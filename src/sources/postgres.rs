@@ -12,6 +12,7 @@ use crate::types::{
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use anyhow::{Context, Result};
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use etl::config::{PgConnectionConfig, TlsConfig};
 use etl::destination::Destination as EtlDestinationTrait;
@@ -42,6 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{info, warn};
 use url::Url;
+use uuid::Uuid;
 
 pub struct PostgresSource {
     config: PostgresConfig,
@@ -296,11 +298,7 @@ impl PostgresSource {
         .await?;
         let udt_name: String = row.try_get("udt_name")?;
         let udt_schema: String = row.try_get("udt_schema")?;
-        if udt_schema == "pg_catalog" {
-            Ok(udt_name)
-        } else {
-            Ok(format!("{}.{}", udt_schema, udt_name))
-        }
+        Ok(format_cast_type(&udt_name, &udt_schema))
     }
 
     pub async fn sync_table(
@@ -733,6 +731,11 @@ impl PostgresSource {
         let batch_size = self.config.batch_size.unwrap_or(default_batch_size);
         let (schema_name, table_name) = split_table_name(&table.name);
 
+        if !dry_run {
+            // Ensure table exists after truncate; emulator deletes tables on truncate.
+            dest.ensure_table(schema).await?;
+        }
+
         let pk_alias = "__cdsync_pk";
         let pk_cast = self
             .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
@@ -847,10 +850,21 @@ impl PostgresSource {
             .as_ref()
             .context("updated_at_column required for incremental sync")?;
         let (schema_name, table_name) = split_table_name(&table.name);
+        let pk_cast = self
+            .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
+            .await?;
+
+        if checkpoint.last_synced_at.is_some() && checkpoint.last_primary_key.is_none() {
+            warn!(
+                table = %table.name,
+                "missing last_primary_key in checkpoint; falling back to updated_at-only paging"
+            );
+        }
 
         let mut last_seen = checkpoint.last_synced_at.unwrap_or_else(|| {
             DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
         });
+        let mut last_pk = checkpoint.last_primary_key.clone();
 
         let select_columns = schema
             .columns
@@ -860,24 +874,32 @@ impl PostgresSource {
             .join(", ");
 
         loop {
-            let mut sql = format!(
-                "SELECT {columns} FROM {schema}.{table} WHERE {updated_at} >= $1",
-                columns = select_columns,
-                schema = schema_name,
-                table = table_name,
-                updated_at = updated_at
+            let sql = build_incremental_sql(
+                &schema_name,
+                &table_name,
+                &select_columns,
+                updated_at,
+                &table.primary_key,
+                &pk_cast,
+                table.where_clause.as_deref(),
+                last_pk.is_some(),
             );
-            if let Some(where_clause) = &table.where_clause {
-                sql = format!("{} AND ({})", sql, where_clause);
-            }
-            sql = format!("{} ORDER BY {updated_at} ASC LIMIT $2", sql, updated_at = updated_at);
 
             let extract_start = Instant::now();
-            let rows = sqlx::query(&sql)
-                .bind(last_seen)
-                .bind(batch_size as i64)
-                .fetch_all(&self.pool)
-                .await?;
+            let rows = if let Some(last_pk_value) = last_pk.as_ref() {
+                sqlx::query(&sql)
+                    .bind(last_seen)
+                    .bind(last_pk_value)
+                    .bind(batch_size as i64)
+                    .fetch_all(&self.pool)
+                    .await?
+            } else {
+                sqlx::query(&sql)
+                    .bind(last_seen)
+                    .bind(batch_size as i64)
+                    .fetch_all(&self.pool)
+                    .await?
+            };
             let extract_ms = extract_start.elapsed().as_millis() as u64;
 
             if rows.is_empty() {
@@ -909,13 +931,16 @@ impl PostgresSource {
                 }
             }
 
-            let max_seen = rows
-                .iter()
-                .filter_map(|row| read_updated_at(row, updated_at))
-                .max()
-                .unwrap_or(last_seen);
-            last_seen = max_seen;
+            let last_row = rows
+                .last()
+                .context("incremental batch empty after non-empty check")?;
+            let next_seen = read_updated_at(last_row, updated_at)
+                .context("missing updated_at value for incremental paging")?;
+            let next_pk = read_primary_key(last_row, &table.primary_key)?;
+            last_seen = next_seen;
+            last_pk = Some(next_pk.clone());
             checkpoint.last_synced_at = Some(last_seen);
+            checkpoint.last_primary_key = Some(next_pk);
         }
         Ok(())
     }
@@ -1767,6 +1792,9 @@ fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> Option<Value
         let dt = Utc.from_utc_datetime(&ts);
         return Some(Value::String(dt.to_rfc3339()));
     }
+    if let Ok(ts) = row.try_get::<DateTime<Utc>, _>(column.as_str()) {
+        return Some(Value::String(ts.to_rfc3339()));
+    }
 
     if let Ok(date) = row.try_get::<NaiveDate, _>(column.as_str()) {
         return Some(Value::String(date.format("%Y-%m-%d").to_string()));
@@ -1829,6 +1857,88 @@ fn read_updated_at(row: &PgRow, updated_at: &str) -> Option<DateTime<Utc>> {
         return Some(ts);
     }
     None
+}
+
+fn read_primary_key(row: &PgRow, column: &str) -> Result<String> {
+    if let Ok(value) = row.try_get::<String, _>(column) {
+        return Ok(value);
+    }
+    if let Ok(value) = row.try_get::<i64, _>(column) {
+        return Ok(value.to_string());
+    }
+    if let Ok(value) = row.try_get::<i32, _>(column) {
+        return Ok(value.to_string());
+    }
+    if let Ok(value) = row.try_get::<BigDecimal, _>(column) {
+        return Ok(value.to_string());
+    }
+    if let Ok(value) = row.try_get::<Uuid, _>(column) {
+        return Ok(value.to_string());
+    }
+    if let Ok(value) = row.try_get::<bool, _>(column) {
+        return Ok(value.to_string());
+    }
+    let raw = row
+        .try_get::<serde_json::Value, _>(column)
+        .with_context(|| format!("unable to decode primary key column {}", column))?;
+    read_primary_key_from_value(raw)
+}
+
+fn build_incremental_sql(
+    schema: &str,
+    table: &str,
+    columns: &str,
+    updated_at: &str,
+    primary_key: &str,
+    pk_cast: &str,
+    where_clause: Option<&str>,
+    has_last_pk: bool,
+) -> String {
+    let mut where_clauses = Vec::new();
+    if let Some(where_clause) = where_clause {
+        where_clauses.push(format!("({})", where_clause));
+    }
+    let pagination_clause = if has_last_pk {
+        format!(
+            "({updated_at} > $1 OR ({updated_at} = $1 AND {pk} > $2::{pk_cast}))",
+            updated_at = updated_at,
+            pk = primary_key,
+            pk_cast = pk_cast
+        )
+    } else {
+        format!("{updated_at} > $1", updated_at = updated_at)
+    };
+    where_clauses.push(pagination_clause);
+    let where_sql = format!(" WHERE {}", where_clauses.join(" AND "));
+    let limit_placeholder = if has_last_pk { "$3" } else { "$2" };
+    format!(
+        "SELECT {columns} FROM {schema}.{table}{where_sql} ORDER BY {updated_at} ASC, {pk} ASC LIMIT {limit}",
+        columns = columns,
+        schema = schema,
+        table = table,
+        where_sql = where_sql,
+        updated_at = updated_at,
+        pk = primary_key,
+        limit = limit_placeholder
+    )
+}
+
+fn read_primary_key_from_value(value: Value) -> Result<String> {
+    match value {
+        Value::String(value) => Ok(value),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Null => anyhow::bail!("primary key value is null"),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn format_cast_type(udt_name: &str, udt_schema: &str) -> String {
+    if udt_schema == "pg_catalog" {
+        udt_name.to_string()
+    } else {
+        format!("{}.{}", udt_schema, udt_name)
+    }
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -1992,5 +2102,155 @@ mod tests {
             pg_type_to_data_type_from_type(&etl::types::Type::TIMESTAMPTZ),
             DataType::Timestamp
         );
+    }
+
+    #[test]
+    fn incremental_sql_uses_strict_paging_without_last_pk() {
+        let sql = build_incremental_sql(
+            "public",
+            "accounts",
+            "id, updated_at",
+            "updated_at",
+            "id",
+            "bigint",
+            None,
+            false,
+        );
+        assert!(sql.contains("updated_at > $1"));
+        assert!(!sql.contains(">="));
+        assert!(sql.contains("ORDER BY updated_at ASC, id ASC LIMIT $2"));
+    }
+
+    #[test]
+    fn incremental_sql_uses_tie_breaker_with_last_pk_and_filters() {
+        let sql = build_incremental_sql(
+            "public",
+            "accounts",
+            "id, updated_at",
+            "updated_at",
+            "id",
+            "bigint",
+            Some("tenant_id = 42"),
+            true,
+        );
+        assert!(sql.contains("(tenant_id = 42)"));
+        assert!(sql.contains("(updated_at > $1 OR (updated_at = $1 AND id > $2::bigint))"));
+        assert!(sql.contains("ORDER BY updated_at ASC, id ASC LIMIT $3"));
+    }
+
+    #[test]
+    fn read_primary_key_prefers_string_then_numeric() {
+        let value = read_primary_key_from_value(Value::String("abc123".to_string()))
+            .expect("string pk");
+        assert_eq!(value, "abc123");
+
+        let value = read_primary_key_from_value(Value::Number(serde_json::Number::from(42)))
+            .expect("numeric pk");
+        assert_eq!(value, "42");
+    }
+
+    #[test]
+    fn read_primary_key_supports_bool_and_null() {
+        let value =
+            read_primary_key_from_value(Value::Bool(true)).expect("bool pk");
+        assert_eq!(value, "true");
+
+        assert!(read_primary_key_from_value(Value::Null).is_err());
+    }
+
+    #[test]
+    fn read_primary_key_supports_uuid_and_decimal() {
+        let uuid = Uuid::parse_str("2e4b7f22-5a7f-4f94-9a9f-6b1f1c2e0a5b")
+            .expect("valid uuid");
+        let value = read_primary_key_from_value(Value::String(uuid.to_string()))
+            .expect("uuid pk");
+        assert_eq!(value, uuid.to_string());
+
+        let decimal = BigDecimal::from(12345i64);
+        let value = read_primary_key_from_value(Value::String(decimal.to_string()))
+            .expect("decimal pk");
+        assert_eq!(value, "12345");
+    }
+
+    #[test]
+    fn primary_key_cast_qualifies_non_pg_schema() {
+        assert_eq!(
+            format_cast_type("citext", "public"),
+            "public.citext"
+        );
+        assert_eq!(format_cast_type("uuid", "pg_catalog"), "uuid");
+    }
+
+    #[test]
+    fn filter_columns_keeps_required_fields() {
+        let all_columns = vec![
+            ColumnSchema {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "updated_at".to_string(),
+                data_type: DataType::Timestamp,
+                nullable: false,
+            },
+        ];
+        let selection = ColumnSelection {
+            include: vec!["name".to_string()],
+            exclude: vec!["updated_at".to_string()],
+        };
+        let required: HashSet<String> =
+            ["id".to_string(), "updated_at".to_string()].into_iter().collect();
+
+        let filtered = filter_columns(&all_columns, &selection, &required);
+        let names: Vec<&str> = filtered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "updated_at"]);
+    }
+
+    #[test]
+    fn schema_diff_detects_incompatible_changes() {
+        let previous = vec![
+            SchemaFieldSnapshot {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            SchemaFieldSnapshot {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: false,
+            },
+        ];
+        let current = TableSchema {
+            name: "public__accounts".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "name".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "extra".to_string(),
+                    data_type: DataType::String,
+                    nullable: true,
+                },
+            ],
+            primary_key: Some("id".to_string()),
+        };
+
+        let diff = schema_diff(Some(&previous), &current).expect("diff");
+        assert!(!diff.is_empty());
+        assert!(diff.has_incompatible());
+        assert!(diff.added.contains(&"extra".to_string()));
+        assert!(diff.removed.contains(&"id".to_string()));
+        assert!(diff
+            .type_changed
+            .iter()
+            .any(|(name, _, _)| name == "name"));
     }
 }

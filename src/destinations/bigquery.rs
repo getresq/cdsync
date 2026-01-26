@@ -18,6 +18,7 @@ use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use reqwest::StatusCode;
 use tracing::{info, warn};
 use url::Url;
 
@@ -374,12 +375,18 @@ impl Destination for BigQueryDestination {
             return Ok(());
         }
         if let Some(emulator_http) = &self.config.emulator_http {
-            warn!(
-                table,
-                emulator = %emulator_http,
-                "bigquery emulator: truncate is a no-op"
+            let client = reqwest::Client::new();
+            let url = format!(
+                "{}/projects/{}/datasets/{}/tables/{}",
+                emulator_http, self.config.project_id, self.config.dataset, table
             );
-            return Ok(());
+            let response = client.delete(url).send().await?;
+            if response.status().is_success()
+                || response.status() == StatusCode::NOT_FOUND
+            {
+                return Ok(());
+            }
+            anyhow::bail!("emulator delete table failed: {}", response.status());
         }
         let sql = format!(
             "TRUNCATE TABLE `{project}.{dataset}.{table}`",

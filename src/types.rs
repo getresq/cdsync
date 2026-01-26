@@ -60,6 +60,7 @@ pub struct RowBatch {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TableCheckpoint {
     pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_primary_key: Option<String>,
     pub last_lsn: Option<String>,
     pub schema_hash: Option<String>,
     pub schema_snapshot: Option<Vec<SchemaFieldSnapshot>>,

@@ -439,6 +439,85 @@ fn polars_schema_with_metadata(schema: &TableSchema) -> EtlResult<Schema> {
     Ok(Schema::from_iter(fields))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ColumnSchema, DataType, TableSchema};
+    use chrono::{DateTime, TimeZone, Utc};
+    use etl::types::{Cell, ColumnSchema as EtlColumnSchema, TableId, TableName, TableRow, Type};
+
+    fn build_info() -> CdcTableInfo {
+        let table_id = TableId::new(1);
+        let table_name = TableName::new("public".to_string(), "items".to_string());
+        let etl_schema = etl::types::TableSchema::new(
+            table_id,
+            table_name,
+            vec![
+                EtlColumnSchema::new("id".to_string(), Type::INT8, -1, false, true),
+                EtlColumnSchema::new(
+                    "deleted_at".to_string(),
+                    Type::TIMESTAMPTZ,
+                    -1,
+                    true,
+                    false,
+                ),
+            ],
+        );
+
+        let schema = TableSchema {
+            name: "public__items".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "deleted_at".to_string(),
+                    data_type: DataType::Timestamp,
+                    nullable: true,
+                },
+            ],
+            primary_key: Some("id".to_string()),
+        };
+
+        CdcTableInfo::new(
+            table_id,
+            "public.items".to_string(),
+            "public__items".to_string(),
+            schema,
+            "id".to_string(),
+            true,
+            Some("deleted_at".to_string()),
+            &etl_schema,
+        )
+        .expect("cdc table info")
+    }
+
+    #[test]
+    fn derive_deleted_at_handles_timestamptz() {
+        let info = build_info();
+        let ts = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+        let row = TableRow::new(vec![Cell::I64(1), Cell::TimestampTz(ts)]);
+        let value = derive_deleted_at_from_row(&info, &row).expect("deleted_at");
+        assert_eq!(value, ts.to_rfc3339());
+    }
+
+    #[test]
+    fn derive_deleted_at_handles_bool_and_null() {
+        let info = build_info();
+        let row = TableRow::new(vec![Cell::I64(1), Cell::Bool(true)]);
+        let value = derive_deleted_at_from_row(&info, &row).expect("deleted_at");
+        assert!(DateTime::parse_from_rfc3339(&value).is_ok());
+
+        let row = TableRow::new(vec![Cell::I64(2), Cell::Bool(false)]);
+        assert!(derive_deleted_at_from_row(&info, &row).is_none());
+
+        let row = TableRow::new(vec![Cell::I64(3), Cell::Null]);
+        assert!(derive_deleted_at_from_row(&info, &row).is_none());
+    }
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
