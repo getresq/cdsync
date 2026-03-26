@@ -1,13 +1,13 @@
 use crate::destinations::bigquery::BigQueryDestination;
 use crate::destinations::{Destination as CdsDestination, WriteMode};
 use crate::stats::StatsHandle;
-use crate::types::{DataType, TableSchema, META_DELETED_AT, META_SYNCED_AT};
+use crate::types::{DataType, META_DELETED_AT, META_SYNCED_AT, TableSchema};
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, NaiveTime, TimeZone, Utc};
 use etl::destination::Destination as EtlDestination;
-use etl::error::{EtlError, EtlResult, ErrorKind};
+use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::types::{Cell, Event, TableId, TableRow};
 use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
@@ -36,17 +36,19 @@ pub struct CdcTableInfo {
     source_soft_delete_index: Option<usize>,
 }
 
+#[derive(Clone)]
+pub struct CdcTableSpec {
+    pub table_id: TableId,
+    pub source_name: String,
+    pub dest_name: String,
+    pub schema: TableSchema,
+    pub primary_key: String,
+    pub soft_delete: bool,
+    pub soft_delete_column: Option<String>,
+}
+
 impl CdcTableInfo {
-    pub fn new(
-        table_id: TableId,
-        source_name: String,
-        dest_name: String,
-        schema: TableSchema,
-        primary_key: String,
-        soft_delete: bool,
-        soft_delete_column: Option<String>,
-        etl_schema: &etl::types::TableSchema,
-    ) -> Result<Self> {
+    pub fn new(spec: CdcTableSpec, etl_schema: &etl::types::TableSchema) -> Result<Self> {
         let source_index_by_name: HashMap<String, usize> = etl_schema
             .column_schemas
             .iter()
@@ -54,33 +56,36 @@ impl CdcTableInfo {
             .map(|(idx, col)| (col.name.clone(), idx))
             .collect();
 
-        let mut dest_source_indices = Vec::with_capacity(schema.columns.len());
-        for column in &schema.columns {
+        let mut dest_source_indices = Vec::with_capacity(spec.schema.columns.len());
+        for column in &spec.schema.columns {
             let idx = source_index_by_name
                 .get(&column.name)
                 .copied()
-                .ok_or_else(|| anyhow::anyhow!("column {} not found in source schema", column.name))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("column {} not found in source schema", column.name)
+                })?;
             dest_source_indices.push(idx);
         }
 
-        if !source_index_by_name.contains_key(&primary_key) {
+        if !source_index_by_name.contains_key(&spec.primary_key) {
             return Err(anyhow::anyhow!(
                 "primary key {} not found in source schema",
-                primary_key
+                spec.primary_key
             ));
         }
 
-        let source_soft_delete_index = soft_delete_column
+        let source_soft_delete_index = spec
+            .soft_delete_column
             .as_ref()
             .and_then(|name| source_index_by_name.get(name).copied());
 
         Ok(Self {
-            table_id,
-            source_name,
-            dest_name,
-            schema,
-            primary_key,
-            soft_delete,
+            table_id: spec.table_id,
+            source_name: spec.source_name,
+            dest_name: spec.dest_name,
+            schema: spec.schema,
+            primary_key: spec.primary_key,
+            soft_delete: spec.soft_delete,
             dest_source_indices,
             source_soft_delete_index,
         })
@@ -119,16 +124,13 @@ impl EtlBigQueryDestination {
     }
 
     pub async fn ensure_table_schema(&self, schema: &TableSchema) -> EtlResult<()> {
-        self.inner
-            .ensure_table(schema)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to ensure BigQuery table",
-                    err.to_string()
-                )
-            })
+        self.inner.ensure_table(schema).await.map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to ensure BigQuery table",
+                err.to_string()
+            )
+        })
     }
 
     async fn write_rows(
@@ -145,7 +147,11 @@ impl EtlBigQueryDestination {
         self.ensure_table(info).await?;
         let frame =
             table_rows_to_frame(info, rows, synced_at, deleted_at_override).map_err(|err| {
-                etl::etl_error!(ErrorKind::ConversionError, "failed to build CDC batch", err.to_string())
+                etl::etl_error!(
+                    ErrorKind::ConversionError,
+                    "failed to build CDC batch",
+                    err.to_string()
+                )
             })?;
         let load_start = Instant::now();
         self.inner
@@ -158,7 +164,11 @@ impl EtlBigQueryDestination {
             )
             .await
             .map_err(|err| {
-                etl::etl_error!(ErrorKind::DestinationError, "failed to write CDC batch", err.to_string())
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to write CDC batch",
+                    err.to_string()
+                )
             })?;
         if let Some(stats) = &self.stats {
             let deleted = if deleted_at_override.is_some() {
@@ -194,14 +204,14 @@ impl EtlBigQueryDestination {
         let delete_synced_at = synced_at;
 
         for table_id in truncate_tables.drain(..) {
-            if let Ok(info) = self.get_table(table_id).await {
-                if let Err(err) = self.inner.truncate_table(&info.dest_name).await {
-                    return Err(etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to truncate table from CDC event",
-                        err.to_string()
-                    ));
-                }
+            if let Ok(info) = self.get_table(table_id).await
+                && let Err(err) = self.inner.truncate_table(&info.dest_name).await
+            {
+                return Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to truncate table from CDC event",
+                    err.to_string()
+                ));
             }
         }
 
@@ -238,11 +248,19 @@ impl EtlDestination for EtlBigQueryDestination {
             .truncate_table(&info.dest_name)
             .await
             .map_err(|err| {
-                etl::etl_error!(ErrorKind::DestinationError, "failed to truncate table", err.to_string())
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to truncate table",
+                    err.to_string()
+                )
             })
     }
 
-    async fn write_table_rows(&self, table_id: TableId, table_rows: Vec<TableRow>) -> EtlResult<()> {
+    async fn write_table_rows(
+        &self,
+        table_id: TableId,
+        table_rows: Vec<TableRow>,
+    ) -> EtlResult<()> {
         let info = self.get_table(table_id).await?;
         let synced_at = Utc::now();
         self.write_rows(&info, &table_rows, WriteMode::Append, synced_at, None)
@@ -296,12 +314,8 @@ impl EtlDestination for EtlBigQueryDestination {
                     }
                 }
                 Event::Commit(_) => {
-                    self.flush_pending(
-                        &mut pending,
-                        &mut pending_deletes,
-                        &mut truncate_tables,
-                    )
-                    .await?;
+                    self.flush_pending(&mut pending, &mut pending_deletes, &mut truncate_tables)
+                        .await?;
                 }
                 Event::Begin(_) | Event::Relation(_) | Event::Unsupported => {}
             }
@@ -331,7 +345,9 @@ fn table_rows_to_frame(
             values.push(cell_to_anyvalue(cell));
         }
 
-        values.push(AnyValue::StringOwned(PlSmallStr::from(synced_at.to_rfc3339())));
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            synced_at.to_rfc3339(),
+        )));
 
         let deleted_at = if info.soft_delete {
             if let Some(ts) = deleted_at_override {
@@ -352,7 +368,11 @@ fn table_rows_to_frame(
     }
 
     DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(|err| {
-        etl::etl_error!(ErrorKind::ConversionError, "failed to build CDC dataframe", err.to_string())
+        etl::etl_error!(
+            ErrorKind::ConversionError,
+            "failed to build CDC dataframe",
+            err.to_string()
+        )
     })
 }
 
@@ -388,9 +408,13 @@ fn cell_to_anyvalue(cell: &Cell) -> AnyValue<'static> {
         Cell::F32(value) => AnyValue::Float64(*value as f64),
         Cell::F64(value) => AnyValue::Float64(*value),
         Cell::Numeric(value) => AnyValue::StringOwned(PlSmallStr::from(value.to_string())),
-        Cell::Date(value) => AnyValue::StringOwned(PlSmallStr::from(value.format("%Y-%m-%d").to_string())),
+        Cell::Date(value) => {
+            AnyValue::StringOwned(PlSmallStr::from(value.format("%Y-%m-%d").to_string()))
+        }
         Cell::Time(value) => AnyValue::StringOwned(PlSmallStr::from(format_time(value))),
-        Cell::Timestamp(value) => AnyValue::StringOwned(PlSmallStr::from(Utc.from_utc_datetime(value).to_rfc3339())),
+        Cell::Timestamp(value) => {
+            AnyValue::StringOwned(PlSmallStr::from(Utc.from_utc_datetime(value).to_rfc3339()))
+        }
         Cell::TimestampTz(value) => AnyValue::StringOwned(PlSmallStr::from(value.to_rfc3339())),
         Cell::Uuid(value) => AnyValue::StringOwned(PlSmallStr::from(value.to_string())),
         Cell::Json(value) => AnyValue::StringOwned(PlSmallStr::from(value.to_string())),
@@ -404,22 +428,157 @@ fn cell_to_anyvalue(cell: &Cell) -> AnyValue<'static> {
 
 fn array_to_json(array: &etl::types::ArrayCell) -> serde_json::Value {
     match array {
-        etl::types::ArrayCell::Bool(values) => serde_json::Value::Array(values.iter().map(|v| v.map(serde_json::Value::Bool).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::String(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|s| serde_json::Value::String(s.clone())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::I16(values) => serde_json::Value::Array(values.iter().map(|v| v.map(|n| serde_json::Value::Number((n as i64).into())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::I32(values) => serde_json::Value::Array(values.iter().map(|v| v.map(|n| serde_json::Value::Number((n as i64).into())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::U32(values) => serde_json::Value::Array(values.iter().map(|v| v.map(|n| serde_json::Value::Number((n as u64).into())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::I64(values) => serde_json::Value::Array(values.iter().map(|v| v.map(|n| serde_json::Value::Number(n.into())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::F32(values) => serde_json::Value::Array(values.iter().map(|v| v.and_then(|n| serde_json::Number::from_f64(n as f64).map(serde_json::Value::Number)).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::F64(values) => serde_json::Value::Array(values.iter().map(|v| v.and_then(|n| serde_json::Number::from_f64(n).map(serde_json::Value::Number)).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Numeric(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|n| serde_json::Value::String(n.to_string())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Date(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|d| serde_json::Value::String(d.format("%Y-%m-%d").to_string())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Time(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|t| serde_json::Value::String(format_time(t))).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Timestamp(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|t| serde_json::Value::String(Utc.from_utc_datetime(t).to_rfc3339())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::TimestampTz(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|t| serde_json::Value::String(t.to_rfc3339())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Uuid(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|u| serde_json::Value::String(u.to_string())).unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Json(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().cloned().unwrap_or(serde_json::Value::Null)).collect()),
-        etl::types::ArrayCell::Bytes(values) => serde_json::Value::Array(values.iter().map(|v| v.as_ref().map(|b| serde_json::Value::String(encode_base64(b))).unwrap_or(serde_json::Value::Null)).collect()),
+        etl::types::ArrayCell::Bool(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(serde_json::Value::Bool)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::String(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::I16(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|n| serde_json::Value::Number((n as i64).into()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::I32(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|n| serde_json::Value::Number((n as i64).into()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::U32(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|n| serde_json::Value::Number((n as u64).into()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::I64(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|n| serde_json::Value::Number(n.into()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::F32(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.and_then(|n| {
+                        serde_json::Number::from_f64(n as f64).map(serde_json::Value::Number)
+                    })
+                    .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::F64(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.and_then(|n| serde_json::Number::from_f64(n).map(serde_json::Value::Number))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Numeric(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|n| serde_json::Value::String(n.to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Date(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|d| serde_json::Value::String(d.format("%Y-%m-%d").to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Time(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|t| serde_json::Value::String(format_time(t)))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Timestamp(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|t| serde_json::Value::String(Utc.from_utc_datetime(t).to_rfc3339()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::TimestampTz(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|t| serde_json::Value::String(t.to_rfc3339()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Uuid(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|u| serde_json::Value::String(u.to_string()))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        etl::types::ArrayCell::Json(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| v.as_ref().cloned().unwrap_or(serde_json::Value::Null))
+                .collect(),
+        ),
+        etl::types::ArrayCell::Bytes(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| {
+                    v.as_ref()
+                        .map(|b| serde_json::Value::String(encode_base64(b)))
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -439,6 +598,14 @@ fn polars_schema_with_metadata(schema: &TableSchema) -> EtlResult<Schema> {
     Ok(Schema::from_iter(fields))
 }
 
+fn encode_base64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+fn format_time(value: &NaiveTime) -> String {
+    value.format("%H:%M:%S%.f").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,13 +621,7 @@ mod tests {
             table_name,
             vec![
                 EtlColumnSchema::new("id".to_string(), Type::INT8, -1, false, true),
-                EtlColumnSchema::new(
-                    "deleted_at".to_string(),
-                    Type::TIMESTAMPTZ,
-                    -1,
-                    true,
-                    false,
-                ),
+                EtlColumnSchema::new("deleted_at".to_string(), Type::TIMESTAMPTZ, -1, true, false),
             ],
         );
 
@@ -482,13 +643,15 @@ mod tests {
         };
 
         CdcTableInfo::new(
-            table_id,
-            "public.items".to_string(),
-            "public__items".to_string(),
-            schema,
-            "id".to_string(),
-            true,
-            Some("deleted_at".to_string()),
+            CdcTableSpec {
+                table_id,
+                source_name: "public.items".to_string(),
+                dest_name: "public__items".to_string(),
+                schema,
+                primary_key: "id".to_string(),
+                soft_delete: true,
+                soft_delete_column: Some("deleted_at".to_string()),
+            },
             &etl_schema,
         )
         .expect("cdc table info")
@@ -516,12 +679,4 @@ mod tests {
         let row = TableRow::new(vec![Cell::I64(3), Cell::Null]);
         assert!(derive_deleted_at_from_row(&info, &row).is_none());
     }
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    STANDARD.encode(bytes)
-}
-
-fn format_time(value: &NaiveTime) -> String {
-    value.format("%H:%M:%S%.f").to_string()
 }

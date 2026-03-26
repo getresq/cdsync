@@ -1,7 +1,12 @@
-use crate::config::{FieldSelection, SalesforceConfig, SalesforceObjectConfig, SalesforceObjectDefaults};
+use crate::config::{
+    FieldSelection, SalesforceConfig, SalesforceObjectConfig, SalesforceObjectDefaults,
+};
 use crate::destinations::{Destination, WriteMode};
+use crate::state::StateHandle;
 use crate::stats::StatsHandle;
-use crate::types::{ColumnSchema, DataType, TableCheckpoint, TableSchema, META_DELETED_AT, META_SYNCED_AT};
+use crate::types::{
+    ColumnSchema, DataType, META_DELETED_AT, META_SYNCED_AT, TableCheckpoint, TableSchema,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSet};
@@ -10,10 +15,10 @@ use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, Pl
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::Mutex;
-use tokio::time::sleep;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 pub struct SalesforceSource {
     config: SalesforceConfig,
@@ -27,6 +32,16 @@ pub struct ResolvedSalesforceObject {
     pub primary_key: String,
     pub fields: Option<FieldSelection>,
     pub soft_delete: bool,
+}
+
+pub struct SalesforceSyncRequest<'a> {
+    pub object: &'a ResolvedSalesforceObject,
+    pub dest: &'a dyn Destination,
+    pub checkpoint: TableCheckpoint,
+    pub state_handle: Option<StateHandle>,
+    pub mode: crate::types::SyncMode,
+    pub dry_run: bool,
+    pub stats: Option<StatsHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,12 +82,14 @@ impl SalesforceSource {
                     if !selection.exclude.is_empty() && exclude_set.is_match(&name) {
                         continue;
                     }
-                    object_map.entry(name.clone()).or_insert(SalesforceObjectConfig {
-                        name,
-                        primary_key: None,
-                        fields: None,
-                        soft_delete: None,
-                    });
+                    object_map
+                        .entry(name.clone())
+                        .or_insert(SalesforceObjectConfig {
+                            name,
+                            primary_key: None,
+                            fields: None,
+                            soft_delete: None,
+                        });
                 }
             }
 
@@ -100,15 +117,16 @@ impl SalesforceSource {
         Ok(resolved)
     }
 
-    pub async fn sync_object(
-        &self,
-        object: &ResolvedSalesforceObject,
-        dest: &dyn Destination,
-        checkpoint: TableCheckpoint,
-        mode: crate::types::SyncMode,
-        dry_run: bool,
-        stats: Option<StatsHandle>,
-    ) -> Result<TableCheckpoint> {
+    pub async fn sync_object(&self, request: SalesforceSyncRequest<'_>) -> Result<TableCheckpoint> {
+        let SalesforceSyncRequest {
+            object,
+            dest,
+            checkpoint,
+            state_handle,
+            mode,
+            dry_run,
+            stats,
+        } = request;
         let auth = self.authenticate(stats.as_ref()).await?;
         let api_version = self
             .config
@@ -123,11 +141,7 @@ impl SalesforceSource {
             Some(selection) => selection
                 .include_list()
                 .unwrap_or_else(|| describe.fields.iter().map(|f| f.name.clone()).collect()),
-            None => describe
-                .fields
-                .iter()
-                .map(|f| f.name.clone())
-                .collect(),
+            None => describe.fields.iter().map(|f| f.name.clone()).collect(),
         };
         if let Some(selection) = &object.fields {
             let exclude = selection.exclude_list();
@@ -215,6 +229,12 @@ impl SalesforceSource {
                 .filter_map(parse_datetime)
                 .max()
                 .or(last_seen);
+            checkpoint.last_synced_at = last_seen.or(Some(Utc::now()));
+            if let Some(state_handle) = &state_handle {
+                state_handle
+                    .save_salesforce_checkpoint(&object.name, &checkpoint)
+                    .await?;
+            }
 
             if let Some(next) = response.next_records_url {
                 query = next;
@@ -224,6 +244,11 @@ impl SalesforceSource {
         }
 
         checkpoint.last_synced_at = last_seen.or(Some(Utc::now()));
+        if let Some(state_handle) = &state_handle {
+            state_handle
+                .save_salesforce_checkpoint(&object.name, &checkpoint)
+                .await?;
+        }
 
         Ok(checkpoint)
     }
@@ -245,7 +270,10 @@ impl SalesforceSource {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("salesforce validation failed: {}", response.status()))
+            Err(anyhow::anyhow!(
+                "salesforce validation failed: {}",
+                response.status()
+            ))
         }
     }
 
@@ -302,7 +330,10 @@ impl SalesforceSource {
             .context("salesforce token request")?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("salesforce auth failed: {}", response.status()));
+            return Err(anyhow::anyhow!(
+                "salesforce auth failed: {}",
+                response.status()
+            ));
         }
 
         let payload: AuthResponse = response.json().await?;
@@ -336,7 +367,11 @@ impl SalesforceSource {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("describe {} failed: {}", object, response.status()));
+            return Err(anyhow::anyhow!(
+                "describe {} failed: {}",
+                object,
+                response.status()
+            ));
         }
         let payload: DescribeResponse = response.json().await?;
         Ok(payload)
@@ -366,7 +401,10 @@ impl SalesforceSource {
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("salesforce query failed: {}", response.status()));
+            return Err(anyhow::anyhow!(
+                "salesforce query failed: {}",
+                response.status()
+            ));
         }
         let payload: QueryResponse = response.json().await?;
         Ok(payload)
@@ -406,10 +444,7 @@ impl SalesforceSource {
                 continue;
             }
 
-            return Err(anyhow::anyhow!(
-                "salesforce request failed: {}",
-                status
-            ));
+            return Err(anyhow::anyhow!("salesforce request failed: {}", status));
         }
     }
 
@@ -426,7 +461,12 @@ impl SalesforceSource {
     }
 }
 
-fn build_soql(fields: &[String], object: &str, mode: crate::types::SyncMode, since: Option<DateTime<Utc>>) -> String {
+fn build_soql(
+    fields: &[String],
+    object: &str,
+    mode: crate::types::SyncMode,
+    since: Option<DateTime<Utc>>,
+) -> String {
     let mut select_fields = fields.to_vec();
     if !select_fields.iter().any(|f| f == "SystemModstamp") {
         select_fields.push("SystemModstamp".to_string());
@@ -436,10 +476,13 @@ fn build_soql(fields: &[String], object: &str, mode: crate::types::SyncMode, sin
     }
 
     let mut soql = format!("SELECT {} FROM {}", select_fields.join(", "), object);
-    if let crate::types::SyncMode::Incremental = mode {
-        if let Some(since) = since {
-            soql.push_str(&format!(" WHERE SystemModstamp > {}", format_salesforce_ts(since)));
-        }
+    if let crate::types::SyncMode::Incremental = mode
+        && let Some(since) = since
+    {
+        soql.push_str(&format!(
+            " WHERE SystemModstamp > {}",
+            format_salesforce_ts(since)
+        ));
     }
     soql
 }
@@ -503,7 +546,9 @@ fn records_to_frame(
             let value = record.get(&column.name).cloned().unwrap_or(Value::Null);
             values.push(salesforce_value_to_anyvalue(&value, &column.data_type));
         }
-        values.push(AnyValue::StringOwned(PlSmallStr::from(synced_at.to_rfc3339())));
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            synced_at.to_rfc3339(),
+        )));
         let deleted_at = if object.soft_delete {
             match record.get("IsDeleted") {
                 Some(Value::Bool(true)) => Value::String(synced_at.to_rfc3339()),
@@ -525,17 +570,32 @@ fn salesforce_value_to_anyvalue(value: &Value, data_type: &DataType) -> AnyValue
     match data_type {
         DataType::Int64 => match value {
             Value::Number(num) => num.as_i64().map(AnyValue::Int64).unwrap_or(AnyValue::Null),
-            Value::String(s) => s.parse::<i64>().ok().map(AnyValue::Int64).unwrap_or(AnyValue::Null),
+            Value::String(s) => s
+                .parse::<i64>()
+                .ok()
+                .map(AnyValue::Int64)
+                .unwrap_or(AnyValue::Null),
             _ => AnyValue::Null,
         },
         DataType::Float64 => match value {
-            Value::Number(num) => num.as_f64().map(AnyValue::Float64).unwrap_or(AnyValue::Null),
-            Value::String(s) => s.parse::<f64>().ok().map(AnyValue::Float64).unwrap_or(AnyValue::Null),
+            Value::Number(num) => num
+                .as_f64()
+                .map(AnyValue::Float64)
+                .unwrap_or(AnyValue::Null),
+            Value::String(s) => s
+                .parse::<f64>()
+                .ok()
+                .map(AnyValue::Float64)
+                .unwrap_or(AnyValue::Null),
             _ => AnyValue::Null,
         },
         DataType::Bool => match value {
             Value::Bool(b) => AnyValue::Boolean(*b),
-            Value::String(s) => s.parse::<bool>().ok().map(AnyValue::Boolean).unwrap_or(AnyValue::Null),
+            Value::String(s) => s
+                .parse::<bool>()
+                .ok()
+                .map(AnyValue::Boolean)
+                .unwrap_or(AnyValue::Null),
             _ => AnyValue::Null,
         },
         _ => match value {

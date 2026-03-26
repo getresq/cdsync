@@ -49,6 +49,7 @@ cargo test --test e2e_postgres_cdc -- --ignored --nocapture
 ```
 cargo test --test e2e_postgres_schema_changes -- --ignored --nocapture
 cargo test --test e2e_postgres_soft_deletes -- --ignored --nocapture
+cargo test --test e2e_runner_graceful_shutdown -- --ignored --nocapture
 ```
 
 ## Notes
@@ -134,7 +135,7 @@ connections:
       service_account_key_path: /path/to/bq-sa.json
 
 state:
-  path: ./state.json
+  path: ./state.db
 ```
 
 ### 4) Validate + run
@@ -142,6 +143,9 @@ state:
 ```
 cdsync validate --connection rds_to_bq --verbose
 cdsync sync --connection rds_to_bq --incremental --schema-diff
+cdsync sync --connection rds_to_bq --incremental --schema-diff --follow
+cdsync reconcile --connection rds_to_bq
+cdsync report --connection rds_to_bq --limit 10
 ```
 
 Notes:

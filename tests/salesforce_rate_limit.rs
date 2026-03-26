@@ -1,13 +1,18 @@
 use async_trait::async_trait;
 use cdsync::config::{SalesforceConfig, SalesforceRateLimitConfig};
 use cdsync::destinations::{Destination, WriteMode};
-use cdsync::sources::salesforce::{ResolvedSalesforceObject, SalesforceSource};
+use cdsync::sources::salesforce::{
+    ResolvedSalesforceObject, SalesforceSource, SalesforceSyncRequest,
+};
 use cdsync::types::TableCheckpoint;
 use cdsync::types::{SyncMode, TableSchema};
 use polars::prelude::DataFrame;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 struct TestDestination;
 
@@ -109,14 +114,15 @@ async fn salesforce_retries_on_rate_limit() -> anyhow::Result<()> {
     };
     let dest = TestDestination;
     source
-        .sync_object(
-            &object,
-            &dest,
-            TableCheckpoint::default(),
-            SyncMode::Incremental,
-            true,
-            None,
-        )
+        .sync_object(SalesforceSyncRequest {
+            object: &object,
+            dest: &dest,
+            checkpoint: TableCheckpoint::default(),
+            state_handle: None,
+            mode: SyncMode::Incremental,
+            dry_run: true,
+            stats: None,
+        })
         .await?;
 
     server.verify().await;

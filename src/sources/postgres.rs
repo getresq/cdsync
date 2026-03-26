@@ -3,15 +3,16 @@ use crate::config::{
 };
 use crate::destinations::etl_bigquery::{CdcTableInfo, EtlBigQueryDestination};
 use crate::destinations::{Destination, WriteMode};
-use crate::state::ConnectionState;
+use crate::runner::ShutdownSignal;
+use crate::state::{ConnectionState, StateHandle};
 use crate::stats::StatsHandle;
 use crate::types::{
-    ColumnSchema, DataType, RowBatch, SchemaFieldSnapshot, TableCheckpoint, TableSchema,
-    META_DELETED_AT, META_SYNCED_AT,
+    ColumnSchema, DataType, META_DELETED_AT, META_SYNCED_AT, RowBatch, SchemaFieldSnapshot,
+    TableCheckpoint, TableSchema,
 };
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use etl::config::{PgConnectionConfig, TlsConfig};
@@ -27,16 +28,15 @@ use etl::types::{
 use etl_postgres::replication::slots::EtlReplicationSlot;
 use futures::StreamExt;
 use globset::{Glob, GlobSet};
-use postgres_replication::protocol::{
-    LogicalReplicationMessage, ReplicationMessage, TupleData,
-};
 use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
+use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessage, TupleData};
 use secrecy::SecretString;
+use serde::Serialize;
 use serde_json::Value;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row as SqlxRow;
 use sqlx::ValueRef;
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -63,6 +63,97 @@ pub struct ResolvedPostgresTable {
     pub columns: ColumnSelection,
 }
 
+pub struct TableSyncRequest<'a> {
+    pub table: &'a ResolvedPostgresTable,
+    pub dest: &'a dyn Destination,
+    pub checkpoint: TableCheckpoint,
+    pub state_handle: Option<StateHandle>,
+    pub mode: crate::types::SyncMode,
+    pub dry_run: bool,
+    pub default_batch_size: usize,
+    pub schema_diff_enabled: bool,
+    pub stats: Option<StatsHandle>,
+}
+
+pub struct CdcSyncRequest<'a> {
+    pub dest: &'a crate::destinations::bigquery::BigQueryDestination,
+    pub state: &'a mut ConnectionState,
+    pub state_handle: Option<StateHandle>,
+    pub mode: crate::types::SyncMode,
+    pub dry_run: bool,
+    pub follow: bool,
+    pub default_batch_size: usize,
+    pub tables: &'a [ResolvedPostgresTable],
+    pub schema_diff_enabled: bool,
+    pub stats: Option<StatsHandle>,
+    pub shutdown: Option<ShutdownSignal>,
+}
+
+struct TableRunOptions<'a> {
+    dry_run: bool,
+    batch_size: usize,
+    stats: Option<&'a StatsHandle>,
+    state_handle: Option<StateHandle>,
+}
+
+struct IncrementalSqlParts<'a> {
+    schema: &'a str,
+    table: &'a str,
+    columns: &'a str,
+    updated_at: &'a str,
+    primary_key: &'a str,
+    pk_cast: &'a str,
+    where_clause: Option<&'a str>,
+    has_last_pk: bool,
+}
+
+struct CdcStreamConfig<'a> {
+    publication: &'a str,
+    slot_name: &'a str,
+    start_lsn: etl::types::PgLsn,
+    pipeline_id: u64,
+    idle_timeout: Duration,
+    max_pending_events: usize,
+    follow: bool,
+    shutdown: Option<ShutdownSignal>,
+}
+
+struct CdcStreamRuntime<'a> {
+    include_tables: &'a HashSet<TableId>,
+    table_configs: &'a HashMap<TableId, ResolvedPostgresTable>,
+    store: &'a MemoryStore,
+    dest: &'a EtlBigQueryDestination,
+    table_info_map: &'a mut HashMap<TableId, CdcTableInfo>,
+    etl_schemas: &'a mut HashMap<TableId, EtlTableSchema>,
+    table_hashes: &'a mut HashMap<TableId, String>,
+    table_snapshots: &'a mut HashMap<TableId, Vec<SchemaFieldSnapshot>>,
+    state: &'a mut ConnectionState,
+    schema_policy: SchemaChangePolicy,
+    schema_diff_enabled: bool,
+    stats: Option<StatsHandle>,
+    state_handle: Option<StateHandle>,
+}
+
+struct CdcRelationRuntime<'a> {
+    table_configs: &'a HashMap<TableId, ResolvedPostgresTable>,
+    store: &'a MemoryStore,
+    dest: &'a EtlBigQueryDestination,
+    table_info_map: &'a mut HashMap<TableId, CdcTableInfo>,
+    etl_schemas: &'a mut HashMap<TableId, EtlTableSchema>,
+    table_hashes: &'a mut HashMap<TableId, String>,
+    table_snapshots: &'a mut HashMap<TableId, Vec<SchemaFieldSnapshot>>,
+    state: &'a mut ConnectionState,
+    schema_policy: SchemaChangePolicy,
+    schema_diff_enabled: bool,
+    state_handle: Option<StateHandle>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PostgresTableSummary {
+    pub row_count: i64,
+    pub max_updated_at: Option<DateTime<Utc>>,
+}
+
 impl PostgresSource {
     pub async fn new(config: PostgresConfig) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -75,6 +166,40 @@ impl PostgresSource {
 
     pub fn pool_max_connections(&self) -> u32 {
         DEFAULT_PG_POOL_MAX
+    }
+
+    pub async fn summarize_table(
+        &self,
+        table: &ResolvedPostgresTable,
+    ) -> Result<PostgresTableSummary> {
+        let (schema_name, table_name) = split_table_name(&table.name);
+        let max_expr = if let Some(updated_at_column) = &table.updated_at_column {
+            format!("max({updated_at_column}) as max_updated_at")
+        } else {
+            "null as max_updated_at".to_string()
+        };
+        let sql = if let Some(where_clause) = &table.where_clause {
+            format!(
+                "select count(*)::bigint as row_count, {max_expr} \
+                 from {schema}.{table} where ({where_clause})",
+                max_expr = max_expr,
+                schema = schema_name,
+                table = table_name,
+                where_clause = where_clause
+            )
+        } else {
+            format!(
+                "select count(*)::bigint as row_count, {max_expr} from {schema}.{table}",
+                max_expr = max_expr,
+                schema = schema_name,
+                table = table_name
+            )
+        };
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
+        Ok(PostgresTableSummary {
+            row_count: row.try_get("row_count")?,
+            max_updated_at: read_updated_at(&row, "max_updated_at"),
+        })
     }
 
     pub async fn resolve_tables(&self) -> Result<Vec<ResolvedPostgresTable>> {
@@ -99,15 +224,17 @@ impl PostgresSource {
                     if !selection.exclude.is_empty() && exclude_set.is_match(&name) {
                         continue;
                     }
-                    table_map.entry(name.clone()).or_insert(PostgresTableConfig {
-                        name,
-                        primary_key: None,
-                        updated_at_column: None,
-                        soft_delete: None,
-                        soft_delete_column: None,
-                        where_clause: None,
-                        columns: None,
-                    });
+                    table_map
+                        .entry(name.clone())
+                        .or_insert(PostgresTableConfig {
+                            name,
+                            primary_key: None,
+                            updated_at_column: None,
+                            soft_delete: None,
+                            soft_delete_column: None,
+                            where_clause: None,
+                            columns: None,
+                        });
                 }
             }
 
@@ -129,7 +256,10 @@ impl PostgresSource {
 
         let mut resolved = Vec::with_capacity(table_map.len());
         for table_cfg in table_map.values() {
-            resolved.push(self.apply_table_defaults(table_cfg, defaults.as_ref()).await?);
+            resolved.push(
+                self.apply_table_defaults(table_cfg, defaults.as_ref())
+                    .await?,
+            );
         }
 
         resolved.sort_by(|a, b| a.name.cmp(&b.name));
@@ -301,63 +431,62 @@ impl PostgresSource {
         Ok(format_cast_type(&udt_name, &udt_schema))
     }
 
-    pub async fn sync_table(
-        &self,
-        table: &ResolvedPostgresTable,
-        dest: &dyn Destination,
-        checkpoint: TableCheckpoint,
-        mode: crate::types::SyncMode,
-        dry_run: bool,
-        default_batch_size: usize,
-        schema_diff_enabled: bool,
-        stats: Option<StatsHandle>,
-    ) -> Result<TableCheckpoint> {
+    pub async fn sync_table(&self, request: TableSyncRequest<'_>) -> Result<TableCheckpoint> {
+        let TableSyncRequest {
+            table,
+            dest,
+            checkpoint,
+            state_handle,
+            mode,
+            dry_run,
+            default_batch_size,
+            schema_diff_enabled,
+            stats,
+        } = request;
         let schema = self.discover_schema(table).await?;
         dest.ensure_table(&schema).await?;
 
         let schema_hash = schema_fingerprint(&schema);
         let policy = self.config.schema_policy();
         let mut entry = checkpoint;
-        if let Some(diff) = schema_diff(entry.schema_snapshot.as_deref(), &schema) {
-            if !diff.is_empty() {
-                if schema_diff_enabled {
-                    log_schema_diff(&table.name, &diff);
+        let run_options = TableRunOptions {
+            dry_run,
+            batch_size: self.config.batch_size.unwrap_or(default_batch_size),
+            stats: stats.as_ref(),
+            state_handle,
+        };
+        if let Some(diff) = schema_diff(entry.schema_snapshot.as_deref(), &schema)
+            && !diff.is_empty()
+        {
+            if schema_diff_enabled {
+                log_schema_diff(&table.name, &diff);
+            }
+            match policy {
+                SchemaChangePolicy::Fail => {
+                    anyhow::bail!(
+                        "schema change detected for {}; set schema_changes=auto or resync",
+                        table.name
+                    );
                 }
-                match policy {
-                    SchemaChangePolicy::Fail => {
+                SchemaChangePolicy::Resync => {
+                    info!(table = %table.name, "schema change detected; resyncing table");
+                    if !dry_run {
+                        dest.truncate_table(&schema.name).await?;
+                    }
+                    self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
+                        .await?;
+                    entry.schema_hash = Some(schema_hash);
+                    entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
+                    return Ok(entry);
+                }
+                SchemaChangePolicy::Auto => {
+                    if diff.has_incompatible() {
                         anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto or resync",
+                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
                             table.name
                         );
                     }
-                    SchemaChangePolicy::Resync => {
-                        info!(table = %table.name, "schema change detected; resyncing table");
-                        if !dry_run {
-                            dest.truncate_table(&schema.name).await?;
-                        }
-                        self.run_full_refresh(
-                            table,
-                            &schema,
-                            dest,
-                            &mut entry,
-                            dry_run,
-                            default_batch_size,
-                            stats.as_ref(),
-                        )
-                        .await?;
-                        entry.schema_hash = Some(schema_hash);
-                        entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
-                        return Ok(entry);
-                    }
-                    SchemaChangePolicy::Auto => {
-                        if diff.has_incompatible() {
-                            anyhow::bail!(
-                                "incompatible schema change detected for {}; set schema_changes=resync or fail",
-                                table.name
-                            );
-                        }
-                        info!(table = %table.name, "schema change detected; auto-altering destination");
-                    }
+                    info!(table = %table.name, "schema change detected; auto-altering destination");
                 }
             }
         }
@@ -367,15 +496,7 @@ impl PostgresSource {
                 if !dry_run {
                     dest.truncate_table(&schema.name).await?;
                 }
-                self.run_full_refresh(
-                    table,
-                    &schema,
-                    dest,
-                    &mut entry,
-                    dry_run,
-                    default_batch_size,
-                    stats.as_ref(),
-                )
+                self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
                     .await?;
             }
             crate::types::SyncMode::Incremental => {
@@ -387,27 +508,11 @@ impl PostgresSource {
                     if !dry_run {
                         dest.truncate_table(&schema.name).await?;
                     }
-                    self.run_full_refresh(
-                        table,
-                        &schema,
-                        dest,
-                        &mut entry,
-                        dry_run,
-                        default_batch_size,
-                        stats.as_ref(),
-                    )
+                    self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
                         .await?;
                 } else {
-                    self.run_incremental(
-                        table,
-                        &schema,
-                        dest,
-                        &mut entry,
-                        dry_run,
-                        default_batch_size,
-                        stats.as_ref(),
-                    )
-                    .await?;
+                    self.run_incremental(table, &schema, dest, &mut entry, &run_options)
+                        .await?;
                 }
             }
         }
@@ -421,17 +526,20 @@ impl PostgresSource {
         self.config.cdc.unwrap_or(true)
     }
 
-    pub async fn sync_cdc(
-        &self,
-        dest: &crate::destinations::bigquery::BigQueryDestination,
-        state: &mut ConnectionState,
-        mode: crate::types::SyncMode,
-        dry_run: bool,
-        default_batch_size: usize,
-        tables: &[ResolvedPostgresTable],
-        schema_diff_enabled: bool,
-        stats: Option<StatsHandle>,
-    ) -> Result<()> {
+    pub async fn sync_cdc(&self, request: CdcSyncRequest<'_>) -> Result<()> {
+        let CdcSyncRequest {
+            dest,
+            state,
+            state_handle,
+            mode,
+            dry_run,
+            follow,
+            default_batch_size,
+            tables,
+            schema_diff_enabled,
+            stats,
+            shutdown,
+        } = request;
         if dry_run {
             info!("dry-run: skipping CDC sync");
             return Ok(());
@@ -493,28 +601,28 @@ impl PostgresSource {
                 .postgres
                 .get(&table_cfg.name)
                 .and_then(|checkpoint| checkpoint.schema_snapshot.clone());
-            if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema) {
-                if !diff.is_empty() {
-                    if schema_diff_enabled {
-                        log_schema_diff(&table_cfg.name, &diff);
+            if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema)
+                && !diff.is_empty()
+            {
+                if schema_diff_enabled {
+                    log_schema_diff(&table_cfg.name, &diff);
+                }
+                match policy {
+                    SchemaChangePolicy::Fail => {
+                        anyhow::bail!(
+                            "schema change detected for {}; set schema_changes=auto or resync",
+                            table_cfg.name
+                        );
                     }
-                    match policy {
-                        SchemaChangePolicy::Fail => {
+                    SchemaChangePolicy::Resync => {
+                        resync_tables.insert(*table_id);
+                    }
+                    SchemaChangePolicy::Auto => {
+                        if diff.has_incompatible() {
                             anyhow::bail!(
-                                "schema change detected for {}; set schema_changes=auto or resync",
+                                "incompatible schema change detected for {}; set schema_changes=resync or fail",
                                 table_cfg.name
                             );
-                        }
-                        SchemaChangePolicy::Resync => {
-                            resync_tables.insert(*table_id);
-                        }
-                        SchemaChangePolicy::Auto => {
-                            if diff.has_incompatible() {
-                                anyhow::bail!(
-                                    "incompatible schema change detected for {}; set schema_changes=resync or fail",
-                                    table_cfg.name
-                                );
-                            }
                         }
                     }
                 }
@@ -536,34 +644,35 @@ impl PostgresSource {
         {
             let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
             cdc_state.slot_name = Some(slot_name.clone());
+            if let Some(state_handle) = &state_handle {
+                state_handle.save_postgres_cdc_state(cdc_state).await?;
+            }
         }
         let mut last_lsn = state.postgres_cdc.as_ref().and_then(|s| s.last_lsn.clone());
 
         let mut start_lsn = None;
-        let mut needs_snapshot =
-            mode == crate::types::SyncMode::Full || last_lsn.is_none();
+        let mut needs_snapshot = mode == crate::types::SyncMode::Full || last_lsn.is_none();
         if !resync_tables.is_empty() {
             needs_snapshot = true;
         }
 
         if needs_snapshot {
-            if let Err(err) = replication_client.delete_slot(&slot_name).await {
-                if err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound {
-                    return Err(err.into());
-                }
+            if let Err(err) = replication_client.delete_slot(&slot_name).await
+                && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
+            {
+                return Err(err.into());
             }
 
             let (transaction, slot) = replication_client
                 .create_slot_with_transaction(&slot_name)
                 .await?;
 
-            let snapshot_table_ids: HashSet<TableId> = if mode == crate::types::SyncMode::Full
-                || last_lsn.is_none()
-            {
-                include_tables.clone()
-            } else {
-                resync_tables.clone()
-            };
+            let snapshot_table_ids: HashSet<TableId> =
+                if mode == crate::types::SyncMode::Full || last_lsn.is_none() {
+                    include_tables.clone()
+                } else {
+                    resync_tables.clone()
+                };
 
             if mode == crate::types::SyncMode::Full {
                 for table_id in &snapshot_table_ids {
@@ -588,11 +697,7 @@ impl PostgresSource {
                     .context("missing table schema for CDC copy")?;
                 info!(table = %info.source_name, "starting CDC snapshot copy");
                 let copy_stream = transaction
-                    .get_table_copy_stream(
-                        *table_id,
-                        &etl_schema.column_schemas,
-                        Some(publication),
-                    )
+                    .get_table_copy_stream(*table_id, &etl_schema.column_schemas, Some(publication))
                     .await?;
                 let stream =
                     TableCopyStream::wrap(copy_stream, &etl_schema.column_schemas, pipeline_id);
@@ -607,7 +712,9 @@ impl PostgresSource {
                                 .record_extract(&info.source_name, buffer.len(), 0)
                                 .await;
                         }
-                        cdc_dest.write_table_rows(*table_id, std::mem::take(&mut buffer)).await?;
+                        cdc_dest
+                            .write_table_rows(*table_id, std::mem::take(&mut buffer))
+                            .await?;
                     }
                 }
                 if !buffer.is_empty() {
@@ -640,24 +747,31 @@ impl PostgresSource {
         let last_flushed = self
             .stream_cdc_changes(
                 replication_client.clone(),
-                publication,
-                &slot_name,
-                start_lsn,
-                pipeline_id,
-                &include_tables,
-                &store,
-                &cdc_dest,
-                idle_timeout,
-                max_pending_events,
-                &table_ids,
-                &mut table_info_map,
-                &mut etl_schemas,
-                &mut table_hashes,
-                &mut table_snapshots,
-                state,
-                policy,
-                schema_diff_enabled,
-                stats.clone(),
+                CdcStreamConfig {
+                    publication,
+                    slot_name: &slot_name,
+                    start_lsn,
+                    pipeline_id,
+                    idle_timeout,
+                    max_pending_events,
+                    follow,
+                    shutdown: shutdown.clone(),
+                },
+                CdcStreamRuntime {
+                    include_tables: &include_tables,
+                    table_configs: &table_ids,
+                    store: &store,
+                    dest: &cdc_dest,
+                    table_info_map: &mut table_info_map,
+                    etl_schemas: &mut etl_schemas,
+                    table_hashes: &mut table_hashes,
+                    table_snapshots: &mut table_snapshots,
+                    state,
+                    schema_policy: policy,
+                    schema_diff_enabled,
+                    stats: stats.clone(),
+                    state_handle: state_handle.clone(),
+                },
             )
             .await?;
 
@@ -669,16 +783,21 @@ impl PostgresSource {
 
         if let Some(cdc_state) = state.postgres_cdc.as_mut() {
             cdc_state.last_lsn = last_lsn;
+            if let Some(state_handle) = &state_handle {
+                state_handle.save_postgres_cdc_state(cdc_state).await?;
+            }
         }
 
         for (table_id, hash) in table_hashes {
             if let Some(info) = table_info_map.get(&table_id) {
-                let entry = state
-                    .postgres
-                    .entry(info.source_name.clone())
-                    .or_insert_with(TableCheckpoint::default);
+                let entry = state.postgres.entry(info.source_name.clone()).or_default();
                 entry.schema_hash = Some(hash);
                 entry.schema_snapshot = table_snapshots.get(&table_id).cloned();
+                if let Some(state_handle) = &state_handle {
+                    state_handle
+                        .save_postgres_checkpoint(&info.source_name, entry)
+                        .await?;
+                }
             }
         }
 
@@ -724,14 +843,11 @@ impl PostgresSource {
         schema: &TableSchema,
         dest: &dyn Destination,
         checkpoint: &mut TableCheckpoint,
-        dry_run: bool,
-        default_batch_size: usize,
-        stats: Option<&StatsHandle>,
+        options: &TableRunOptions<'_>,
     ) -> Result<()> {
-        let batch_size = self.config.batch_size.unwrap_or(default_batch_size);
         let (schema_name, table_name) = split_table_name(&table.name);
 
-        if !dry_run {
+        if !options.dry_run {
             // Ensure table exists after truncate; emulator deletes tables on truncate.
             dest.ensure_table(schema).await?;
         }
@@ -746,7 +862,10 @@ impl PostgresSource {
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let select_expr = format!("{}, {}::text as {}", select_columns, table.primary_key, pk_alias);
+        let select_expr = format!(
+            "{}, {}::text as {}",
+            select_columns, table.primary_key, pk_alias
+        );
         let mut last_pk: Option<String> = None;
         let has_where = table.where_clause.is_some();
         let base_sql = if let Some(where_clause) = &table.where_clause {
@@ -765,10 +884,7 @@ impl PostgresSource {
                 table = table_name
             )
         };
-        let sql_without_pk = format!(
-            "{} ORDER BY {} LIMIT $1",
-            base_sql, table.primary_key
-        );
+        let sql_without_pk = format!("{} ORDER BY {} LIMIT $1", base_sql, table.primary_key);
         let sql_with_pk = if has_where {
             format!(
                 "{} AND {} > $1::{} ORDER BY {} LIMIT $2",
@@ -785,12 +901,12 @@ impl PostgresSource {
             let rows = if let Some(last_pk_value) = last_pk.as_ref() {
                 sqlx::query(&sql_with_pk)
                     .bind(last_pk_value)
-                    .bind(batch_size as i64)
+                    .bind(options.batch_size as i64)
                     .fetch_all(&self.pool)
                     .await?
             } else {
                 sqlx::query(&sql_without_pk)
-                    .bind(batch_size as i64)
+                    .bind(options.batch_size as i64)
                     .fetch_all(&self.pool)
                     .await?
             };
@@ -801,22 +917,22 @@ impl PostgresSource {
             }
 
             let batch = rows_to_batch(schema, &rows, table, Utc::now())?;
-            if let Some(stats) = stats {
+            if let Some(stats) = options.stats {
                 stats
                     .record_extract(&table.name, rows.len(), extract_ms)
                     .await;
             }
-            if !dry_run {
+            if !options.dry_run {
                 let load_start = Instant::now();
                 dest.write_batch(
                     &schema.name,
-                    &schema,
+                    schema,
                     &batch.frame,
                     WriteMode::Append,
                     Some(&table.primary_key),
                 )
                 .await?;
-                if let Some(stats) = stats {
+                if let Some(stats) = options.stats {
                     let load_ms = load_start.elapsed().as_millis() as u64;
                     stats
                         .record_load(&table.name, rows.len(), 0, 0, load_ms)
@@ -830,6 +946,11 @@ impl PostgresSource {
                 .context("missing primary key value for keyset pagination")?;
             last_pk = Some(last_value);
             checkpoint.last_synced_at = Some(Utc::now());
+            if let Some(state_handle) = &options.state_handle {
+                state_handle
+                    .save_postgres_checkpoint(&table.name, checkpoint)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -840,11 +961,8 @@ impl PostgresSource {
         schema: &TableSchema,
         dest: &dyn Destination,
         checkpoint: &mut TableCheckpoint,
-        dry_run: bool,
-        default_batch_size: usize,
-        stats: Option<&StatsHandle>,
+        options: &TableRunOptions<'_>,
     ) -> Result<()> {
-        let batch_size = self.config.batch_size.unwrap_or(default_batch_size);
         let updated_at = table
             .updated_at_column
             .as_ref()
@@ -861,9 +979,9 @@ impl PostgresSource {
             );
         }
 
-        let mut last_seen = checkpoint.last_synced_at.unwrap_or_else(|| {
-            DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
-        });
+        let mut last_seen = checkpoint
+            .last_synced_at
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now));
         let mut last_pk = checkpoint.last_primary_key.clone();
 
         let select_columns = schema
@@ -874,29 +992,29 @@ impl PostgresSource {
             .join(", ");
 
         loop {
-            let sql = build_incremental_sql(
-                &schema_name,
-                &table_name,
-                &select_columns,
+            let sql = build_incremental_sql(&IncrementalSqlParts {
+                schema: &schema_name,
+                table: &table_name,
+                columns: &select_columns,
                 updated_at,
-                &table.primary_key,
-                &pk_cast,
-                table.where_clause.as_deref(),
-                last_pk.is_some(),
-            );
+                primary_key: &table.primary_key,
+                pk_cast: &pk_cast,
+                where_clause: table.where_clause.as_deref(),
+                has_last_pk: last_pk.is_some(),
+            });
 
             let extract_start = Instant::now();
             let rows = if let Some(last_pk_value) = last_pk.as_ref() {
                 sqlx::query(&sql)
                     .bind(last_seen)
                     .bind(last_pk_value)
-                    .bind(batch_size as i64)
+                    .bind(options.batch_size as i64)
                     .fetch_all(&self.pool)
                     .await?
             } else {
                 sqlx::query(&sql)
                     .bind(last_seen)
-                    .bind(batch_size as i64)
+                    .bind(options.batch_size as i64)
                     .fetch_all(&self.pool)
                     .await?
             };
@@ -908,22 +1026,22 @@ impl PostgresSource {
 
             let batch_synced_at = Utc::now();
             let batch = rows_to_batch(schema, &rows, table, batch_synced_at)?;
-            if let Some(stats) = stats {
+            if let Some(stats) = options.stats {
                 stats
                     .record_extract(&table.name, rows.len(), extract_ms)
                     .await;
             }
-            if !dry_run {
+            if !options.dry_run {
                 let load_start = Instant::now();
                 dest.write_batch(
                     &schema.name,
-                    &schema,
+                    schema,
                     &batch.frame,
                     WriteMode::Upsert,
                     Some(&table.primary_key),
                 )
                 .await?;
-                if let Some(stats) = stats {
+                if let Some(stats) = options.stats {
                     let load_ms = load_start.elapsed().as_millis() as u64;
                     stats
                         .record_load(&table.name, rows.len(), rows.len(), 0, load_ms)
@@ -941,6 +1059,11 @@ impl PostgresSource {
             last_pk = Some(next_pk.clone());
             checkpoint.last_synced_at = Some(last_seen);
             checkpoint.last_primary_key = Some(next_pk);
+            if let Some(state_handle) = &options.state_handle {
+                state_handle
+                    .save_postgres_checkpoint(&table.name, checkpoint)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -1021,10 +1144,7 @@ impl PostgresSource {
             .await
             .context("checking wal_level")?;
         if wal_level != "logical" {
-            anyhow::bail!(
-                "wal_level must be logical for CDC (found '{}')",
-                wal_level
-            );
+            anyhow::bail!("wal_level must be logical for CDC (found '{}')", wal_level);
         }
         Ok(())
     }
@@ -1184,25 +1304,32 @@ impl PostgresSource {
     async fn stream_cdc_changes(
         &self,
         replication_client: PgReplicationClient,
-        publication: &str,
-        slot_name: &str,
-        start_lsn: etl::types::PgLsn,
-        pipeline_id: u64,
-        include_tables: &HashSet<TableId>,
-        store: &MemoryStore,
-        dest: &EtlBigQueryDestination,
-        idle_timeout: Duration,
-        max_pending_events: usize,
-        table_configs: &HashMap<TableId, ResolvedPostgresTable>,
-        table_info_map: &mut HashMap<TableId, CdcTableInfo>,
-        etl_schemas: &mut HashMap<TableId, EtlTableSchema>,
-        table_hashes: &mut HashMap<TableId, String>,
-        table_snapshots: &mut HashMap<TableId, Vec<SchemaFieldSnapshot>>,
-        state: &mut ConnectionState,
-        schema_policy: SchemaChangePolicy,
-        schema_diff_enabled: bool,
-        stats: Option<StatsHandle>,
+        config: CdcStreamConfig<'_>,
+        runtime: CdcStreamRuntime<'_>,
     ) -> Result<etl::types::PgLsn> {
+        let CdcStreamConfig {
+            publication,
+            slot_name,
+            start_lsn,
+            pipeline_id,
+            idle_timeout,
+            max_pending_events,
+            follow,
+            shutdown,
+        } = config;
+        let include_tables = runtime.include_tables;
+        let table_configs = runtime.table_configs;
+        let store = runtime.store;
+        let dest = runtime.dest;
+        let table_info_map = runtime.table_info_map;
+        let etl_schemas = runtime.etl_schemas;
+        let table_hashes = runtime.table_hashes;
+        let table_snapshots = runtime.table_snapshots;
+        let state = runtime.state;
+        let schema_policy = runtime.schema_policy;
+        let schema_diff_enabled = runtime.schema_diff_enabled;
+        let stats = runtime.stats;
+        let state_handle = runtime.state_handle;
         let logical_stream = replication_client
             .start_logical_replication(publication, slot_name, start_lsn)
             .await?;
@@ -1215,16 +1342,55 @@ impl PostgresSource {
         let mut last_flushed_lsn = start_lsn;
         let mut in_tx = false;
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
+        let mut shutdown = shutdown;
+        let mut shutdown_requested = false;
 
         loop {
-            let message = match timeout(idle_timeout, stream.next()).await {
-                Ok(Some(msg)) => msg?,
-                Ok(None) => break,
-                Err(_) => {
-                    if in_tx {
+            if shutdown_requested && !in_tx {
+                break;
+            }
+
+            let message = if let Some(shutdown) = shutdown.as_mut() {
+                tokio::select! {
+                    changed = shutdown.changed(), if !shutdown_requested => {
+                        if changed {
+                            shutdown_requested = true;
+                            if in_tx {
+                                continue;
+                            }
+                            break;
+                        }
                         continue;
                     }
-                    break;
+                    result = timeout(idle_timeout, stream.next()) => {
+                        match result {
+                            Ok(Some(msg)) => msg?,
+                            Ok(None) => break,
+                            Err(_) => {
+                                if in_tx {
+                                    continue;
+                                }
+                                if follow {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match timeout(idle_timeout, stream.next()).await {
+                    Ok(Some(msg)) => msg?,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if in_tx {
+                            continue;
+                        }
+                        if follow {
+                            continue;
+                        }
+                        break;
+                    }
                 }
             };
 
@@ -1261,16 +1427,15 @@ impl PostgresSource {
                             pending_stats.clear();
                         }
                         LogicalReplicationMessage::Commit(commit) => {
-                            let commit_lsn =
-                                etl::types::PgLsn::from(commit.commit_lsn());
-                            if let Some(expected) = expected_commit_lsn.take() {
-                                if expected != commit_lsn {
-                                    warn!(
-                                        expected = %expected,
-                                        actual = %commit_lsn,
-                                        "commit lsn mismatch"
-                                    );
-                                }
+                            let commit_lsn = etl::types::PgLsn::from(commit.commit_lsn());
+                            if let Some(expected) = expected_commit_lsn.take()
+                                && expected != commit_lsn
+                            {
+                                warn!(
+                                    expected = %expected,
+                                    actual = %commit_lsn,
+                                    "commit lsn mismatch"
+                                );
                             }
 
                             if !pending_events.is_empty() {
@@ -1280,9 +1445,7 @@ impl PostgresSource {
                             if let Some(stats) = &stats {
                                 for (table_id, count) in pending_stats.drain() {
                                     if let Some(cfg) = table_configs.get(&table_id) {
-                                        stats
-                                            .record_extract(&cfg.name, count, 0)
-                                            .await;
+                                        stats.record_extract(&cfg.name, count, 0).await;
                                     }
                                 }
                             } else {
@@ -1299,6 +1462,11 @@ impl PostgresSource {
                                     StatusUpdateType::KeepAlive,
                                 )
                                 .await?;
+                            let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
+                            cdc_state.last_lsn = Some(last_flushed_lsn.to_string());
+                            if let Some(state_handle) = &state_handle {
+                                state_handle.save_postgres_cdc_state(cdc_state).await?;
+                            }
                             in_tx = false;
                         }
                         LogicalReplicationMessage::Relation(relation) => {
@@ -1306,20 +1474,21 @@ impl PostgresSource {
                             if !include_tables.contains(&table_id) {
                                 continue;
                             }
-                            self.handle_relation_change(
-                                table_id,
+                            let mut relation_runtime = CdcRelationRuntime {
                                 table_configs,
                                 store,
                                 dest,
-                                table_info_map,
-                                etl_schemas,
-                                table_hashes,
-                                table_snapshots,
-                                state,
-                                schema_policy.clone(),
+                                table_info_map: &mut *table_info_map,
+                                etl_schemas: &mut *etl_schemas,
+                                table_hashes: &mut *table_hashes,
+                                table_snapshots: &mut *table_snapshots,
+                                state: &mut *state,
+                                schema_policy: schema_policy.clone(),
                                 schema_diff_enabled,
-                            )
-                            .await?;
+                                state_handle: state_handle.clone(),
+                            };
+                            self.handle_relation_change(table_id, &mut relation_runtime)
+                                .await?;
                         }
                         LogicalReplicationMessage::Insert(insert) => {
                             let table_id = TableId::new(insert.rel_id());
@@ -1333,8 +1502,7 @@ impl PostgresSource {
                                 );
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
-                            let commit_lsn =
-                                expected_commit_lsn.unwrap_or(start);
+                            let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -1364,8 +1532,7 @@ impl PostgresSource {
                                 );
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
-                            let commit_lsn =
-                                expected_commit_lsn.unwrap_or(start);
+                            let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -1408,8 +1575,7 @@ impl PostgresSource {
                                 );
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
-                            let commit_lsn =
-                                expected_commit_lsn.unwrap_or(start);
+                            let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -1442,8 +1608,7 @@ impl PostgresSource {
                             {
                                 continue;
                             }
-                            let commit_lsn =
-                                expected_commit_lsn.unwrap_or(start);
+                            let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let event = TruncateEvent {
                                 start_lsn: start,
                                 commit_lsn,
@@ -1452,7 +1617,8 @@ impl PostgresSource {
                             };
                             pending_events.push(Event::Truncate(event));
                         }
-                        LogicalReplicationMessage::Origin(_) | LogicalReplicationMessage::Type(_) => {}
+                        LogicalReplicationMessage::Origin(_)
+                        | LogicalReplicationMessage::Type(_) => {}
                         _ => {}
                     }
                 }
@@ -1466,81 +1632,79 @@ impl PostgresSource {
     async fn handle_relation_change(
         &self,
         table_id: TableId,
-        table_configs: &HashMap<TableId, ResolvedPostgresTable>,
-        store: &MemoryStore,
-        dest: &EtlBigQueryDestination,
-        table_info_map: &mut HashMap<TableId, CdcTableInfo>,
-        etl_schemas: &mut HashMap<TableId, EtlTableSchema>,
-        table_hashes: &mut HashMap<TableId, String>,
-        table_snapshots: &mut HashMap<TableId, Vec<SchemaFieldSnapshot>>,
-        state: &mut ConnectionState,
-        schema_policy: SchemaChangePolicy,
-        schema_diff_enabled: bool,
+        runtime: &mut CdcRelationRuntime<'_>,
     ) -> Result<()> {
-        let table_cfg = table_configs
+        let table_cfg = runtime
+            .table_configs
             .get(&table_id)
             .context("relation for unknown table")?;
 
         let etl_schema = self.load_etl_table_schema(table_id).await?;
-        store.store_table_schema(etl_schema.clone()).await?;
+        runtime.store.store_table_schema(etl_schema.clone()).await?;
         let info = cdc_table_info_from_schema(table_cfg, &etl_schema)?;
         let new_hash = schema_fingerprint(&info.schema);
-        let prev_snapshot = table_snapshots.get(&table_id).cloned();
-        if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema) {
-            if !diff.is_empty() {
-                if schema_diff_enabled {
-                    log_schema_diff(&table_cfg.name, &diff);
+        let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
+        if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema)
+            && !diff.is_empty()
+        {
+            if runtime.schema_diff_enabled {
+                log_schema_diff(&table_cfg.name, &diff);
+            }
+            match runtime.schema_policy.clone() {
+                SchemaChangePolicy::Fail => {
+                    anyhow::bail!(
+                        "schema change detected for {}; set schema_changes=auto or resync",
+                        table_cfg.name
+                    );
                 }
-                match schema_policy {
-                    SchemaChangePolicy::Fail => {
+                SchemaChangePolicy::Resync => {
+                    warn!(
+                        table = %table_cfg.name,
+                        "schema change detected; marking CDC for resync"
+                    );
+                    if let Some(cdc_state) = runtime.state.postgres_cdc.as_mut() {
+                        cdc_state.last_lsn = None;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "schema change detected for {}; resync required",
+                        table_cfg.name
+                    ));
+                }
+                SchemaChangePolicy::Auto => {
+                    if diff.has_incompatible() {
                         anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto or resync",
+                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
                             table_cfg.name
                         );
                     }
-                    SchemaChangePolicy::Resync => {
-                        warn!(
-                            table = %table_cfg.name,
-                            "schema change detected; marking CDC for resync"
-                        );
-                        if let Some(cdc_state) = state.postgres_cdc.as_mut() {
-                            cdc_state.last_lsn = None;
-                        }
-                        return Err(anyhow::anyhow!(
-                            "schema change detected for {}; resync required",
-                            table_cfg.name
-                        ));
-                    }
-                    SchemaChangePolicy::Auto => {
-                        if diff.has_incompatible() {
-                            anyhow::bail!(
-                                "incompatible schema change detected for {}; set schema_changes=resync or fail",
-                                table_cfg.name
-                            );
-                        }
-                        info!(
-                            table = %table_cfg.name,
-                            "schema change detected; updating destination schema"
-                        );
-                    }
+                    info!(
+                        table = %table_cfg.name,
+                        "schema change detected; updating destination schema"
+                    );
                 }
             }
         }
 
         let snapshot = schema_snapshot_from_schema(&info.schema);
-        dest.ensure_table_schema(&info.schema).await?;
-        dest.update_table_info(info.clone()).await?;
-        table_info_map.insert(table_id, info);
-        etl_schemas.insert(table_id, etl_schema);
-        table_hashes.insert(table_id, new_hash.clone());
-        table_snapshots.insert(table_id, snapshot.clone());
+        runtime.dest.ensure_table_schema(&info.schema).await?;
+        runtime.dest.update_table_info(info.clone()).await?;
+        runtime.table_info_map.insert(table_id, info);
+        runtime.etl_schemas.insert(table_id, etl_schema);
+        runtime.table_hashes.insert(table_id, new_hash.clone());
+        runtime.table_snapshots.insert(table_id, snapshot.clone());
 
-        let entry = state
+        let entry = runtime
+            .state
             .postgres
             .entry(table_cfg.name.clone())
-            .or_insert_with(TableCheckpoint::default);
+            .or_default();
         entry.schema_hash = Some(new_hash);
         entry.schema_snapshot = Some(snapshot);
+        if let Some(state_handle) = &runtime.state_handle {
+            state_handle
+                .save_postgres_checkpoint(&table_cfg.name, entry)
+                .await?;
+        }
 
         Ok(())
     }
@@ -1558,12 +1722,8 @@ fn split_table_name(table: &str) -> (String, String) {
 
 fn normalize_filter(value: &str) -> String {
     let mut trimmed = value.trim();
-    loop {
-        if let Some(stripped) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-            trimmed = stripped.trim();
-        } else {
-            break;
-        }
+    while let Some(stripped) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        trimmed = stripped.trim();
     }
     trimmed
         .chars()
@@ -1599,7 +1759,9 @@ impl SchemaDiff {
     }
 
     fn has_incompatible(&self) -> bool {
-        !self.removed.is_empty() || !self.type_changed.is_empty() || !self.nullable_changed.is_empty()
+        !self.removed.is_empty()
+            || !self.type_changed.is_empty()
+            || !self.nullable_changed.is_empty()
     }
 }
 
@@ -1631,8 +1793,11 @@ fn schema_diff(
         current_names.insert(col.name.as_str());
         if let Some(prev) = prev_map.get(col.name.as_str()) {
             if prev.data_type != col.data_type {
-                diff.type_changed
-                    .push((col.name.clone(), prev.data_type.clone(), col.data_type.clone()));
+                diff.type_changed.push((
+                    col.name.clone(),
+                    prev.data_type.clone(),
+                    col.data_type.clone(),
+                ));
             } else if prev.nullable != col.nullable {
                 diff.nullable_changed
                     .push((col.name.clone(), prev.nullable, col.nullable));
@@ -1684,10 +1849,10 @@ fn required_columns(table: &ResolvedPostgresTable) -> HashSet<String> {
     if let Some(updated_at) = &table.updated_at_column {
         required.insert(updated_at.clone());
     }
-    if table.soft_delete {
-        if let Some(column) = &table.soft_delete_column {
-            required.insert(column.clone());
-        }
+    if table.soft_delete
+        && let Some(column) = &table.soft_delete_column
+    {
+        required.insert(column.clone());
     }
     required
 }
@@ -1755,7 +1920,9 @@ fn rows_to_batch(
             values.push(value);
         }
 
-        values.push(AnyValue::StringOwned(PlSmallStr::from(synced_at.to_rfc3339())));
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            synced_at.to_rfc3339(),
+        )));
         let deleted_at = derive_deleted_at(row, table).unwrap_or(Value::Null);
         match deleted_at {
             Value::String(value) => values.push(AnyValue::StringOwned(PlSmallStr::from(value))),
@@ -1782,10 +1949,10 @@ fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> Option<Value
         return Some(Value::Null);
     }
 
-    if let Ok(flag) = row.try_get::<bool, _>(column.as_str()) {
-        if flag {
-            return Some(Value::String(Utc::now().to_rfc3339()));
-        }
+    if let Ok(flag) = row.try_get::<bool, _>(column.as_str())
+        && flag
+    {
+        return Some(Value::String(Utc::now().to_rfc3339()));
     }
 
     if let Ok(ts) = row.try_get::<NaiveDateTime, _>(column.as_str()) {
@@ -1809,15 +1976,9 @@ fn pg_value_to_anyvalue(row: &PgRow, column: &ColumnSchema) -> Result<AnyValue<'
         DataType::String => row
             .try_get::<Option<String>, _>(name)?
             .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
-        DataType::Int64 => row
-            .try_get::<Option<i64>, _>(name)?
-            .map(AnyValue::Int64),
-        DataType::Float64 => row
-            .try_get::<Option<f64>, _>(name)?
-            .map(AnyValue::Float64),
-        DataType::Bool => row
-            .try_get::<Option<bool>, _>(name)?
-            .map(AnyValue::Boolean),
+        DataType::Int64 => row.try_get::<Option<i64>, _>(name)?.map(AnyValue::Int64),
+        DataType::Float64 => row.try_get::<Option<f64>, _>(name)?.map(AnyValue::Float64),
+        DataType::Bool => row.try_get::<Option<bool>, _>(name)?.map(AnyValue::Boolean),
         DataType::Timestamp => {
             if let Ok(value) = row.try_get::<Option<NaiveDateTime>, _>(name) {
                 value
@@ -1884,41 +2045,32 @@ fn read_primary_key(row: &PgRow, column: &str) -> Result<String> {
     read_primary_key_from_value(raw)
 }
 
-fn build_incremental_sql(
-    schema: &str,
-    table: &str,
-    columns: &str,
-    updated_at: &str,
-    primary_key: &str,
-    pk_cast: &str,
-    where_clause: Option<&str>,
-    has_last_pk: bool,
-) -> String {
+fn build_incremental_sql(parts: &IncrementalSqlParts<'_>) -> String {
     let mut where_clauses = Vec::new();
-    if let Some(where_clause) = where_clause {
+    if let Some(where_clause) = parts.where_clause {
         where_clauses.push(format!("({})", where_clause));
     }
-    let pagination_clause = if has_last_pk {
+    let pagination_clause = if parts.has_last_pk {
         format!(
             "({updated_at} > $1 OR ({updated_at} = $1 AND {pk} > $2::{pk_cast}))",
-            updated_at = updated_at,
-            pk = primary_key,
-            pk_cast = pk_cast
+            updated_at = parts.updated_at,
+            pk = parts.primary_key,
+            pk_cast = parts.pk_cast
         )
     } else {
-        format!("{updated_at} > $1", updated_at = updated_at)
+        format!("{updated_at} > $1", updated_at = parts.updated_at)
     };
     where_clauses.push(pagination_clause);
     let where_sql = format!(" WHERE {}", where_clauses.join(" AND "));
-    let limit_placeholder = if has_last_pk { "$3" } else { "$2" };
+    let limit_placeholder = if parts.has_last_pk { "$3" } else { "$2" };
     format!(
         "SELECT {columns} FROM {schema}.{table}{where_sql} ORDER BY {updated_at} ASC, {pk} ASC LIMIT {limit}",
-        columns = columns,
-        schema = schema,
-        table = table,
+        columns = parts.columns,
+        schema = parts.schema,
+        table = parts.table,
         where_sql = where_sql,
-        updated_at = updated_at,
-        pk = primary_key,
+        updated_at = parts.updated_at,
+        pk = parts.primary_key,
         limit = limit_placeholder
     )
 }
@@ -2012,16 +2164,18 @@ fn cdc_table_info_from_schema(
         );
     }
 
-    Ok(CdcTableInfo::new(
-        etl_schema.id,
-        etl_schema.name.to_string(),
-        schema.name.clone(),
-        schema,
-        table_cfg.primary_key.clone(),
-        table_cfg.soft_delete,
-        table_cfg.soft_delete_column.clone(),
+    CdcTableInfo::new(
+        crate::destinations::etl_bigquery::CdcTableSpec {
+            table_id: etl_schema.id,
+            source_name: etl_schema.name.to_string(),
+            dest_name: schema.name.clone(),
+            schema,
+            primary_key: table_cfg.primary_key.clone(),
+            soft_delete: table_cfg.soft_delete,
+            soft_delete_column: table_cfg.soft_delete_column.clone(),
+        },
         etl_schema,
-    )?)
+    )
 }
 
 fn tuple_to_row(
@@ -2106,16 +2260,16 @@ mod tests {
 
     #[test]
     fn incremental_sql_uses_strict_paging_without_last_pk() {
-        let sql = build_incremental_sql(
-            "public",
-            "accounts",
-            "id, updated_at",
-            "updated_at",
-            "id",
-            "bigint",
-            None,
-            false,
-        );
+        let sql = build_incremental_sql(&IncrementalSqlParts {
+            schema: "public",
+            table: "accounts",
+            columns: "id, updated_at",
+            updated_at: "updated_at",
+            primary_key: "id",
+            pk_cast: "bigint",
+            where_clause: None,
+            has_last_pk: false,
+        });
         assert!(sql.contains("updated_at > $1"));
         assert!(!sql.contains(">="));
         assert!(sql.contains("ORDER BY updated_at ASC, id ASC LIMIT $2"));
@@ -2123,16 +2277,16 @@ mod tests {
 
     #[test]
     fn incremental_sql_uses_tie_breaker_with_last_pk_and_filters() {
-        let sql = build_incremental_sql(
-            "public",
-            "accounts",
-            "id, updated_at",
-            "updated_at",
-            "id",
-            "bigint",
-            Some("tenant_id = 42"),
-            true,
-        );
+        let sql = build_incremental_sql(&IncrementalSqlParts {
+            schema: "public",
+            table: "accounts",
+            columns: "id, updated_at",
+            updated_at: "updated_at",
+            primary_key: "id",
+            pk_cast: "bigint",
+            where_clause: Some("tenant_id = 42"),
+            has_last_pk: true,
+        });
         assert!(sql.contains("(tenant_id = 42)"));
         assert!(sql.contains("(updated_at > $1 OR (updated_at = $1 AND id > $2::bigint))"));
         assert!(sql.contains("ORDER BY updated_at ASC, id ASC LIMIT $3"));
@@ -2140,8 +2294,8 @@ mod tests {
 
     #[test]
     fn read_primary_key_prefers_string_then_numeric() {
-        let value = read_primary_key_from_value(Value::String("abc123".to_string()))
-            .expect("string pk");
+        let value =
+            read_primary_key_from_value(Value::String("abc123".to_string())).expect("string pk");
         assert_eq!(value, "abc123");
 
         let value = read_primary_key_from_value(Value::Number(serde_json::Number::from(42)))
@@ -2151,8 +2305,7 @@ mod tests {
 
     #[test]
     fn read_primary_key_supports_bool_and_null() {
-        let value =
-            read_primary_key_from_value(Value::Bool(true)).expect("bool pk");
+        let value = read_primary_key_from_value(Value::Bool(true)).expect("bool pk");
         assert_eq!(value, "true");
 
         assert!(read_primary_key_from_value(Value::Null).is_err());
@@ -2160,24 +2313,19 @@ mod tests {
 
     #[test]
     fn read_primary_key_supports_uuid_and_decimal() {
-        let uuid = Uuid::parse_str("2e4b7f22-5a7f-4f94-9a9f-6b1f1c2e0a5b")
-            .expect("valid uuid");
-        let value = read_primary_key_from_value(Value::String(uuid.to_string()))
-            .expect("uuid pk");
+        let uuid = Uuid::parse_str("2e4b7f22-5a7f-4f94-9a9f-6b1f1c2e0a5b").expect("valid uuid");
+        let value = read_primary_key_from_value(Value::String(uuid.to_string())).expect("uuid pk");
         assert_eq!(value, uuid.to_string());
 
         let decimal = BigDecimal::from(12345i64);
-        let value = read_primary_key_from_value(Value::String(decimal.to_string()))
-            .expect("decimal pk");
+        let value =
+            read_primary_key_from_value(Value::String(decimal.to_string())).expect("decimal pk");
         assert_eq!(value, "12345");
     }
 
     #[test]
     fn primary_key_cast_qualifies_non_pg_schema() {
-        assert_eq!(
-            format_cast_type("citext", "public"),
-            "public.citext"
-        );
+        assert_eq!(format_cast_type("citext", "public"), "public.citext");
         assert_eq!(format_cast_type("uuid", "pg_catalog"), "uuid");
     }
 
@@ -2204,8 +2352,9 @@ mod tests {
             include: vec!["name".to_string()],
             exclude: vec!["updated_at".to_string()],
         };
-        let required: HashSet<String> =
-            ["id".to_string(), "updated_at".to_string()].into_iter().collect();
+        let required: HashSet<String> = ["id".to_string(), "updated_at".to_string()]
+            .into_iter()
+            .collect();
 
         let filtered = filter_columns(&all_columns, &selection, &required);
         let names: Vec<&str> = filtered.iter().map(|c| c.name.as_str()).collect();
@@ -2248,9 +2397,6 @@ mod tests {
         assert!(diff.has_incompatible());
         assert!(diff.added.contains(&"extra".to_string()));
         assert!(diff.removed.contains(&"id".to_string()));
-        assert!(diff
-            .type_changed
-            .iter()
-            .any(|(name, _, _)| name == "name"));
+        assert!(diff.type_changed.iter().any(|(name, _, _)| name == "name"));
     }
 }

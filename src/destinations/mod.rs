@@ -32,14 +32,20 @@ pub trait Destination: Send + Sync {
 
 pub fn with_metadata_schema(schema: &TableSchema) -> TableSchema {
     let mut columns = schema.columns.clone();
-    if !columns.iter().any(|c| c.name == crate::types::META_SYNCED_AT) {
+    if !columns
+        .iter()
+        .any(|c| c.name == crate::types::META_SYNCED_AT)
+    {
         columns.push(crate::types::ColumnSchema {
             name: crate::types::META_SYNCED_AT.to_string(),
             data_type: crate::types::DataType::Timestamp,
             nullable: false,
         });
     }
-    if !columns.iter().any(|c| c.name == crate::types::META_DELETED_AT) {
+    if !columns
+        .iter()
+        .any(|c| c.name == crate::types::META_DELETED_AT)
+    {
         columns.push(crate::types::ColumnSchema {
             name: crate::types::META_DELETED_AT.to_string(),
             data_type: crate::types::DataType::Timestamp,

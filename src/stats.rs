@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::Row;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -31,6 +32,24 @@ pub struct RunStatsSnapshot {
     pub api_calls: i64,
     pub rate_limit_hits: i64,
     pub tables: Vec<TableStatsSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub connection_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub rows_read: i64,
+    pub rows_written: i64,
+    pub rows_deleted: i64,
+    pub rows_upserted: i64,
+    pub extract_ms: i64,
+    pub load_ms: i64,
+    pub api_calls: i64,
+    pub rate_limit_hits: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +135,7 @@ impl StatsHandle {
         let table_stats = guard.tables.entry(table.to_string()).or_default();
         table_stats.rows_read += rows;
         table_stats.extract_ms += elapsed_ms as i64;
+        crate::telemetry::record_rows_read(table, rows as u64);
     }
 
     pub async fn record_load(
@@ -139,6 +159,7 @@ impl StatsHandle {
         table_stats.rows_upserted += upserted;
         table_stats.rows_deleted += deleted;
         table_stats.load_ms += elapsed_ms as i64;
+        crate::telemetry::record_rows_written(table, rows as u64);
     }
 
     pub async fn record_api_call(&self, rate_limited: bool) {
@@ -197,7 +218,10 @@ impl StatsDb {
         }
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true);
-        let pool = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
         let db = Self { pool };
         db.init().await?;
         Ok(db)
@@ -336,4 +360,95 @@ impl StatsDb {
 
         Ok(())
     }
+
+    pub async fn recent_runs(
+        &self,
+        connection_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RunSummary>> {
+        let limit = limit.max(1) as i64;
+        let rows = if let Some(connection_id) = connection_id {
+            sqlx::query(
+                r#"
+                select
+                    run_id,
+                    connection_id,
+                    started_at,
+                    finished_at,
+                    status,
+                    error,
+                    rows_read,
+                    rows_written,
+                    rows_deleted,
+                    rows_upserted,
+                    extract_ms,
+                    load_ms,
+                    api_calls,
+                    rate_limit_hits
+                from runs
+                where connection_id = ?
+                order by started_at desc
+                limit ?
+                "#,
+            )
+            .bind(connection_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                select
+                    run_id,
+                    connection_id,
+                    started_at,
+                    finished_at,
+                    status,
+                    error,
+                    rows_read,
+                    rows_written,
+                    rows_deleted,
+                    rows_upserted,
+                    extract_ms,
+                    load_ms,
+                    api_calls,
+                    rate_limit_hits
+                from runs
+                order by started_at desc
+                limit ?
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(RunSummary {
+                    run_id: row.try_get("run_id")?,
+                    connection_id: row.try_get("connection_id")?,
+                    started_at: parse_rfc3339(row.try_get("started_at")?)?,
+                    finished_at: row
+                        .try_get::<Option<String>, _>("finished_at")?
+                        .map(parse_rfc3339)
+                        .transpose()?,
+                    status: row.try_get("status")?,
+                    error: row.try_get("error")?,
+                    rows_read: row.try_get("rows_read")?,
+                    rows_written: row.try_get("rows_written")?,
+                    rows_deleted: row.try_get("rows_deleted")?,
+                    rows_upserted: row.try_get("rows_upserted")?,
+                    extract_ms: row.try_get("extract_ms")?,
+                    load_ms: row.try_get("load_ms")?,
+                    api_calls: row.try_get("api_calls")?,
+                    rate_limit_hits: row.try_get("rate_limit_hits")?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn parse_rfc3339(value: String) -> anyhow::Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(&value)?.with_timezone(&Utc))
 }

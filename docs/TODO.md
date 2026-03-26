@@ -3,7 +3,7 @@
 ## 0. Project Setup
 - [x] Define crate dependencies and feature flags (tokio, clap, serde, yaml, tracing, sqlx, reqwest, retry, secrecy).
 - [x] Enable overflow checks in release builds in `Cargo.toml`.
-- [ ] Add linting/format config if desired.
+- [x] Add CI linting and test workflow.
 
 ## 1. Core Architecture
 - [x] Define core traits: `Destination`.
@@ -13,7 +13,7 @@
 
 ## 2. Config + State
 - [x] Implement YAML config schema with connections, include/exclude selection, and sync options.
-- [x] Implement state file storage (JSON): last synced timestamp, LSN, per-table checkpoints.
+- [x] Implement durable SQLite-backed state storage with connection locking and per-table checkpoints.
 - [x] Implement config validation and `cdsync init` (connection check + schema preview).
 
 ## 3. Sources
@@ -49,10 +49,17 @@
 
 ## 6. Reliability
 - [x] Retry policy with exponential backoff.
-- [x] Checkpoint after each batch.
+- [x] Checkpoint after each batch/commit.
 - [x] Idempotent load with primary keys.
+- [x] Long-running CDC follow mode with retry supervision.
+- [x] Fail syncs on BigQuery row-level insert errors.
 
 ## 7. Tests
 - [x] Unit tests for type mapping and config parsing.
-- [ ] Integration tests with dockerized Postgres and mock BigQuery.
+- [x] Integration tests with dockerized Postgres and BigQuery emulator.
 - [x] Salesforce API mock tests.
+
+## 8. Reporting + Observability
+- [x] Add `report` command for recent run history.
+- [x] Add `reconcile` command for source vs destination row-count checks.
+- [x] Add OTLP metrics/tracing support.

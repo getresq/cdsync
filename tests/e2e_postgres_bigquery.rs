@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use cdsync::config::{BigQueryConfig, PostgresConfig, PostgresTableConfig, SchemaChangePolicy};
 use cdsync::destinations::bigquery::BigQueryDestination;
-use cdsync::sources::postgres::PostgresSource;
+use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::types::TableCheckpoint;
 mod support;
-use cdsync::types::{destination_table_name, SyncMode};
+use cdsync::types::{SyncMode, destination_table_name};
 use sqlx::postgres::PgPoolOptions;
 use std::env;
-use uuid::Uuid;
 use url::Url;
+use uuid::Uuid;
 
 #[tokio::test]
 #[ignore]
@@ -19,10 +19,8 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
         .context("set CDSYNC_E2E_BQ_HTTP to the BigQuery emulator HTTP base URL")?;
     let bq_grpc_raw = env::var("CDSYNC_E2E_BQ_GRPC")
         .context("set CDSYNC_E2E_BQ_GRPC to the BigQuery emulator gRPC host:port")?;
-    let project_id =
-        env::var("CDSYNC_E2E_BQ_PROJECT").unwrap_or_else(|_| "cdsync".to_string());
-    let dataset =
-        env::var("CDSYNC_E2E_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e".to_string());
+    let project_id = env::var("CDSYNC_E2E_BQ_PROJECT").unwrap_or_else(|_| "cdsync".to_string());
+    let dataset = env::var("CDSYNC_E2E_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e".to_string());
 
     let bq_http = normalize_http(&bq_http_raw)?;
     let bq_grpc = normalize_grpc(&bq_grpc_raw)?;
@@ -85,6 +83,7 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
         service_account_key_path: None,
         service_account_key: None,
         partition_by_synced_at: Some(false),
+        storage_write_enabled: Some(true),
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };
@@ -96,36 +95,27 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
 
     for table in &tables {
         source
-            .sync_table(
+            .sync_table(TableSyncRequest {
                 table,
-                &dest,
-                TableCheckpoint::default(),
-                SyncMode::Full,
-                false,
-                1000,
-                false,
-                None,
-            )
+                dest: &dest,
+                checkpoint: TableCheckpoint::default(),
+                state_handle: None,
+                mode: SyncMode::Full,
+                dry_run: false,
+                default_batch_size: 1000,
+                schema_diff_enabled: false,
+                stats: None,
+            })
             .await?;
     }
 
     let http_client = reqwest::Client::new();
-    let fields = support::fetch_table_fields(
-        &http_client,
-        &bq_http,
-        &project_id,
-        &dataset,
-        &dest_table,
-    )
-    .await?;
-    let rows = support::fetch_table_rows(
-        &http_client,
-        &bq_http,
-        &project_id,
-        &dataset,
-        &dest_table,
-    )
-    .await?;
+    let fields =
+        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
+            .await?;
+    let rows =
+        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
+            .await?;
     let mapped = support::map_rows(&fields, rows)?;
 
     assert_eq!(mapped.len(), 2);
@@ -137,7 +127,9 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
     ids.sort();
     assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
     for row in &mapped {
-        let synced_at = row.get("_cdsync_synced_at").context("missing _cdsync_synced_at")?;
+        let synced_at = row
+            .get("_cdsync_synced_at")
+            .context("missing _cdsync_synced_at")?;
         assert!(synced_at.is_string());
         let deleted_at = row
             .get("_cdsync_deleted_at")

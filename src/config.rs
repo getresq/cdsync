@@ -6,6 +6,7 @@ pub struct Config {
     pub connections: Vec<ConnectionConfig>,
     pub state: StateConfig,
     pub logging: Option<LoggingConfig>,
+    pub observability: Option<ObservabilityConfig>,
     pub sync: Option<SyncConfig>,
     pub stats: Option<StatsConfig>,
 }
@@ -52,6 +53,15 @@ pub struct SyncConfig {
 pub struct LoggingConfig {
     pub level: Option<String>,
     pub json: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    pub service_name: Option<String>,
+    pub otlp_traces_endpoint: Option<String>,
+    pub otlp_metrics_endpoint: Option<String>,
+    pub otlp_headers: Option<std::collections::HashMap<String, String>>,
+    pub metrics_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +154,9 @@ pub struct PostgresConfig {
 
 impl PostgresConfig {
     pub fn schema_policy(&self) -> SchemaChangePolicy {
-        self.schema_changes.clone().unwrap_or(SchemaChangePolicy::Auto)
+        self.schema_changes
+            .clone()
+            .unwrap_or(SchemaChangePolicy::Auto)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -325,6 +337,7 @@ pub struct BigQueryConfig {
     pub service_account_key_path: Option<PathBuf>,
     pub service_account_key: Option<String>,
     pub partition_by_synced_at: Option<bool>,
+    pub storage_write_enabled: Option<bool>,
     pub emulator_http: Option<String>,
     pub emulator_grpc: Option<String>,
 }
@@ -338,11 +351,17 @@ pub struct TemplateConfig {
 const DEFAULT_TEMPLATE: &str = r#"# CDSync configuration (YAML)
 
 state:
-  path: "./cdsync_state.json"
+  path: "./cdsync_state.db"
 
 logging:
   level: "info"
   json: false
+
+observability:
+  service_name: "cdsync"
+  # otlp_traces_endpoint: "http://localhost:4318/v1/traces"
+  # otlp_metrics_endpoint: "http://localhost:4318/v1/metrics"
+  metrics_interval_seconds: 30
 
 sync:
   default_batch_size: 10000
@@ -394,6 +413,7 @@ connections:
       dataset: "cdsync"
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
+      storage_write_enabled: true
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
 
@@ -425,6 +445,7 @@ connections:
       dataset: "cdsync"
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
+      storage_write_enabled: true
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
 "#;

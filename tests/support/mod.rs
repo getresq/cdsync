@@ -65,14 +65,15 @@ pub async fn fetch_table_rows(
     Ok(output)
 }
 
-pub fn map_rows(
-    fields: &[String],
-    rows: Vec<Vec<Value>>,
-) -> Result<Vec<HashMap<String, Value>>> {
+pub fn map_rows(fields: &[String], rows: Vec<Vec<Value>>) -> Result<Vec<HashMap<String, Value>>> {
     let mut output = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() != fields.len() {
-            anyhow::bail!("row length {} does not match field length {}", row.len(), fields.len());
+            anyhow::bail!(
+                "row length {} does not match field length {}",
+                row.len(),
+                fields.len()
+            );
         }
         let mut map = HashMap::new();
         for (idx, field) in fields.iter().enumerate() {
