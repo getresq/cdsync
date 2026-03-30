@@ -437,7 +437,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                         .with_context(|| "syncing postgres CDC");
                     match result {
                         Ok(_) => break,
-                        Err(err) if follow || attempt < max_retries => {
+                        Err(_err) if follow || attempt < max_retries => {
                             if wait_backoff(backoff, shutdown.clone()).await {
                                 return Ok(());
                             }
@@ -500,7 +500,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                                 .with_context(|| format!("syncing postgres table {}", table.name));
                             match attempt_result {
                                 Ok(checkpoint) => break Ok(checkpoint),
-                                Err(err) if attempt < max_retries => {
+                                Err(_err) if attempt < max_retries => {
                                     if wait_backoff(backoff, shutdown.clone()).await {
                                         break Ok(checkpoint.clone());
                                     }
@@ -586,7 +586,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                             .with_context(|| format!("syncing salesforce object {}", object.name));
                         match attempt_result {
                             Ok(checkpoint) => break Ok(checkpoint),
-                            Err(err) if attempt < max_retries => {
+                            Err(_err) if attempt < max_retries => {
                                 if wait_backoff(backoff, shutdown.clone()).await {
                                     break Ok(checkpoint.clone());
                                 }

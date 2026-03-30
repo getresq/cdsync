@@ -665,6 +665,7 @@ dependencies = [
  "prost-reflect",
  "prost-types",
  "reqwest",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
