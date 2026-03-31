@@ -101,7 +101,7 @@ struct ScrubbedConfig {
     metadata: Option<MetadataConfig>,
     logging: Option<LoggingConfig>,
     admin_api: Option<AdminApiConfig>,
-    observability: Option<ObservabilityConfig>,
+    observability: Option<ScrubbedObservabilityConfig>,
     sync: Option<SyncConfig>,
     stats: Option<ScrubbedStatsConfig>,
     connections: Vec<ScrubbedConnectionConfig>,
@@ -117,6 +117,15 @@ struct ScrubbedStateConfig {
 struct ScrubbedStatsConfig {
     url: Option<String>,
     schema: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ScrubbedObservabilityConfig {
+    service_name: Option<String>,
+    otlp_traces_endpoint: Option<String>,
+    otlp_metrics_endpoint: Option<String>,
+    otlp_headers: Option<std::collections::HashMap<String, String>>,
+    metrics_interval_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -357,13 +366,28 @@ fn scrub_config(cfg: &Config) -> ScrubbedConfig {
         metadata: cfg.metadata.clone(),
         logging: cfg.logging.clone(),
         admin_api: cfg.admin_api.clone(),
-        observability: cfg.observability.clone(),
+        observability: cfg.observability.as_ref().map(scrub_observability_config),
         sync: cfg.sync.clone(),
         stats: cfg.stats.as_ref().map(|stats| ScrubbedStatsConfig {
             url: stats.url.as_deref().map(scrub_url),
             schema: stats.schema.clone(),
         }),
         connections: cfg.connections.iter().map(scrub_connection).collect(),
+    }
+}
+
+fn scrub_observability_config(obs: &ObservabilityConfig) -> ScrubbedObservabilityConfig {
+    ScrubbedObservabilityConfig {
+        service_name: obs.service_name.clone(),
+        otlp_traces_endpoint: obs.otlp_traces_endpoint.clone(),
+        otlp_metrics_endpoint: obs.otlp_metrics_endpoint.clone(),
+        otlp_headers: obs.otlp_headers.as_ref().map(|headers| {
+            headers
+                .keys()
+                .map(|key| (key.clone(), "***".to_string()))
+                .collect()
+        }),
+        metrics_interval_seconds: obs.metrics_interval_seconds,
     }
 }
 
@@ -454,4 +478,34 @@ fn scrub_url(raw: &str) -> String {
         return url.to_string();
     }
     raw.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_observability_config_redacts_header_values() {
+        let obs = ObservabilityConfig {
+            service_name: Some("svc".to_string()),
+            otlp_traces_endpoint: Some("https://trace.example".to_string()),
+            otlp_metrics_endpoint: Some("https://metrics.example".to_string()),
+            otlp_headers: Some(
+                [("authorization".to_string(), "Bearer secret".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            metrics_interval_seconds: Some(30),
+        };
+
+        let scrubbed = scrub_observability_config(&obs);
+        assert_eq!(
+            scrubbed
+                .otlp_headers
+                .as_ref()
+                .and_then(|headers| headers.get("authorization"))
+                .map(String::as_str),
+            Some("***")
+        );
+    }
 }

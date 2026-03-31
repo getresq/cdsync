@@ -36,10 +36,10 @@ use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessa
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
+use sqlx::Connection;
 use sqlx::Row as SqlxRow;
 use sqlx::ValueRef;
-use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -73,7 +73,7 @@ pub struct PostgresSource {
 }
 
 struct ExportedSnapshotSlot {
-    _client: TokioPgClient,
+    client: Option<TokioPgClient>,
 }
 
 struct ExportedSnapshotSlotInfo {
@@ -759,11 +759,15 @@ impl PostgresSource {
                 });
             }
 
-            while let Some(result) = snapshot_tasks.next().await {
-                result?;
+            let snapshot_result: Result<()> = async {
+                while let Some(result) = snapshot_tasks.next().await {
+                    result?;
+                }
+                Ok(())
             }
-
-            drop(slot_guard);
+            .await;
+            release_exported_snapshot_slot(slot_guard, snapshot_result.is_ok()).await?;
+            snapshot_result?;
             let snapshot_start_lsn = slot.consistent_point.parse().map_err(|_| {
                 anyhow::anyhow!("invalid slot consistent_point '{}'", slot.consistent_point)
             })?;
@@ -895,15 +899,12 @@ impl PostgresSource {
         let pk_cast = self
             .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
             .await?;
-        let select_columns = schema
-            .columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let select_columns = build_select_columns(schema);
         let select_expr = format!(
             "{}, {}::text as {}",
-            select_columns, table.primary_key, pk_alias
+            select_columns,
+            quote_pg_identifier(&table.primary_key),
+            quote_pg_identifier(pk_alias)
         );
         let mut last_pk: Option<String> = None;
         let has_where = table.where_clause.is_some();
@@ -1023,12 +1024,7 @@ impl PostgresSource {
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now));
         let mut last_pk = checkpoint.last_primary_key.clone();
 
-        let select_columns = schema
-            .columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let select_columns = build_select_columns(schema);
 
         loop {
             let sql = build_incremental_sql(&IncrementalSqlParts {
@@ -1158,8 +1154,22 @@ impl PostgresSource {
     ) -> Result<(ExportedSnapshotSlot, ExportedSnapshotSlotInfo)> {
         let pg_config = self.build_pg_connection_config().await?;
         let client = connect_replication_control_client(&pg_config).await?;
-        let info = create_exported_snapshot_slot_info(&client, slot_name).await?;
-        Ok((ExportedSnapshotSlot { _client: client }, info))
+        client
+            .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
+            .await?;
+        let info = match create_exported_snapshot_slot_info(&client, slot_name).await {
+            Ok(info) => info,
+            Err(err) => {
+                let _ = client.simple_query("ROLLBACK").await;
+                return Err(err);
+            }
+        };
+        Ok((
+            ExportedSnapshotSlot {
+                client: Some(client),
+            },
+            info,
+        ))
     }
 
     async fn run_snapshot_copy_with_exported_snapshot(
@@ -1181,15 +1191,12 @@ impl PostgresSource {
             .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
             .await?;
         let pk_alias = "__cdsync_pk";
-        let select_columns = schema
-            .columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let select_columns = build_select_columns(schema);
         let select_expr = format!(
             "{}, {}::text as {}",
-            select_columns, table.primary_key, pk_alias
+            select_columns,
+            quote_pg_identifier(&table.primary_key),
+            quote_pg_identifier(pk_alias)
         );
         let has_where = table.where_clause.is_some();
         let base_sql = if let Some(where_clause) = &table.where_clause {
@@ -1221,7 +1228,8 @@ impl PostgresSource {
             )
         };
 
-        let mut connection = acquire_exported_snapshot_reader(&self.pool, snapshot_name).await?;
+        let mut connection =
+            acquire_exported_snapshot_reader(&self.config.url, snapshot_name).await?;
         let mut last_pk: Option<String> = None;
         let mut extracted_rows = 0usize;
         let mut loaded_batches = 0usize;
@@ -1234,12 +1242,12 @@ impl PostgresSource {
                     sqlx::query(&sql_with_pk)
                         .bind(last_pk_value)
                         .bind(batch_size as i64)
-                        .fetch_all(&mut *connection)
+                        .fetch_all(&mut connection)
                         .await?
                 } else {
                     sqlx::query(&sql_without_pk)
                         .bind(batch_size as i64)
-                        .fetch_all(&mut *connection)
+                        .fetch_all(&mut connection)
                         .await?
                 };
                 let extract_ms = extract_start.elapsed().as_millis() as u64;
@@ -2074,23 +2082,20 @@ async fn create_exported_snapshot_slot_info(
     anyhow::bail!("replication slot creation returned no row")
 }
 
-async fn acquire_exported_snapshot_reader(
-    pool: &PgPool,
-    snapshot_name: &str,
-) -> Result<PoolConnection<sqlx::Postgres>> {
-    let mut connection = pool.acquire().await?;
+async fn acquire_exported_snapshot_reader(url: &str, snapshot_name: &str) -> Result<PgConnection> {
+    let mut connection = PgConnection::connect(url).await?;
     sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .execute(&mut *connection)
+        .execute(&mut connection)
         .await
         .with_context(|| "starting exported snapshot reader transaction")?;
     if let Err(err) = sqlx::query(&format!(
         "SET TRANSACTION SNAPSHOT {}",
         quote_pg_literal(snapshot_name)
     ))
-    .execute(&mut *connection)
+    .execute(&mut connection)
     .await
     {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut connection).await;
         return Err(err).with_context(|| {
             format!(
                 "importing exported snapshot {} into snapshot reader transaction",
@@ -2101,12 +2106,20 @@ async fn acquire_exported_snapshot_reader(
     Ok(connection)
 }
 
-async fn release_exported_snapshot_reader(
-    connection: &mut PoolConnection<sqlx::Postgres>,
+async fn release_exported_snapshot_reader(connection: &mut PgConnection, commit: bool) -> Result<()> {
+    let statement = if commit { "COMMIT" } else { "ROLLBACK" };
+    sqlx::query(statement).execute(&mut *connection).await?;
+    Ok(())
+}
+
+async fn release_exported_snapshot_slot(
+    mut slot: ExportedSnapshotSlot,
     commit: bool,
 ) -> Result<()> {
     let statement = if commit { "COMMIT" } else { "ROLLBACK" };
-    sqlx::query(statement).execute(&mut **connection).await?;
+    if let Some(client) = slot.client.take() {
+        client.simple_query(statement).await?;
+    }
     Ok(())
 }
 
@@ -2116,6 +2129,21 @@ fn quote_pg_identifier(value: &str) -> String {
 
 fn quote_pg_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_select_columns(schema: &TableSchema) -> String {
+    schema
+        .columns
+        .iter()
+        .map(|column| {
+            let ident = quote_pg_identifier(&column.name);
+            match column.data_type {
+                DataType::String => format!("{ident}::text as {ident}"),
+                _ => ident,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 #[cfg(test)]
 mod tests {
@@ -2352,5 +2380,30 @@ mod tests {
         assert!(should_log_snapshot_progress(10));
         assert!(!should_log_snapshot_progress(11));
         assert!(should_log_snapshot_progress(20));
+    }
+
+    #[test]
+    fn build_select_columns_casts_string_columns_to_text() {
+        let schema = TableSchema {
+            name: "public.example".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "search_vector".to_string(),
+                    data_type: DataType::String,
+                    nullable: true,
+                },
+            ],
+            primary_key: Some("id".to_string()),
+        };
+
+        assert_eq!(
+            build_select_columns(&schema),
+            "\"id\", \"search_vector\"::text as \"search_vector\""
+        );
     }
 }

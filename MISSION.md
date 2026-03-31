@@ -79,6 +79,7 @@ Primary work:
 - Constraint: The current GCP service account can write to `nora-461013` and now has enough access for the staging GCS bucket, but dataset creation had to be handled separately.
 - Constraint: WAL apply parallelism must preserve commit/LSN ordering; do not use unordered multi-reader CDC.
 - Constraint: The staging source database has an `awsdms_intercept_ddl` event trigger that writes to `public.awsdms_ddl_audit`; runtime users without DDL-audit privileges cannot safely run migrations on startup.
+- Constraint: Exported Postgres snapshots are only importable while the creating transaction stays open; the slot-creation connection must hold that transaction open until snapshot readers have finished importing it.
 - Validation: Staging primary PostgreSQL is CDC-ready and `cdsync_staging_pub` plus the `cdsync_staging` role are in place.
 - Validation: One-off ECS runs in `cluster-staging` can connect to the staging writer with TLS and begin CDC snapshot work.
 - Validation: The Postgres-backed control-plane schemas were precreated on staging, with `_sqlx_migrations`, `cdsync_state.*`, and `cdsync_stats.*` tables created and granted to `cdsync_staging`.
@@ -86,5 +87,7 @@ Primary work:
 - Blocker: BigQuery load jobs can fail if we model source `NOT NULL` columns as destination `REQUIRED`, because CDC/upsert batches can still surface `NULL` values for those fields.
 - Blocker: The exported-snapshot snapshot path was aborting because runtime logs hid the root cause; richer error chains now show the real failure source.
 - Blocker: Snapshot row decoding still assumed `INT4` columns could be read directly as Rust `i64`; the current local fix adds `i32`/`i16` fallback casting, but it still needs to be staged.
+- Blocker: Snapshot reads also hit Postgres string-like types such as `tsvector`; selecting all `DataType::String` columns as `::text` is the current hardening approach for snapshot/polling SQL.
+- Validation: The scrubbed admin API config must redact `observability.otlp_headers`; `/v1/config` is not safe if it clones those headers verbatim.
 - Decision: Use the existing `cdsync_e2e_real` dataset temporarily for staging one-off runs until a dedicated staging shadow dataset is provisioned.
 - Validation: The exported-snapshot parallel snapshot implementation compiles cleanly and passes `cargo clippy --all-targets --all-features -- -D warnings` plus `cargo test`.
