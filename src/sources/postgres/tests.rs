@@ -310,6 +310,40 @@ fn primary_key_changed_uses_hash_fallback_for_legacy_checkpoints() {
 }
 
 #[test]
+fn primary_key_changed_ignores_schema_hash_when_explicit_primary_key_matches() {
+    let diff = SchemaDiff {
+        added: vec!["extra".to_string()],
+        removed: vec!["legacy_name".to_string()],
+        nullable_changed: vec![("id".to_string(), false, true)],
+        ..Default::default()
+    };
+    let schema = TableSchema {
+        name: "public__accounts".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "extra".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+            },
+        ],
+        primary_key: Some("id".to_string()),
+    };
+
+    assert!(!primary_key_changed(
+        Some("id"),
+        Some("old-hash"),
+        &schema,
+        "new-hash",
+        &diff,
+    ));
+}
+
+#[test]
 fn snapshot_progress_logging_uses_ten_batch_interval() {
     assert!(!should_log_snapshot_progress(0));
     assert!(!should_log_snapshot_progress(9));
