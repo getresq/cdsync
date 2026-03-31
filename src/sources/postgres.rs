@@ -84,6 +84,8 @@ struct CdcSnapshotTask {
     table: ResolvedPostgresTable,
     info: CdcTableInfo,
     checkpoint: TableCheckpoint,
+    chunk: Option<SnapshotChunkRange>,
+    persist_progress: bool,
     state_handle: Option<StateHandle>,
 }
 
@@ -97,6 +99,23 @@ struct SnapshotCopyContext<'a> {
 }
 
 const DEFAULT_PG_POOL_MAX: u32 = 5;
+const SNAPSHOT_CHUNK_MIN_BATCHES_PER_WORKER: usize = 8;
+
+struct PrimaryKeyTypeInfo {
+    cast_type: String,
+    udt_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotChunkRange {
+    start_pk: i64,
+    end_pk: i64,
+}
+
+struct SnapshotChunkPlan {
+    row_count: i64,
+    chunk_ranges: Vec<SnapshotChunkRange>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPostgresTable {
@@ -431,12 +450,12 @@ impl PostgresSource {
         })
     }
 
-    async fn resolve_primary_key_cast(
+    async fn resolve_primary_key_type_info(
         &self,
         schema_name: &str,
         table_name: &str,
         column: &str,
-    ) -> Result<String> {
+    ) -> Result<PrimaryKeyTypeInfo> {
         let row = sqlx::query(
             r#"
             select udt_name, udt_schema
@@ -451,7 +470,89 @@ impl PostgresSource {
         .await?;
         let udt_name: String = row.try_get("udt_name")?;
         let udt_schema: String = row.try_get("udt_schema")?;
-        Ok(format_cast_type(&udt_name, &udt_schema))
+        Ok(PrimaryKeyTypeInfo {
+            cast_type: format_cast_type(&udt_name, &udt_schema),
+            udt_name,
+        })
+    }
+
+    async fn resolve_primary_key_cast(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        column: &str,
+    ) -> Result<String> {
+        Ok(self
+            .resolve_primary_key_type_info(schema_name, table_name, column)
+            .await?
+            .cast_type)
+    }
+
+    async fn plan_snapshot_chunk_ranges(
+        &self,
+        table: &ResolvedPostgresTable,
+        batch_size: usize,
+        max_chunks: usize,
+    ) -> Result<SnapshotChunkPlan> {
+        if batch_size == 0 || max_chunks <= 1 {
+            return Ok(SnapshotChunkPlan {
+                row_count: 0,
+                chunk_ranges: Vec::new(),
+            });
+        }
+
+        let (schema_name, table_name) = split_table_name(&table.name);
+        let pk_info = self
+            .resolve_primary_key_type_info(&schema_name, &table_name, &table.primary_key)
+            .await?;
+        if !is_chunkable_snapshot_primary_key(&pk_info.udt_name) {
+            return Ok(SnapshotChunkPlan {
+                row_count: 0,
+                chunk_ranges: Vec::new(),
+            });
+        }
+
+        let pk = quote_pg_identifier(&table.primary_key);
+        let table_ref = format!(
+            "{}.{}",
+            quote_pg_identifier(&schema_name),
+            quote_pg_identifier(&table_name)
+        );
+        let sql = if let Some(where_clause) = &table.where_clause {
+            format!(
+                "SELECT COUNT(*)::bigint AS row_count, \
+                 MIN({pk})::bigint AS min_pk, \
+                 MAX({pk})::bigint AS max_pk \
+                 FROM {table_ref} WHERE ({where_clause})",
+                pk = pk,
+                table_ref = table_ref,
+                where_clause = where_clause
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*)::bigint AS row_count, \
+                 MIN({pk})::bigint AS min_pk, \
+                 MAX({pk})::bigint AS max_pk \
+                 FROM {table_ref}",
+                pk = pk,
+                table_ref = table_ref
+            )
+        };
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
+        let row_count: i64 = row.try_get("row_count")?;
+        let min_pk: Option<i64> = row.try_get("min_pk")?;
+        let max_pk: Option<i64> = row.try_get("max_pk")?;
+        let chunk_ranges = match (min_pk, max_pk) {
+            (Some(min_pk), Some(max_pk)) => plan_snapshot_chunk_ranges_from_bounds(
+                row_count, min_pk, max_pk, batch_size, max_chunks,
+            ),
+            _ => Vec::new(),
+        };
+
+        Ok(SnapshotChunkPlan {
+            row_count,
+            chunk_ranges,
+        })
     }
 
     pub async fn sync_table(&self, request: TableSyncRequest<'_>) -> Result<TableCheckpoint> {
@@ -716,6 +817,7 @@ impl PostgresSource {
             }
 
             let mut snapshot_tasks_to_run = Vec::with_capacity(snapshot_table_ids.len());
+            let mut chunked_snapshot_tables = HashSet::new();
             for table_id in &snapshot_table_ids {
                 let table = table_ids
                     .get(table_id)
@@ -734,16 +836,47 @@ impl PostgresSource {
                         entry.schema_snapshot = Some(snapshot.clone());
                     }
                     if let Some(state_handle) = &state_handle {
-                        state_handle.save_postgres_checkpoint(&table.name, entry).await?;
+                        state_handle
+                            .save_postgres_checkpoint(&table.name, entry)
+                            .await?;
                     }
                     entry.clone()
                 };
-                snapshot_tasks_to_run.push(CdcSnapshotTask {
-                    table,
-                    info,
-                    checkpoint,
-                    state_handle: state_handle.clone(),
-                });
+                let snapshot_plan = self
+                    .plan_snapshot_chunk_ranges(&table, batch_size, snapshot_concurrency)
+                    .await?;
+                if !snapshot_plan.chunk_ranges.is_empty() {
+                    let first_chunk = snapshot_plan.chunk_ranges.first().copied();
+                    let last_chunk = snapshot_plan.chunk_ranges.last().copied();
+                    info!(
+                        table = %info.source_name,
+                        row_count = snapshot_plan.row_count,
+                        chunk_count = snapshot_plan.chunk_ranges.len(),
+                        chunk_start = first_chunk.map(|chunk| chunk.start_pk),
+                        chunk_end = last_chunk.map(|chunk| chunk.end_pk),
+                        "chunking large exported CDC snapshot table by PK range"
+                    );
+                    chunked_snapshot_tables.insert(table.name.clone());
+                    for chunk in snapshot_plan.chunk_ranges {
+                        snapshot_tasks_to_run.push(CdcSnapshotTask {
+                            table: table.clone(),
+                            info: info.clone(),
+                            checkpoint: checkpoint.clone(),
+                            chunk: Some(chunk),
+                            persist_progress: false,
+                            state_handle: state_handle.clone(),
+                        });
+                    }
+                } else {
+                    snapshot_tasks_to_run.push(CdcSnapshotTask {
+                        table,
+                        info,
+                        checkpoint,
+                        chunk: None,
+                        persist_progress: true,
+                        state_handle: state_handle.clone(),
+                    });
+                }
             }
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_concurrency));
@@ -765,19 +898,26 @@ impl PostgresSource {
                         snapshot_name = %snapshot_name,
                         batch_size,
                         snapshot_concurrency,
+                        chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
+                        chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
                         "starting exported CDC snapshot copy"
                     );
                     source
                         .run_snapshot_copy_with_exported_snapshot(
                             &snapshot_task.table,
                             &snapshot_task.info.schema,
+                            snapshot_task.chunk,
                             SnapshotCopyContext {
                                 dest: &dest,
                                 snapshot_name: &snapshot_name,
                                 batch_size,
                                 stats,
                                 checkpoint: snapshot_task.checkpoint,
-                                state_handle: snapshot_task.state_handle,
+                                state_handle: if snapshot_task.persist_progress {
+                                    snapshot_task.state_handle
+                                } else {
+                                    None
+                                },
                             },
                         )
                         .await
@@ -800,6 +940,20 @@ impl PostgresSource {
             .await;
             release_exported_snapshot_slot(slot_guard, snapshot_result.is_ok()).await?;
             snapshot_result?;
+            if !chunked_snapshot_tables.is_empty() {
+                let completed_at = Utc::now();
+                for table_name in &chunked_snapshot_tables {
+                    if let Some(entry) = state.postgres.get_mut(table_name) {
+                        entry.last_synced_at = Some(completed_at);
+                        entry.last_primary_key = None;
+                        if let Some(state_handle) = &state_handle {
+                            state_handle
+                                .save_postgres_checkpoint(table_name, entry)
+                                .await?;
+                        }
+                    }
+                }
+            }
             let snapshot_start_lsn = slot.consistent_point.parse().map_err(|_| {
                 anyhow::anyhow!("invalid slot consistent_point '{}'", slot.consistent_point)
             })?;
@@ -1199,6 +1353,7 @@ impl PostgresSource {
         &self,
         table: &ResolvedPostgresTable,
         schema: &TableSchema,
+        chunk: Option<SnapshotChunkRange>,
         ctx: SnapshotCopyContext<'_>,
     ) -> Result<()> {
         let SnapshotCopyContext {
@@ -1210,6 +1365,11 @@ impl PostgresSource {
             state_handle,
         } = ctx;
         let (schema_name, table_name) = split_table_name(&table.name);
+        let table_ref = format!(
+            "{}.{}",
+            quote_pg_identifier(&schema_name),
+            quote_pg_identifier(&table_name)
+        );
 
         if !schema.columns.is_empty() {
             dest.ensure_table(schema).await?;
@@ -1219,28 +1379,34 @@ impl PostgresSource {
             .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
             .await?;
         let pk_alias = "__cdsync_pk";
+        let pk_ident = quote_pg_identifier(&table.primary_key);
         let select_columns = build_select_columns(schema);
         let select_expr = format!(
             "{}, {}::text as {}",
             select_columns,
-            quote_pg_identifier(&table.primary_key),
+            pk_ident,
             quote_pg_identifier(pk_alias)
         );
-        let has_where = table.where_clause.is_some();
-        let base_sql = if let Some(where_clause) = &table.where_clause {
+        let mut filters = Vec::new();
+        if let Some(where_clause) = &table.where_clause {
+            filters.push(format!("({where_clause})"));
+        }
+        if let Some(chunk) = chunk {
+            filters.push(snapshot_chunk_filter_sql(&pk_ident, &pk_cast, chunk));
+        }
+        let has_filters = !filters.is_empty();
+        let base_sql = if has_filters {
             format!(
-                "SELECT {select} FROM {schema}.{table} WHERE ({where_clause})",
+                "SELECT {select} FROM {table_ref} WHERE {filters}",
                 select = select_expr,
-                schema = schema_name,
-                table = table_name,
-                where_clause = where_clause
+                table_ref = table_ref,
+                filters = filters.join(" AND ")
             )
         } else {
             format!(
-                "SELECT {select} FROM {schema}.{table}",
+                "SELECT {select} FROM {table_ref}",
                 select = select_expr,
-                schema = schema_name,
-                table = table_name
+                table_ref = table_ref
             )
         };
         let pg_config = self.build_pg_connection_config().await?;
@@ -1249,16 +1415,18 @@ impl PostgresSource {
         let mut extracted_rows = 0usize;
         let mut loaded_batches = 0usize;
         let mut completed = false;
+        let chunk_start = chunk.map(|range| range.start_pk);
+        let chunk_end = chunk.map(|range| range.end_pk);
 
         let run_result: Result<()> = async {
             loop {
                 let extract_start = Instant::now();
                 let rows = if let Some(last_pk_value) = last_pk.as_ref() {
-                    let query = if has_where {
+                    let query = if has_filters {
                         format!(
                             "{base_sql} AND {pk} > {last_pk}::{pk_cast} ORDER BY {pk} LIMIT {limit}",
                             base_sql = base_sql,
-                            pk = table.primary_key,
+                            pk = pk_ident,
                             last_pk = quote_pg_literal(last_pk_value),
                             pk_cast = pk_cast,
                             limit = batch_size,
@@ -1267,7 +1435,7 @@ impl PostgresSource {
                         format!(
                             "{base_sql} WHERE {pk} > {last_pk}::{pk_cast} ORDER BY {pk} LIMIT {limit}",
                             base_sql = base_sql,
-                            pk = table.primary_key,
+                            pk = pk_ident,
                             last_pk = quote_pg_literal(last_pk_value),
                             pk_cast = pk_cast,
                             limit = batch_size,
@@ -1277,7 +1445,7 @@ impl PostgresSource {
                 } else {
                     let query = format!(
                         "{} ORDER BY {} LIMIT {}",
-                        base_sql, table.primary_key, batch_size
+                        base_sql, pk_ident, batch_size
                     );
                     connection.query(&query, &[]).await?
                 };
@@ -1324,6 +1492,8 @@ impl PostgresSource {
                         extracted_rows,
                         loaded_batches,
                         snapshot_name,
+                        chunk_start,
+                        chunk_end,
                         "exported snapshot copy progress"
                     );
                 }
@@ -1362,6 +1532,8 @@ impl PostgresSource {
             extracted_rows,
             loaded_batches,
             snapshot_name,
+            chunk_start,
+            chunk_end,
             "completed exported snapshot copy"
         );
         Ok(())
@@ -2194,10 +2366,7 @@ async fn acquire_exported_snapshot_reader(
     Ok(connection)
 }
 
-async fn release_exported_snapshot_reader(
-    connection: &TokioPgClient,
-    commit: bool,
-) -> Result<()> {
+async fn release_exported_snapshot_reader(connection: &TokioPgClient, commit: bool) -> Result<()> {
     let statement = if commit { "COMMIT;" } else { "ROLLBACK;" };
     connection.simple_query(statement).await?;
     Ok(())
@@ -2217,6 +2386,73 @@ fn quote_pg_identifier(value: &str) -> String {
 
 fn quote_pg_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn is_chunkable_snapshot_primary_key(udt_name: &str) -> bool {
+    matches!(udt_name, "int2" | "int4" | "int8")
+}
+
+fn snapshot_chunk_filter_sql(
+    primary_key_ident: &str,
+    pk_cast: &str,
+    range: SnapshotChunkRange,
+) -> String {
+    format!(
+        "{pk} >= {start}::{pk_cast} AND {pk} <= {end}::{pk_cast}",
+        pk = primary_key_ident,
+        start = range.start_pk,
+        end = range.end_pk,
+        pk_cast = pk_cast
+    )
+}
+
+fn plan_snapshot_chunk_ranges_from_bounds(
+    row_count: i64,
+    min_pk: i64,
+    max_pk: i64,
+    batch_size: usize,
+    max_chunks: usize,
+) -> Vec<SnapshotChunkRange> {
+    if row_count <= 0 || batch_size == 0 || max_chunks <= 1 || min_pk >= max_pk {
+        return Vec::new();
+    }
+
+    let min_rows_per_worker = batch_size.saturating_mul(SNAPSHOT_CHUNK_MIN_BATCHES_PER_WORKER);
+    let total_rows_threshold = min_rows_per_worker.saturating_mul(max_chunks);
+    let total_rows_threshold = i64::try_from(total_rows_threshold).unwrap_or(i64::MAX);
+    if row_count < total_rows_threshold {
+        return Vec::new();
+    }
+
+    let span = u128::try_from(i128::from(max_pk) - i128::from(min_pk) + 1).unwrap_or(0);
+    if span <= 1 {
+        return Vec::new();
+    }
+
+    let chunk_count = max_chunks.min(usize::try_from(span).unwrap_or(max_chunks));
+    if chunk_count <= 1 {
+        return Vec::new();
+    }
+
+    let step = span.div_ceil(chunk_count as u128);
+    let mut ranges = Vec::with_capacity(chunk_count);
+    let mut start = i128::from(min_pk);
+    let max_pk_i128 = i128::from(max_pk);
+
+    for chunk_idx in 0..chunk_count {
+        let end = if chunk_idx + 1 == chunk_count {
+            max_pk_i128
+        } else {
+            (start + i128::try_from(step).unwrap_or(i128::MAX) - 1).min(max_pk_i128)
+        };
+        ranges.push(SnapshotChunkRange {
+            start_pk: i64::try_from(start).unwrap_or(min_pk),
+            end_pk: i64::try_from(end).unwrap_or(max_pk),
+        });
+        start = end + 1;
+    }
+
+    ranges
 }
 
 fn build_select_columns(schema: &TableSchema) -> String {
@@ -2470,6 +2706,53 @@ mod tests {
         assert!(should_log_snapshot_progress(10));
         assert!(!should_log_snapshot_progress(11));
         assert!(should_log_snapshot_progress(20));
+    }
+
+    #[test]
+    fn plan_snapshot_chunk_ranges_keeps_small_tables_on_whole_table_path() {
+        let ranges = plan_snapshot_chunk_ranges_from_bounds(31_999, 1, 31_999, 1_000, 4);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn plan_snapshot_chunk_ranges_splits_large_tables_evenly() {
+        let ranges = plan_snapshot_chunk_ranges_from_bounds(40_000, 1, 40_000, 1_000, 4);
+        assert_eq!(
+            ranges,
+            vec![
+                SnapshotChunkRange {
+                    start_pk: 1,
+                    end_pk: 10_000,
+                },
+                SnapshotChunkRange {
+                    start_pk: 10_001,
+                    end_pk: 20_000,
+                },
+                SnapshotChunkRange {
+                    start_pk: 20_001,
+                    end_pk: 30_000,
+                },
+                SnapshotChunkRange {
+                    start_pk: 30_001,
+                    end_pk: 40_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_chunk_filter_sql_uses_inclusive_upper_bound() {
+        assert_eq!(
+            snapshot_chunk_filter_sql(
+                "\"id\"",
+                "int8",
+                SnapshotChunkRange {
+                    start_pk: 10,
+                    end_pk: 20,
+                }
+            ),
+            "\"id\" >= 10::int8 AND \"id\" <= 20::int8"
+        );
     }
 
     #[test]
