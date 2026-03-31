@@ -23,6 +23,7 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
                 DataType::Timestamp => TableFieldType::Timestamp,
                 DataType::Date => TableFieldType::Date,
                 DataType::Time => TableFieldType::Time,
+                DataType::Interval => TableFieldType::Float64,
                 DataType::Bytes => TableFieldType::Bytes,
                 DataType::Numeric => TableFieldType::Numeric,
                 DataType::Json => TableFieldType::String,
@@ -334,5 +335,17 @@ mod tests {
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].data_type, TableFieldType::Time);
+    }
+
+    #[test]
+    fn bq_fields_from_schema_maps_interval_to_float64() {
+        let fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "elapsed".to_string(),
+            data_type: DataType::Interval,
+            nullable: true,
+        }]);
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].data_type, TableFieldType::Float64);
     }
 }

@@ -9,6 +9,7 @@ pub(super) fn pg_type_to_data_type(data_type: &str) -> DataType {
         "timestamp without time zone" | "timestamp with time zone" => DataType::Timestamp,
         "date" => DataType::Date,
         "time without time zone" => DataType::Time,
+        "interval" => DataType::Interval,
         "json" | "jsonb" => DataType::Json,
         "bytea" => DataType::Bytes,
         _ => DataType::String,
@@ -174,6 +175,17 @@ pub(super) fn pg_value_to_anyvalue(
             .try_get::<Option<NaiveDate>, _>(name)?
             .map(|v| v.format("%Y-%m-%d").to_string())
             .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
+        DataType::Interval => {
+            if let Ok(value) = row.try_get::<Option<f64>, _>(name) {
+                value.map(AnyValue::Float64)
+            } else if let Ok(value) = row.try_get::<Option<String>, _>(name) {
+                value
+                    .and_then(|v| parse_postgres_interval_to_seconds(&v).ok())
+                    .map(AnyValue::Float64)
+            } else {
+                None
+            }
+        }
         DataType::Time => {
             if let Ok(value) = row.try_get::<Option<NaiveTime>, _>(name) {
                 value
@@ -258,6 +270,17 @@ pub(super) fn tokio_pg_value_to_anyvalue(
             .try_get::<_, Option<NaiveDate>>(name)?
             .map(|v| v.format("%Y-%m-%d").to_string())
             .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
+        DataType::Interval => {
+            if let Ok(value) = row.try_get::<_, Option<f64>>(name) {
+                value.map(AnyValue::Float64)
+            } else if let Ok(value) = row.try_get::<_, Option<String>>(name) {
+                value
+                    .and_then(|v| parse_postgres_interval_to_seconds(&v).ok())
+                    .map(AnyValue::Float64)
+            } else {
+                None
+            }
+        }
         DataType::Time => {
             if let Ok(value) = row.try_get::<_, Option<NaiveTime>>(name) {
                 value
@@ -384,7 +407,7 @@ pub(super) fn polars_schema_with_metadata(
     for column in &schema.columns {
         let dtype = match column.data_type {
             DataType::Int64 => PolarsDataType::Int64,
-            DataType::Float64 => PolarsDataType::Float64,
+            DataType::Float64 | DataType::Interval => PolarsDataType::Float64,
             DataType::Bool => PolarsDataType::Boolean,
             _ => PolarsDataType::String,
         };
@@ -410,6 +433,7 @@ pub(super) fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType
         Type::TIMESTAMP | Type::TIMESTAMPTZ => DataType::Timestamp,
         Type::DATE => DataType::Date,
         Type::TIME => DataType::Time,
+        Type::INTERVAL => DataType::Interval,
         Type::JSON | Type::JSONB => DataType::Json,
         Type::BYTEA => DataType::Bytes,
         Type::NUMERIC => DataType::Numeric,
@@ -511,11 +535,86 @@ pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
             .parse::<f64>()
             .map(Cell::F64)
             .unwrap_or_else(|_| Cell::String(text.to_string())),
+        Type::INTERVAL => parse_postgres_interval_to_seconds(text)
+            .map(Cell::F64)
+            .unwrap_or_else(|_| Cell::String(text.to_string())),
         Type::BYTEA => parse_bytea(text)
             .map(Cell::Bytes)
             .unwrap_or_else(|_| Cell::String(text.to_string())),
         _ => Cell::String(text.to_string()),
     }
+}
+
+pub(super) fn parse_postgres_interval_to_seconds(text: &str) -> Result<f64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty interval");
+    }
+
+    let mut total_seconds = 0.0_f64;
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        let token = tokens[idx];
+        if token.contains(':') {
+            total_seconds += parse_interval_clock_component(token)?;
+            idx += 1;
+            continue;
+        }
+
+        let value = token
+            .parse::<f64>()
+            .with_context(|| format!("parsing interval component `{}`", token))?;
+        let unit = tokens
+            .get(idx + 1)
+            .copied()
+            .context("interval component missing unit")?;
+        total_seconds += interval_unit_seconds(value, unit)?;
+        idx += 2;
+    }
+
+    Ok(total_seconds)
+}
+
+fn parse_interval_clock_component(component: &str) -> Result<f64> {
+    let negative = component.starts_with('-');
+    let normalized = if component.starts_with(['+', '-']) {
+        &component[1..]
+    } else {
+        component
+    };
+    let parts: Vec<&str> = normalized.split(':').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("invalid interval clock component `{}`", component);
+    }
+
+    let hours = parts[0]
+        .parse::<f64>()
+        .with_context(|| format!("parsing interval hours from `{}`", component))?;
+    let minutes = parts[1]
+        .parse::<f64>()
+        .with_context(|| format!("parsing interval minutes from `{}`", component))?;
+    let seconds = parts[2]
+        .parse::<f64>()
+        .with_context(|| format!("parsing interval seconds from `{}`", component))?;
+    let total = (hours * 3600.0) + (minutes * 60.0) + seconds;
+
+    Ok(if negative { -total } else { total })
+}
+
+fn interval_unit_seconds(value: f64, unit: &str) -> Result<f64> {
+    let normalized = unit.to_ascii_lowercase();
+    let multiplier = match normalized.as_str() {
+        "year" | "years" => 365.25 * 86_400.0,
+        "mon" | "mons" | "month" | "months" => 30.0 * 86_400.0,
+        "day" | "days" => 86_400.0,
+        "hour" | "hours" => 3_600.0,
+        "minute" | "minutes" | "min" | "mins" => 60.0,
+        "second" | "seconds" | "sec" | "secs" => 1.0,
+        _ => anyhow::bail!("unsupported interval unit `{}`", unit),
+    };
+    Ok(value * multiplier)
 }
 
 pub(super) fn parse_bytea(text: &str) -> Result<Vec<u8>> {

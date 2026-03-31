@@ -38,6 +38,7 @@ pub enum DataType {
     Timestamp,
     Date,
     Time,
+    Interval,
     Bytes,
     Numeric,
     Json,

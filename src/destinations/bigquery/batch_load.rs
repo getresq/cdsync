@@ -252,7 +252,7 @@ fn parquet_batch_load_series(series: &Series, column: &ColumnSchema) -> Result<S
             let values = collect_parquet_int64_values(series)?;
             Ok(Series::new(column.name.as_str().into(), values))
         }
-        DataType::Float64 => {
+        DataType::Float64 | DataType::Interval => {
             let values = collect_parquet_float64_values(series)?;
             Ok(Series::new(column.name.as_str().into(), values))
         }

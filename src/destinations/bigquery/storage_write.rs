@@ -203,7 +203,7 @@ fn storage_write_field_type(data_type: DataType) -> Type {
             Type::String
         }
         DataType::Int64 => Type::Int64,
-        DataType::Float64 => Type::Double,
+        DataType::Float64 | DataType::Interval => Type::Double,
         DataType::Bool => Type::Bool,
         DataType::Timestamp => Type::Int64,
         DataType::Bytes => Type::Bytes,
@@ -265,7 +265,7 @@ fn anyvalue_to_storage_write_value(
             ReflectValue::String(anyvalue_to_owned_string(value)?)
         }
         DataType::Int64 => ReflectValue::I64(anyvalue_to_i64(value)?),
-        DataType::Float64 => ReflectValue::F64(anyvalue_to_f64(value)?),
+        DataType::Float64 | DataType::Interval => ReflectValue::F64(anyvalue_to_f64(value)?),
         DataType::Bool => ReflectValue::Bool(anyvalue_to_bool(value)?),
         DataType::Timestamp => ReflectValue::I64(anyvalue_to_timestamp_micros(value)?),
         DataType::Bytes => ReflectValue::Bytes(Bytes::from(anyvalue_to_bytes(value)?)),

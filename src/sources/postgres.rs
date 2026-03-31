@@ -653,6 +653,7 @@ fn build_select_columns(schema: &TableSchema) -> String {
                 DataType::String | DataType::Numeric | DataType::Json => {
                     format!("{ident}::text as {ident}")
                 }
+                DataType::Interval => format!("extract(epoch from {ident}) as {ident}"),
                 _ => ident,
             }
         })

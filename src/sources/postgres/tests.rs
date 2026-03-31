@@ -26,6 +26,10 @@ fn maps_pg_types_to_internal_types() {
         pg_type_to_data_type_from_type(&etl::types::Type::TIME),
         DataType::Time
     );
+    assert_eq!(
+        pg_type_to_data_type_from_type(&etl::types::Type::INTERVAL),
+        DataType::Interval
+    );
 }
 
 #[test]
@@ -472,6 +476,40 @@ fn build_select_columns_casts_string_columns_to_text() {
     assert_eq!(
         build_select_columns(&schema),
         "\"id\", \"search_vector\"::text as \"search_vector\""
+    );
+}
+
+#[test]
+fn build_select_columns_projects_interval_as_epoch_seconds() {
+    let schema = TableSchema {
+        name: "public.example".to_string(),
+        columns: vec![ColumnSchema {
+            name: "elapsed".to_string(),
+            data_type: DataType::Interval,
+            nullable: true,
+        }],
+        primary_key: Some("id".to_string()),
+    };
+
+    assert_eq!(
+        build_select_columns(&schema),
+        "extract(epoch from \"elapsed\") as \"elapsed\""
+    );
+}
+
+#[test]
+fn parse_postgres_interval_to_seconds_handles_postgres_style_values() {
+    assert_eq!(
+        parse_postgres_interval_to_seconds("3 days 04:05:06.5").expect("interval"),
+        273_906.5
+    );
+    assert_eq!(
+        parse_postgres_interval_to_seconds("1 mon").expect("interval"),
+        2_592_000.0
+    );
+    assert_eq!(
+        parse_postgres_interval_to_seconds("-01:30:00").expect("interval"),
+        -5_400.0
     );
 }
 

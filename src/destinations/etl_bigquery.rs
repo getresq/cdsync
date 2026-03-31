@@ -420,9 +420,14 @@ fn table_rows_to_frame(
     let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
-        for source_idx in &info.dest_source_indices {
+        for (column, source_idx) in info
+            .schema
+            .columns
+            .iter()
+            .zip(info.dest_source_indices.iter())
+        {
             let cell = row.values.get(*source_idx).unwrap_or(&Cell::Null);
-            values.push(cell_to_anyvalue(cell));
+            values.push(cell_to_anyvalue(cell, &column.data_type));
         }
 
         values.push(AnyValue::StringOwned(PlSmallStr::from(
@@ -476,7 +481,16 @@ fn derive_deleted_at_from_row(info: &CdcTableInfo, row: &TableRow) -> Option<Str
     }
 }
 
-fn cell_to_anyvalue(cell: &Cell) -> AnyValue<'static> {
+fn cell_to_anyvalue(cell: &Cell, data_type: &DataType) -> AnyValue<'static> {
+    if matches!(data_type, DataType::Interval) {
+        return match cell {
+            Cell::Null => AnyValue::Null,
+            Cell::F32(value) => AnyValue::Float64(*value as f64),
+            Cell::F64(value) => AnyValue::Float64(*value),
+            _ => AnyValue::Null,
+        };
+    }
+
     match cell {
         Cell::Null => AnyValue::Null,
         Cell::Bool(value) => AnyValue::Boolean(*value),
@@ -670,7 +684,7 @@ fn polars_schema_with_metadata(
     for column in &schema.columns {
         let dtype = match column.data_type {
             DataType::Int64 => PolarsDataType::Int64,
-            DataType::Float64 => PolarsDataType::Float64,
+            DataType::Float64 | DataType::Interval => PolarsDataType::Float64,
             DataType::Bool => PolarsDataType::Boolean,
             _ => PolarsDataType::String,
         };
@@ -768,5 +782,60 @@ mod tests {
 
         let row = TableRow::new(vec![Cell::I64(3), Cell::Null]);
         assert!(derive_deleted_at_from_row(&info, &row).is_none());
+    }
+
+    #[test]
+    fn table_rows_to_frame_keeps_interval_values_numeric() {
+        let table_id = TableId::new(2);
+        let table_name = TableName::new("public".to_string(), "metrics".to_string());
+        let etl_schema = etl::types::TableSchema::new(
+            table_id,
+            table_name,
+            vec![EtlColumnSchema::new(
+                "elapsed".to_string(),
+                Type::INTERVAL,
+                -1,
+                true,
+                false,
+            )],
+        );
+
+        let schema = TableSchema {
+            name: "public__metrics".to_string(),
+            columns: vec![ColumnSchema {
+                name: "elapsed".to_string(),
+                data_type: DataType::Interval,
+                nullable: true,
+            }],
+            primary_key: Some("elapsed".to_string()),
+        };
+
+        let info = CdcTableInfo::new(
+            CdcTableSpec {
+                table_id,
+                source_name: "public.metrics".to_string(),
+                dest_name: "public__metrics".to_string(),
+                schema,
+                metadata: MetadataColumns::default(),
+                primary_key: "elapsed".to_string(),
+                soft_delete: false,
+                soft_delete_column: None,
+            },
+            &etl_schema,
+        )
+        .expect("cdc table info");
+
+        let frame = table_rows_to_frame(
+            &info,
+            &[TableRow::new(vec![Cell::F64(42.5)])],
+            Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            None,
+        )
+        .expect("frame");
+
+        assert_eq!(
+            frame.column("elapsed").expect("elapsed").dtype(),
+            &PolarsDataType::Float64
+        );
     }
 }
