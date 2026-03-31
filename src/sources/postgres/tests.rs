@@ -1,5 +1,5 @@
-use super::*;
 use super::snapshot_sync::save_snapshot_progress;
+use super::*;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -60,7 +60,8 @@ fn incremental_sql_uses_tie_breaker_with_last_pk_and_filters() {
 
 #[test]
 fn read_primary_key_prefers_string_then_numeric() {
-    let value = read_primary_key_from_value(Value::String("abc123".to_string())).expect("string pk");
+    let value =
+        read_primary_key_from_value(Value::String("abc123".to_string())).expect("string pk");
     assert_eq!(value, "abc123");
 
     let value = read_primary_key_from_value(Value::Number(serde_json::Number::from(42)))
@@ -228,6 +229,87 @@ fn schema_diff_detects_incompatible_changes() {
 }
 
 #[test]
+fn schema_diff_treats_removed_and_nullable_only_changes_as_compatible() {
+    let previous = vec![
+        SchemaFieldSnapshot {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        },
+        SchemaFieldSnapshot {
+            name: "legacy_name".to_string(),
+            data_type: DataType::String,
+            nullable: false,
+        },
+    ];
+    let current = TableSchema {
+        name: "public__accounts".to_string(),
+        columns: vec![ColumnSchema {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }],
+        primary_key: Some("id".to_string()),
+    };
+
+    let diff = schema_diff(Some(&previous), &current).expect("diff");
+    assert_eq!(diff.removed, vec!["legacy_name".to_string()]);
+    assert_eq!(diff.nullable_changed, vec![("id".to_string(), false, true)]);
+    assert!(!diff.has_incompatible());
+}
+
+#[test]
+fn primary_key_changed_detects_explicit_primary_key_change() {
+    let diff = SchemaDiff::default();
+    let schema = TableSchema {
+        name: "public__accounts".to_string(),
+        columns: vec![ColumnSchema {
+            name: "account_id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Some("account_id".to_string()),
+    };
+
+    assert!(primary_key_changed(
+        Some("id"),
+        Some("hash-a"),
+        &schema,
+        "hash-b",
+        &diff,
+    ));
+}
+
+#[test]
+fn primary_key_changed_uses_hash_fallback_for_legacy_checkpoints() {
+    let diff = SchemaDiff::default();
+    let schema = TableSchema {
+        name: "public__accounts".to_string(),
+        columns: vec![ColumnSchema {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Some("account_id".to_string()),
+    };
+
+    assert!(primary_key_changed(
+        None,
+        Some("old-hash"),
+        &schema,
+        "new-hash",
+        &diff
+    ));
+    assert!(!primary_key_changed(
+        None,
+        Some("same-hash"),
+        &schema,
+        "same-hash",
+        &diff
+    ));
+}
+
+#[test]
 fn snapshot_progress_logging_uses_ten_batch_interval() {
     assert!(!should_log_snapshot_progress(0));
     assert!(!should_log_snapshot_progress(9));
@@ -359,7 +441,10 @@ fn test_state_config() -> Option<crate::config::StateConfig> {
     let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
     Some(crate::config::StateConfig {
         url,
-        schema: Some(format!("cdsync_state_snapshot_test_{}", Uuid::new_v4().simple())),
+        schema: Some(format!(
+            "cdsync_state_snapshot_test_{}",
+            Uuid::new_v4().simple()
+        )),
     })
 }
 

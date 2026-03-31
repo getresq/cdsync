@@ -511,12 +511,35 @@ impl PostgresSource {
         runtime.store.store_table_schema(etl_schema.clone()).await?;
         let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
         let new_hash = schema_fingerprint(&info.schema);
+        let current_primary_key = info.schema.primary_key.clone();
         let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
-        if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema)
+        let entry = runtime
+            .state
+            .postgres
+            .entry(table_cfg.name.clone())
+            .or_default();
+        let diff = schema_diff(prev_snapshot.as_deref(), &info.schema);
+        let default_diff = SchemaDiff::default();
+        let primary_key_changed_detected = primary_key_changed(
+            entry.schema_primary_key.as_deref(),
+            entry.schema_hash.as_deref(),
+            &info.schema,
+            &new_hash,
+            diff.as_ref().unwrap_or(&default_diff),
+        );
+        if let Some(diff) = diff
             && !diff.is_empty()
         {
             if runtime.schema_diff_enabled {
                 log_schema_diff(&table_cfg.name, &diff);
+            }
+            if primary_key_changed_detected {
+                warn!(
+                    table = %table_cfg.name,
+                    previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
+                    current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
+                    "schema change: primary key changed"
+                );
             }
             match runtime.schema_policy.clone() {
                 SchemaChangePolicy::Fail => {
@@ -539,7 +562,7 @@ impl PostgresSource {
                     ));
                 }
                 SchemaChangePolicy::Auto => {
-                    if diff.has_incompatible() {
+                    if diff.has_incompatible() || primary_key_changed_detected {
                         anyhow::bail!(
                             "incompatible schema change detected for {}; set schema_changes=resync or fail",
                             table_cfg.name
@@ -548,6 +571,40 @@ impl PostgresSource {
                     info!(
                         table = %table_cfg.name,
                         "schema change detected; updating destination schema"
+                    );
+                }
+            }
+        } else if primary_key_changed_detected {
+            warn!(
+                table = %table_cfg.name,
+                previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
+                current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
+                "schema change: primary key changed"
+            );
+            match runtime.schema_policy.clone() {
+                SchemaChangePolicy::Fail => {
+                    anyhow::bail!(
+                        "schema change detected for {}; set schema_changes=auto or resync",
+                        table_cfg.name
+                    );
+                }
+                SchemaChangePolicy::Resync => {
+                    warn!(
+                        table = %table_cfg.name,
+                        "schema change detected; marking CDC for resync"
+                    );
+                    if let Some(cdc_state) = runtime.state.postgres_cdc.as_mut() {
+                        cdc_state.last_lsn = None;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "schema change detected for {}; resync required",
+                        table_cfg.name
+                    ));
+                }
+                SchemaChangePolicy::Auto => {
+                    anyhow::bail!(
+                        "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                        table_cfg.name
                     );
                 }
             }
@@ -561,13 +618,9 @@ impl PostgresSource {
         runtime.table_hashes.insert(table_id, new_hash.clone());
         runtime.table_snapshots.insert(table_id, snapshot.clone());
 
-        let entry = runtime
-            .state
-            .postgres
-            .entry(table_cfg.name.clone())
-            .or_default();
         entry.schema_hash = Some(new_hash);
         entry.schema_snapshot = Some(snapshot);
+        entry.schema_primary_key = current_primary_key;
         if let Some(state_handle) = &runtime.state_handle {
             state_handle
                 .save_postgres_checkpoint(&table_cfg.name, entry)

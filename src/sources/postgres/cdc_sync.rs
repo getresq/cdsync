@@ -1,5 +1,5 @@
-use super::*;
 use super::snapshot_sync::release_exported_snapshot_slot;
+use super::*;
 
 impl PostgresSource {
     pub async fn sync_cdc(&self, request: CdcSyncRequest<'_>) -> Result<()> {
@@ -75,15 +75,34 @@ impl PostgresSource {
             let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
             dest.ensure_table(&info.schema).await?;
             let schema_hash = schema_fingerprint(&info.schema);
-            let prev_snapshot = state
-                .postgres
-                .get(&table_cfg.name)
-                .and_then(|checkpoint| checkpoint.schema_snapshot.clone());
-            if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema)
+            let checkpoint = state.postgres.get(&table_cfg.name);
+            let prev_snapshot =
+                checkpoint.and_then(|checkpoint| checkpoint.schema_snapshot.clone());
+            let diff = schema_diff(prev_snapshot.as_deref(), &info.schema);
+            let default_diff = SchemaDiff::default();
+            let primary_key_changed_detected = primary_key_changed(
+                checkpoint.and_then(|checkpoint| checkpoint.schema_primary_key.as_deref()),
+                checkpoint.and_then(|checkpoint| checkpoint.schema_hash.as_deref()),
+                &info.schema,
+                &schema_hash,
+                diff.as_ref().unwrap_or(&default_diff),
+            );
+
+            if let Some(diff) = diff
                 && !diff.is_empty()
             {
                 if schema_diff_enabled {
                     log_schema_diff(&table_cfg.name, &diff);
+                }
+                if primary_key_changed_detected {
+                    warn!(
+                        table = %table_cfg.name,
+                        previous_primary_key = checkpoint
+                            .and_then(|checkpoint| checkpoint.schema_primary_key.as_deref())
+                            .unwrap_or("unknown"),
+                        current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
+                        "schema change: primary key changed"
+                    );
                 }
                 match policy {
                     SchemaChangePolicy::Fail => {
@@ -96,12 +115,38 @@ impl PostgresSource {
                         resync_tables.insert(*table_id);
                     }
                     SchemaChangePolicy::Auto => {
-                        if diff.has_incompatible() {
+                        if diff.has_incompatible() || primary_key_changed_detected {
                             anyhow::bail!(
                                 "incompatible schema change detected for {}; set schema_changes=resync or fail",
                                 table_cfg.name
                             );
                         }
+                    }
+                }
+            } else if primary_key_changed_detected {
+                warn!(
+                    table = %table_cfg.name,
+                    previous_primary_key = checkpoint
+                        .and_then(|checkpoint| checkpoint.schema_primary_key.as_deref())
+                        .unwrap_or("unknown"),
+                    current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
+                    "schema change: primary key changed"
+                );
+                match policy {
+                    SchemaChangePolicy::Fail => {
+                        anyhow::bail!(
+                            "schema change detected for {}; set schema_changes=auto or resync",
+                            table_cfg.name
+                        );
+                    }
+                    SchemaChangePolicy::Resync => {
+                        resync_tables.insert(*table_id);
+                    }
+                    SchemaChangePolicy::Auto => {
+                        anyhow::bail!(
+                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                            table_cfg.name
+                        );
                     }
                 }
             }
@@ -226,6 +271,7 @@ impl PostgresSource {
                     if let Some(snapshot) = table_snapshots.get(table_id) {
                         entry.schema_snapshot = Some(snapshot.clone());
                     }
+                    entry.schema_primary_key = info.schema.primary_key.clone();
                     if !resume_snapshot_run {
                         if force_snapshot_restart && had_progress {
                             entry.snapshot_chunks.clear();
@@ -482,6 +528,7 @@ impl PostgresSource {
                 let entry = state.postgres.entry(info.source_name.clone()).or_default();
                 entry.schema_hash = Some(hash);
                 entry.schema_snapshot = table_snapshots.get(&table_id).cloned();
+                entry.schema_primary_key = info.schema.primary_key.clone();
                 if let Some(state_handle) = &state_handle {
                     state_handle
                         .save_postgres_checkpoint(&info.source_name, entry)

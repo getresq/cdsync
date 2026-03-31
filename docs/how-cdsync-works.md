@@ -182,15 +182,29 @@ That is intentional. Removal from config means "stop managing this table", not "
 If `schema_changes = auto`:
 
 - new source columns can usually be added to BigQuery automatically
+- historical rows remain null for the new column unless you explicitly resync/backfill
 
-### Destructive or incompatible changes
+### Non-destructive changes
 
 Examples:
 
 - column removed
 - column renamed
-- type changed
-- nullability changed in a breaking way
+
+With the current raw replication policy, these are handled conservatively:
+
+- removed columns are not automatically dropped from BigQuery
+- a rename is treated as "new column added, old column left in place"
+- nullability-only changes are logged but do not force a resync
+
+That keeps the raw destination non-destructive and avoids guessing at schema intent.
+
+### Incompatible changes
+
+Examples:
+
+- type changed in a way that changes the destination type
+- primary key changed
 
 These are treated as incompatible changes and usually require:
 

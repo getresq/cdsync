@@ -17,9 +17,7 @@ impl SchemaDiff {
     }
 
     pub(super) fn has_incompatible(&self) -> bool {
-        !self.removed.is_empty()
-            || !self.type_changed.is_empty()
-            || !self.nullable_changed.is_empty()
+        !self.type_changed.is_empty()
     }
 }
 
@@ -163,6 +161,22 @@ pub(super) fn log_schema_diff(table: &str, diff: &SchemaDiff) {
             "schema change: nullable changes"
         );
     }
+}
+
+pub(super) fn primary_key_changed(
+    previous_primary_key: Option<&str>,
+    previous_schema_hash: Option<&str>,
+    current: &TableSchema,
+    current_schema_hash: &str,
+    diff: &SchemaDiff,
+) -> bool {
+    if let Some(previous_primary_key) = previous_primary_key {
+        return current.primary_key.as_deref() != Some(previous_primary_key);
+    }
+
+    diff.is_empty()
+        && previous_schema_hash
+            .is_some_and(|previous_schema_hash| previous_schema_hash != current_schema_hash)
 }
 
 #[cfg(test)]

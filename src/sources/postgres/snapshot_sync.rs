@@ -136,6 +136,21 @@ impl PostgresSource {
             if schema_diff_enabled {
                 log_schema_diff(&table.name, &diff);
             }
+            let primary_key_changed_detected = primary_key_changed(
+                entry.schema_primary_key.as_deref(),
+                entry.schema_hash.as_deref(),
+                &schema,
+                &schema_hash,
+                &diff,
+            );
+            if primary_key_changed_detected {
+                warn!(
+                    table = %table.name,
+                    previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
+                    current_primary_key = schema.primary_key.as_deref().unwrap_or("none"),
+                    "schema change: primary key changed"
+                );
+            }
             match policy {
                 SchemaChangePolicy::Fail => {
                     anyhow::bail!(
@@ -155,13 +170,52 @@ impl PostgresSource {
                     return Ok(entry);
                 }
                 SchemaChangePolicy::Auto => {
-                    if diff.has_incompatible() {
+                    if diff.has_incompatible() || primary_key_changed_detected {
                         anyhow::bail!(
                             "incompatible schema change detected for {}; set schema_changes=resync or fail",
                             table.name
                         );
                     }
                     info!(table = %table.name, "schema change detected; auto-altering destination");
+                }
+            }
+        } else if primary_key_changed(
+            entry.schema_primary_key.as_deref(),
+            entry.schema_hash.as_deref(),
+            &schema,
+            &schema_hash,
+            &SchemaDiff::default(),
+        ) {
+            warn!(
+                table = %table.name,
+                previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
+                current_primary_key = schema.primary_key.as_deref().unwrap_or("none"),
+                "schema change: primary key changed"
+            );
+            match policy {
+                SchemaChangePolicy::Fail => {
+                    anyhow::bail!(
+                        "schema change detected for {}; set schema_changes=auto or resync",
+                        table.name
+                    );
+                }
+                SchemaChangePolicy::Resync => {
+                    info!(table = %table.name, "schema change detected; resyncing table");
+                    if !dry_run {
+                        dest.truncate_table(&schema.name).await?;
+                    }
+                    self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
+                        .await?;
+                    entry.schema_hash = Some(schema_hash.clone());
+                    entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
+                    entry.schema_primary_key = schema.primary_key.clone();
+                    return Ok(entry);
+                }
+                SchemaChangePolicy::Auto => {
+                    anyhow::bail!(
+                        "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                        table.name
+                    );
                 }
             }
         }
@@ -194,6 +248,7 @@ impl PostgresSource {
 
         entry.schema_hash = Some(schema_hash);
         entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
+        entry.schema_primary_key = schema.primary_key.clone();
         Ok(entry)
     }
 
@@ -290,7 +345,9 @@ impl PostgresSource {
                 .await?;
                 if let Some(stats) = options.stats {
                     let load_ms = load_start.elapsed().as_millis() as u64;
-                    stats.record_load(&table.name, rows.len(), 0, 0, load_ms).await;
+                    stats
+                        .record_load(&table.name, rows.len(), 0, 0, load_ms)
+                        .await;
                 }
             }
 
