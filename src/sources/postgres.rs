@@ -9,7 +9,8 @@ use crate::state::{ConnectionState, StateHandle};
 use crate::stats::StatsHandle;
 use crate::tls::MakeNativeTlsConnect;
 use crate::types::{
-    ColumnSchema, DataType, MetadataColumns, SchemaFieldSnapshot, TableCheckpoint, TableSchema,
+    ColumnSchema, DataType, MetadataColumns, SchemaFieldSnapshot, SnapshotChunkCheckpoint,
+    TableCheckpoint, TableSchema,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -83,18 +84,21 @@ struct ExportedSnapshotSlotInfo {
 struct CdcSnapshotTask {
     table: ResolvedPostgresTable,
     info: CdcTableInfo,
-    checkpoint: TableCheckpoint,
+    checkpoint_state: Arc<Mutex<TableCheckpoint>>,
+    resume_from_primary_key: Option<String>,
     chunk: Option<SnapshotChunkRange>,
-    persist_progress: bool,
+    write_mode: WriteMode,
     state_handle: Option<StateHandle>,
 }
 
 struct SnapshotCopyContext<'a> {
     dest: &'a dyn Destination,
-    snapshot_name: &'a str,
+    snapshot_name: Option<&'a str>,
     batch_size: usize,
     stats: Option<StatsHandle>,
-    checkpoint: TableCheckpoint,
+    checkpoint_state: Arc<Mutex<TableCheckpoint>>,
+    resume_from_primary_key: Option<String>,
+    write_mode: WriteMode,
     state_handle: Option<StateHandle>,
 }
 
@@ -780,44 +784,79 @@ impl PostgresSource {
         }
         let mut last_lsn = state.postgres_cdc.as_ref().and_then(|s| s.last_lsn.clone());
 
+        let has_snapshot_progress = tables.iter().any(|table| {
+            state
+                .postgres
+                .get(&table.name)
+                .is_some_and(table_has_snapshot_progress)
+        });
+        let mut snapshot_progress_missing_lsn = false;
+        let snapshot_resume_lsn = tables.iter().try_fold(None, |current, table| {
+            let Some(checkpoint) = state.postgres.get(&table.name) else {
+                return Ok(current);
+            };
+            if !table_has_snapshot_progress(checkpoint) {
+                return Ok(current);
+            }
+            match (&current, checkpoint.snapshot_start_lsn.as_ref()) {
+                (None, Some(lsn)) => Ok(Some(lsn.clone())),
+                (Some(existing), Some(lsn)) if existing == lsn => Ok(current),
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("snapshot progress checkpoints have mismatched start LSNs")
+                }
+                (_, None) => {
+                    snapshot_progress_missing_lsn = true;
+                    Ok(current)
+                }
+            }
+        })?;
+        let force_snapshot_restart = has_snapshot_progress
+            && (snapshot_resume_lsn.is_none() || snapshot_progress_missing_lsn);
+        if force_snapshot_restart {
+            warn!(
+                "snapshot progress exists without a saved snapshot_start_lsn; restarting snapshot from scratch"
+            );
+        }
+
         let mut start_lsn = None;
-        let mut needs_snapshot = mode == crate::types::SyncMode::Full || last_lsn.is_none();
+        let mut needs_snapshot =
+            mode == crate::types::SyncMode::Full || last_lsn.is_none() || has_snapshot_progress;
         if !resync_tables.is_empty() {
             needs_snapshot = true;
         }
 
         if needs_snapshot {
-            if let Err(err) = replication_client.delete_slot(&slot_name).await
-                && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
+            let snapshot_table_ids: HashSet<TableId> = if mode == crate::types::SyncMode::Full
+                || last_lsn.is_none()
+                || has_snapshot_progress
             {
-                return Err(err.into());
-            }
+                include_tables.clone()
+            } else {
+                resync_tables.clone()
+            };
 
-            let (slot_guard, slot) = self.create_exported_snapshot_slot(&slot_name).await?;
-
-            let snapshot_table_ids: HashSet<TableId> =
-                if mode == crate::types::SyncMode::Full || last_lsn.is_none() {
-                    include_tables.clone()
-                } else {
-                    resync_tables.clone()
-                };
-
-            if mode == crate::types::SyncMode::Full {
-                for table_id in &snapshot_table_ids {
-                    if let Some(info) = table_info_map.get(table_id) {
-                        dest.truncate_table(&info.dest_name).await?;
-                    }
+            let resume_snapshot_run = snapshot_resume_lsn.is_some() && !force_snapshot_restart;
+            let mut slot_guard = None;
+            let mut snapshot_name = None;
+            let snapshot_start_lsn = if resume_snapshot_run {
+                snapshot_resume_lsn
+                    .clone()
+                    .context("missing snapshot start LSN for snapshot resume")?
+            } else {
+                if let Err(err) = replication_client.delete_slot(&slot_name).await
+                    && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
+                {
+                    return Err(err.into());
                 }
-            } else if !resync_tables.is_empty() {
-                for table_id in &resync_tables {
-                    if let Some(info) = table_info_map.get(table_id) {
-                        dest.truncate_table(&info.dest_name).await?;
-                    }
-                }
-            }
+                let (guard, slot) = self.create_exported_snapshot_slot(&slot_name).await?;
+                snapshot_name = Some(slot.snapshot_name);
+                let consistent_point = slot.consistent_point;
+                slot_guard = Some(guard);
+                consistent_point
+            };
 
             let mut snapshot_tasks_to_run = Vec::with_capacity(snapshot_table_ids.len());
-            let mut chunked_snapshot_tables = HashSet::new();
+            let mut snapshot_checkpoint_states = HashMap::new();
             for table_id in &snapshot_table_ids {
                 let table = table_ids
                     .get(table_id)
@@ -827,55 +866,114 @@ impl PostgresSource {
                     .get(table_id)
                     .cloned()
                     .context("missing table info for CDC snapshot")?;
-                let checkpoint = {
+                let write_mode;
+                let resumed_from_saved_progress;
+                let task_specs = {
                     let entry = state.postgres.entry(table.name.clone()).or_default();
+                    let had_progress = table_has_snapshot_progress(entry);
+                    resumed_from_saved_progress = resume_snapshot_run && had_progress;
                     if let Some(schema_hash) = table_hashes.get(table_id) {
                         entry.schema_hash = Some(schema_hash.clone());
                     }
                     if let Some(snapshot) = table_snapshots.get(table_id) {
                         entry.schema_snapshot = Some(snapshot.clone());
                     }
+                    if !resume_snapshot_run {
+                        if force_snapshot_restart && had_progress {
+                            entry.snapshot_chunks.clear();
+                            entry.snapshot_start_lsn = None;
+                        }
+                        let snapshot_plan = self
+                            .plan_snapshot_chunk_ranges(&table, batch_size, snapshot_concurrency)
+                            .await?;
+                        if !snapshot_plan.chunk_ranges.is_empty() {
+                            let first_chunk = snapshot_plan.chunk_ranges.first().copied();
+                            let last_chunk = snapshot_plan.chunk_ranges.last().copied();
+                            info!(
+                                table = %info.source_name,
+                                row_count = snapshot_plan.row_count,
+                                chunk_count = snapshot_plan.chunk_ranges.len(),
+                                chunk_start = first_chunk.map(|chunk| chunk.start_pk),
+                                chunk_end = last_chunk.map(|chunk| chunk.end_pk),
+                                "chunking exported CDC snapshot table by PK range"
+                            );
+                        }
+                        entry.snapshot_start_lsn = Some(snapshot_start_lsn.clone());
+                        entry.snapshot_chunks =
+                            snapshot_chunk_checkpoints_from_ranges(&snapshot_plan.chunk_ranges);
+                        if mode == crate::types::SyncMode::Full
+                            || resync_tables.contains(table_id)
+                            || (force_snapshot_restart && had_progress)
+                        {
+                            dest.truncate_table(&info.dest_name).await?;
+                        }
+                        write_mode = WriteMode::Append;
+                    } else {
+                        if !had_progress {
+                            let snapshot_plan = self
+                                .plan_snapshot_chunk_ranges(
+                                    &table,
+                                    batch_size,
+                                    snapshot_concurrency,
+                                )
+                                .await?;
+                            if !snapshot_plan.chunk_ranges.is_empty() {
+                                let first_chunk = snapshot_plan.chunk_ranges.first().copied();
+                                let last_chunk = snapshot_plan.chunk_ranges.last().copied();
+                                info!(
+                                    table = %info.source_name,
+                                    row_count = snapshot_plan.row_count,
+                                    chunk_count = snapshot_plan.chunk_ranges.len(),
+                                    chunk_start = first_chunk.map(|chunk| chunk.start_pk),
+                                    chunk_end = last_chunk.map(|chunk| chunk.end_pk),
+                                    "planning remaining snapshot work for resumed CDC snapshot"
+                                );
+                            }
+                            entry.snapshot_start_lsn = Some(snapshot_start_lsn.clone());
+                            entry.snapshot_chunks =
+                                snapshot_chunk_checkpoints_from_ranges(&snapshot_plan.chunk_ranges);
+                        }
+                        write_mode = WriteMode::Upsert;
+                    }
                     if let Some(state_handle) = &state_handle {
                         state_handle
                             .save_postgres_checkpoint(&table.name, entry)
                             .await?;
                     }
-                    entry.clone()
+                    snapshot_resume_tasks_from_checkpoint(entry)?
                 };
-                let snapshot_plan = self
-                    .plan_snapshot_chunk_ranges(&table, batch_size, snapshot_concurrency)
-                    .await?;
-                if !snapshot_plan.chunk_ranges.is_empty() {
-                    let first_chunk = snapshot_plan.chunk_ranges.first().copied();
-                    let last_chunk = snapshot_plan.chunk_ranges.last().copied();
-                    info!(
-                        table = %info.source_name,
-                        row_count = snapshot_plan.row_count,
-                        chunk_count = snapshot_plan.chunk_ranges.len(),
-                        chunk_start = first_chunk.map(|chunk| chunk.start_pk),
-                        chunk_end = last_chunk.map(|chunk| chunk.end_pk),
-                        "chunking large exported CDC snapshot table by PK range"
-                    );
-                    chunked_snapshot_tables.insert(table.name.clone());
-                    for chunk in snapshot_plan.chunk_ranges {
-                        snapshot_tasks_to_run.push(CdcSnapshotTask {
-                            table: table.clone(),
-                            info: info.clone(),
-                            checkpoint: checkpoint.clone(),
-                            chunk: Some(chunk),
-                            persist_progress: false,
-                            state_handle: state_handle.clone(),
-                        });
-                    }
-                } else {
+                let checkpoint_state = Arc::new(Mutex::new(
+                    state
+                        .postgres
+                        .get(&table.name)
+                        .cloned()
+                        .context("missing snapshot checkpoint state after planning")?,
+                ));
+                snapshot_checkpoint_states
+                    .insert(table.name.clone(), Arc::clone(&checkpoint_state));
+                let task_count = task_specs.len();
+                for (chunk, resume_from_primary_key) in task_specs {
                     snapshot_tasks_to_run.push(CdcSnapshotTask {
-                        table,
-                        info,
-                        checkpoint,
-                        chunk: None,
-                        persist_progress: true,
+                        table: table.clone(),
+                        info: info.clone(),
+                        checkpoint_state: Arc::clone(&checkpoint_state),
+                        resume_from_primary_key,
+                        chunk,
+                        write_mode,
                         state_handle: state_handle.clone(),
                     });
+                }
+                if resume_snapshot_run && task_count == 0 {
+                    info!(
+                        table = %info.source_name,
+                        "snapshot already complete for table; keeping saved start LSN for CDC catch-up"
+                    );
+                } else if resumed_from_saved_progress {
+                    info!(
+                        table = %info.source_name,
+                        write_mode = "upsert",
+                        "resuming snapshot table from saved checkpoint progress"
+                    );
                 }
             }
 
@@ -883,7 +981,7 @@ impl PostgresSource {
             let mut snapshot_tasks = FuturesUnordered::new();
             for snapshot_task in snapshot_tasks_to_run {
                 let permit_pool = Arc::clone(&semaphore);
-                let snapshot_name = slot.snapshot_name.clone();
+                let snapshot_name = snapshot_name.clone();
                 let source = self;
                 let dest = dest.clone();
                 let stats = stats.clone();
@@ -895,11 +993,15 @@ impl PostgresSource {
                     let _permit = permit;
                     info!(
                         table = %snapshot_task.info.source_name,
-                        snapshot_name = %snapshot_name,
+                        snapshot_name = snapshot_name.as_deref().unwrap_or("resume"),
                         batch_size,
                         snapshot_concurrency,
                         chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
                         chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
+                        write_mode = match snapshot_task.write_mode {
+                            WriteMode::Append => "append",
+                            WriteMode::Upsert => "upsert",
+                        },
                         "starting exported CDC snapshot copy"
                     );
                     source
@@ -909,15 +1011,13 @@ impl PostgresSource {
                             snapshot_task.chunk,
                             SnapshotCopyContext {
                                 dest: &dest,
-                                snapshot_name: &snapshot_name,
+                                snapshot_name: snapshot_name.as_deref(),
                                 batch_size,
                                 stats,
-                                checkpoint: snapshot_task.checkpoint,
-                                state_handle: if snapshot_task.persist_progress {
-                                    snapshot_task.state_handle
-                                } else {
-                                    None
-                                },
+                                checkpoint_state: snapshot_task.checkpoint_state,
+                                resume_from_primary_key: snapshot_task.resume_from_primary_key,
+                                write_mode: snapshot_task.write_mode,
+                                state_handle: snapshot_task.state_handle,
                             },
                         )
                         .await
@@ -938,27 +1038,39 @@ impl PostgresSource {
                 Ok(())
             }
             .await;
-            release_exported_snapshot_slot(slot_guard, snapshot_result.is_ok()).await?;
+            if let Some(slot_guard) = slot_guard {
+                release_exported_snapshot_slot(slot_guard, snapshot_result.is_ok()).await?;
+            }
             snapshot_result?;
-            if !chunked_snapshot_tables.is_empty() {
-                let completed_at = Utc::now();
-                for table_name in &chunked_snapshot_tables {
-                    if let Some(entry) = state.postgres.get_mut(table_name) {
-                        entry.last_synced_at = Some(completed_at);
-                        entry.last_primary_key = None;
-                        if let Some(state_handle) = &state_handle {
-                            state_handle
-                                .save_postgres_checkpoint(table_name, entry)
-                                .await?;
-                        }
-                    }
+            {
+                let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
+                cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
+                if let Some(state_handle) = &state_handle {
+                    state_handle.save_postgres_cdc_state(cdc_state).await?;
                 }
             }
-            let snapshot_start_lsn = slot.consistent_point.parse().map_err(|_| {
-                anyhow::anyhow!("invalid slot consistent_point '{}'", slot.consistent_point)
+            let completed_at = Utc::now();
+            for (table_name, checkpoint_state) in snapshot_checkpoint_states {
+                let checkpoint = {
+                    let mut checkpoint = checkpoint_state.lock().await;
+                    checkpoint.last_synced_at = Some(completed_at);
+                    checkpoint.last_primary_key = None;
+                    checkpoint.snapshot_start_lsn = None;
+                    checkpoint.snapshot_chunks.clear();
+                    checkpoint.clone()
+                };
+                if let Some(state_handle) = &state_handle {
+                    state_handle
+                        .save_postgres_checkpoint(&table_name, &checkpoint)
+                        .await?;
+                }
+                state.postgres.insert(table_name, checkpoint);
+            }
+            let parsed_start_lsn = snapshot_start_lsn.parse().map_err(|_| {
+                anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
             })?;
-            start_lsn = Some(snapshot_start_lsn);
-            last_lsn = Some(slot.consistent_point);
+            start_lsn = Some(parsed_start_lsn);
+            last_lsn = Some(snapshot_start_lsn);
         }
 
         let start_lsn = match (start_lsn, last_lsn.as_deref()) {
@@ -1154,7 +1266,7 @@ impl PostgresSource {
                     &schema.name,
                     schema,
                     &batch,
-                    WriteMode::Append,
+                    WriteMode::Upsert,
                     Some(&table.primary_key),
                 )
                 .await?;
@@ -1361,7 +1473,9 @@ impl PostgresSource {
             snapshot_name,
             batch_size,
             stats,
-            mut checkpoint,
+            checkpoint_state,
+            resume_from_primary_key,
+            write_mode,
             state_handle,
         } = ctx;
         let (schema_name, table_name) = split_table_name(&table.name);
@@ -1410,13 +1524,14 @@ impl PostgresSource {
             )
         };
         let pg_config = self.build_pg_connection_config().await?;
-        let connection = acquire_exported_snapshot_reader(&pg_config, snapshot_name).await?;
-        let mut last_pk: Option<String> = None;
+        let connection = acquire_snapshot_reader(&pg_config, snapshot_name).await?;
+        let mut last_pk = resume_from_primary_key;
         let mut extracted_rows = 0usize;
         let mut loaded_batches = 0usize;
         let mut completed = false;
         let chunk_start = chunk.map(|range| range.start_pk);
         let chunk_end = chunk.map(|range| range.end_pk);
+        let snapshot_label = snapshot_name.unwrap_or("resume");
 
         let run_result: Result<()> = async {
             loop {
@@ -1474,11 +1589,16 @@ impl PostgresSource {
                 )
                 .await?;
                 if let Some(stats) = &stats {
+                    let upserted = if matches!(write_mode, WriteMode::Upsert) {
+                        rows.len()
+                    } else {
+                        0
+                    };
                     stats
                         .record_load(
                             &table.name,
                             rows.len(),
-                            0,
+                            upserted,
                             0,
                             load_start.elapsed().as_millis() as u64,
                         )
@@ -1491,7 +1611,7 @@ impl PostgresSource {
                         table = %table.name,
                         extracted_rows,
                         loaded_batches,
-                        snapshot_name,
+                        snapshot_name = snapshot_label,
                         chunk_start,
                         chunk_end,
                         "exported snapshot copy progress"
@@ -1503,13 +1623,15 @@ impl PostgresSource {
                         .and_then(|row| row.try_get::<_, String>(pk_alias).ok())
                         .context("missing primary key value for snapshot pagination")?,
                 );
-                checkpoint.last_synced_at = Some(Utc::now());
-                checkpoint.last_primary_key = last_pk.clone();
-                if let Some(state_handle) = &state_handle {
-                    state_handle
-                        .save_postgres_checkpoint(&table.name, &checkpoint)
-                        .await?;
-                }
+                save_snapshot_progress(
+                    &checkpoint_state,
+                    &table.name,
+                    chunk,
+                    last_pk.clone(),
+                    false,
+                    state_handle.as_ref(),
+                )
+                .await?;
             }
 
             completed = true;
@@ -1520,18 +1642,21 @@ impl PostgresSource {
         release_exported_snapshot_reader(&connection, completed).await?;
         run_result?;
 
-        checkpoint.last_synced_at = Some(Utc::now());
-        if let Some(state_handle) = &state_handle {
-            state_handle
-                .save_postgres_checkpoint(&table.name, &checkpoint)
-                .await?;
-        }
+        save_snapshot_progress(
+            &checkpoint_state,
+            &table.name,
+            chunk,
+            last_pk.clone(),
+            true,
+            state_handle.as_ref(),
+        )
+        .await?;
 
         info!(
             table = %table.name,
             extracted_rows,
             loaded_batches,
-            snapshot_name,
+            snapshot_name = snapshot_label,
             chunk_start,
             chunk_end,
             "completed exported snapshot copy"
@@ -2339,21 +2464,22 @@ async fn create_exported_snapshot_slot_info(
     anyhow::bail!("replication slot creation returned no row")
 }
 
-async fn acquire_exported_snapshot_reader(
+async fn acquire_snapshot_reader(
     pg_config: &PgConnectionConfig,
-    snapshot_name: &str,
+    snapshot_name: Option<&str>,
 ) -> Result<TokioPgClient> {
     let connection = connect_snapshot_reader_client(pg_config).await?;
     connection
         .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
         .await
         .with_context(|| "starting exported snapshot reader transaction")?;
-    if let Err(err) = connection
-        .simple_query(&format!(
-            "SET TRANSACTION SNAPSHOT {}",
-            quote_pg_literal(snapshot_name)
-        ))
-        .await
+    if let Some(snapshot_name) = snapshot_name
+        && let Err(err) = connection
+            .simple_query(&format!(
+                "SET TRANSACTION SNAPSHOT {}",
+                quote_pg_literal(snapshot_name)
+            ))
+            .await
     {
         let _ = connection.simple_query("ROLLBACK;").await;
         return Err(err).with_context(|| {
@@ -2380,6 +2506,28 @@ async fn release_exported_snapshot_slot(
     Ok(())
 }
 
+async fn save_snapshot_progress(
+    checkpoint_state: &Arc<Mutex<TableCheckpoint>>,
+    table_name: &str,
+    chunk: Option<SnapshotChunkRange>,
+    last_primary_key: Option<String>,
+    complete: bool,
+    state_handle: Option<&StateHandle>,
+) -> Result<()> {
+    let checkpoint = {
+        let mut checkpoint = checkpoint_state.lock().await;
+        checkpoint.last_synced_at = Some(Utc::now());
+        update_snapshot_chunk_checkpoint(&mut checkpoint, chunk, last_primary_key, complete)?;
+        checkpoint.clone()
+    };
+    if let Some(state_handle) = state_handle {
+        state_handle
+            .save_postgres_checkpoint(table_name, &checkpoint)
+            .await?;
+    }
+    Ok(())
+}
+
 fn quote_pg_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -2390,6 +2538,10 @@ fn quote_pg_literal(value: &str) -> String {
 
 fn is_chunkable_snapshot_primary_key(udt_name: &str) -> bool {
     matches!(udt_name, "int2" | "int4" | "int8")
+}
+
+fn table_has_snapshot_progress(checkpoint: &TableCheckpoint) -> bool {
+    !checkpoint.snapshot_chunks.is_empty()
 }
 
 fn snapshot_chunk_filter_sql(
@@ -2453,6 +2605,96 @@ fn plan_snapshot_chunk_ranges_from_bounds(
     }
 
     ranges
+}
+
+fn snapshot_chunk_checkpoints_from_ranges(
+    ranges: &[SnapshotChunkRange],
+) -> Vec<SnapshotChunkCheckpoint> {
+    if ranges.is_empty() {
+        return vec![SnapshotChunkCheckpoint {
+            start_primary_key: None,
+            end_primary_key: None,
+            last_primary_key: None,
+            complete: false,
+        }];
+    }
+
+    ranges
+        .iter()
+        .map(|range| SnapshotChunkCheckpoint {
+            start_primary_key: Some(range.start_pk.to_string()),
+            end_primary_key: Some(range.end_pk.to_string()),
+            last_primary_key: None,
+            complete: false,
+        })
+        .collect()
+}
+
+fn snapshot_chunk_checkpoint_to_range(
+    checkpoint: &SnapshotChunkCheckpoint,
+) -> Result<Option<SnapshotChunkRange>> {
+    match (
+        checkpoint.start_primary_key.as_deref(),
+        checkpoint.end_primary_key.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) => Ok(Some(SnapshotChunkRange {
+            start_pk: start
+                .parse()
+                .with_context(|| format!("parsing snapshot chunk start {}", start))?,
+            end_pk: end
+                .parse()
+                .with_context(|| format!("parsing snapshot chunk end {}", end))?,
+        })),
+        _ => anyhow::bail!("snapshot chunk checkpoint has mismatched bounds"),
+    }
+}
+
+fn snapshot_chunk_checkpoint_matches_range(
+    checkpoint: &SnapshotChunkCheckpoint,
+    range: Option<SnapshotChunkRange>,
+) -> bool {
+    match range {
+        Some(range) => {
+            let start = range.start_pk.to_string();
+            let end = range.end_pk.to_string();
+            checkpoint.start_primary_key.as_deref() == Some(start.as_str())
+                && checkpoint.end_primary_key.as_deref() == Some(end.as_str())
+        }
+        None => checkpoint.start_primary_key.is_none() && checkpoint.end_primary_key.is_none(),
+    }
+}
+
+fn snapshot_resume_tasks_from_checkpoint(
+    checkpoint: &TableCheckpoint,
+) -> Result<Vec<(Option<SnapshotChunkRange>, Option<String>)>> {
+    checkpoint
+        .snapshot_chunks
+        .iter()
+        .filter(|chunk| !chunk.complete)
+        .map(|chunk| {
+            Ok((
+                snapshot_chunk_checkpoint_to_range(chunk)?,
+                chunk.last_primary_key.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn update_snapshot_chunk_checkpoint(
+    checkpoint: &mut TableCheckpoint,
+    range: Option<SnapshotChunkRange>,
+    last_primary_key: Option<String>,
+    complete: bool,
+) -> Result<()> {
+    let chunk = checkpoint
+        .snapshot_chunks
+        .iter_mut()
+        .find(|chunk| snapshot_chunk_checkpoint_matches_range(chunk, range))
+        .context("missing snapshot chunk checkpoint for progress update")?;
+    chunk.last_primary_key = last_primary_key;
+    chunk.complete = complete;
+    Ok(())
 }
 
 fn build_select_columns(schema: &TableSchema) -> String {
@@ -2715,6 +2957,20 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_chunk_checkpoints_use_unbounded_entry_for_single_table_resume() {
+        let checkpoints = snapshot_chunk_checkpoints_from_ranges(&[]);
+        assert_eq!(
+            checkpoints,
+            vec![SnapshotChunkCheckpoint {
+                start_primary_key: None,
+                end_primary_key: None,
+                last_primary_key: None,
+                complete: false,
+            }]
+        );
+    }
+
+    #[test]
     fn plan_snapshot_chunk_ranges_splits_large_tables_evenly() {
         let ranges = plan_snapshot_chunk_ranges_from_bounds(40_000, 1, 40_000, 1_000, 4);
         assert_eq!(
@@ -2752,6 +3008,39 @@ mod tests {
                 }
             ),
             "\"id\" >= 10::int8 AND \"id\" <= 20::int8"
+        );
+    }
+
+    #[test]
+    fn snapshot_resume_tasks_skip_completed_chunks_and_keep_saved_progress() {
+        let checkpoint = TableCheckpoint {
+            snapshot_chunks: vec![
+                SnapshotChunkCheckpoint {
+                    start_primary_key: Some("1".to_string()),
+                    end_primary_key: Some("10".to_string()),
+                    last_primary_key: Some("6".to_string()),
+                    complete: false,
+                },
+                SnapshotChunkCheckpoint {
+                    start_primary_key: Some("11".to_string()),
+                    end_primary_key: Some("20".to_string()),
+                    last_primary_key: Some("20".to_string()),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let tasks = snapshot_resume_tasks_from_checkpoint(&checkpoint).expect("resume tasks");
+        assert_eq!(
+            tasks,
+            vec![(
+                Some(SnapshotChunkRange {
+                    start_pk: 1,
+                    end_pk: 10,
+                }),
+                Some("6".to_string()),
+            )]
         );
     }
 

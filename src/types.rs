@@ -56,6 +56,14 @@ pub struct SchemaFieldSnapshot {
     pub nullable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotChunkCheckpoint {
+    pub start_primary_key: Option<String>,
+    pub end_primary_key: Option<String>,
+    pub last_primary_key: Option<String>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
@@ -70,4 +78,7 @@ pub struct TableCheckpoint {
     pub last_lsn: Option<String>,
     pub schema_hash: Option<String>,
     pub schema_snapshot: Option<Vec<SchemaFieldSnapshot>>,
+    pub snapshot_start_lsn: Option<String>,
+    #[serde(default)]
+    pub snapshot_chunks: Vec<SnapshotChunkCheckpoint>,
 }

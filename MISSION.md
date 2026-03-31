@@ -1,24 +1,24 @@
 # Mission
 
-Mission: Replace NDJSON as the primary BigQuery GCS batch-load format with Parquet, while keeping a narrowly-scoped fallback only for schema types that are not yet safe to encode through the current Parquet path.
+Mission: Make PostgreSQL CDC snapshot resume semantics safe enough for interrupted runs by persisting per-table snapshot progress, resuming incomplete work without duplicate snapshot appends, and preserving the snapshot start LSN needed for CDC catch-up.
 
 ## Done Criteria
 
-1. BigQuery batch-load uploads use Parquet by default.
-2. Load jobs are configured for Parquet objects.
-3. The current frame-to-Parquet path preserves the supported BigQuery column types we already emit in bulk loads.
-4. Unsupported schema shapes fall back intentionally instead of silently writing invalid Parquet.
+1. In-progress CDC snapshots persist resumable per-table snapshot state instead of only a single ambiguous `last_primary_key`.
+2. Restarted snapshot runs resume incomplete tables or chunks without truncating already-loaded work.
+3. Resumed snapshot work writes through an idempotent path so rereads from a later source view do not create duplicate destination rows.
+4. The snapshot start LSN survives interruption and is reused for the CDC catch-up boundary.
 5. The change is covered by focused tests and passes formatting, tests, and clippy.
 
 ## Guardrails
 
-- Keep the change bounded to the batch-load path; do not redesign the whole destination writer.
-- Do not regress emulator behavior or the non-batch-load append/upsert paths.
-- Do not claim Parquet support for schema types we cannot encode safely yet.
+- Keep the change bounded to CDC snapshot resume semantics; do not redesign the WAL pipeline.
+- Do not regress the normal fresh snapshot path or polling sync behavior.
+- Be explicit when old checkpoint state is too incomplete to resume safely.
 - No compiler warnings, no clippy warnings, no broken tests.
 
 ## Critical Learnings
 
-- Decision: Use Parquet as the primary batch-load format immediately rather than adding a long-term config switch between NDJSON and Parquet.
-- Decision: Keep NDJSON only as a temporary compatibility path for schema types like `NUMERIC` and `JSON` that are not safely represented by the current DataFrame-to-Parquet conversion.
-- Constraint: The existing bulk frames store several logical types as strings, so supported Parquet loads need an explicit frame-to-typed-Parquet conversion step instead of writing the raw frame bytes directly.
+- Decision: Persist snapshot progress as explicit per-table chunk checkpoints plus a saved snapshot start LSN, rather than overloading `last_primary_key`.
+- Decision: Resume snapshot batches via `Upsert` so rereading from a later source view still converges correctly when WAL catch-up starts from the original snapshot LSN.
+- Constraint: Exported Postgres snapshots do not survive process restarts, so a resumed run cannot depend on re-importing the original exported snapshot name.
