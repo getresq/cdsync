@@ -98,19 +98,21 @@ mod sync_selection_tests {
                 cdc_tls_ca_path: None,
                 cdc_tls_ca: None,
             }),
-            destination: crate::config::DestinationConfig::BigQuery(crate::config::BigQueryConfig {
-                project_id: "proj".to_string(),
-                dataset: "dataset".to_string(),
-                location: None,
-                service_account_key_path: None,
-                service_account_key: None,
-                partition_by_synced_at: Some(false),
-                storage_write_enabled: Some(false),
-                batch_load_bucket: None,
-                batch_load_prefix: None,
-                emulator_http: Some("http://localhost:9050".to_string()),
-                emulator_grpc: Some("localhost:9051".to_string()),
-            }),
+            destination: crate::config::DestinationConfig::BigQuery(
+                crate::config::BigQueryConfig {
+                    project_id: "proj".to_string(),
+                    dataset: "dataset".to_string(),
+                    location: None,
+                    service_account_key_path: None,
+                    service_account_key: None,
+                    partition_by_synced_at: Some(false),
+                    storage_write_enabled: Some(false),
+                    batch_load_bucket: None,
+                    batch_load_prefix: None,
+                    emulator_http: Some("http://localhost:9050".to_string()),
+                    emulator_grpc: Some("localhost:9051".to_string()),
+                },
+            ),
             schedule: Some(crate::config::ScheduleConfig {
                 every: Some("10m".to_string()),
             }),
@@ -144,7 +146,10 @@ mod sync_selection_tests {
         ];
 
         let selected = select_sync_connections(&connections, None).expect("selected connections");
-        let ids: Vec<&str> = selected.iter().map(|connection| connection.id.as_str()).collect();
+        let ids: Vec<&str> = selected
+            .iter()
+            .map(|connection| connection.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["enabled", "default-enabled"]);
     }
 
@@ -215,8 +220,8 @@ mod sync_selection_tests {
     }
 
     #[tokio::test]
-    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state(
-    ) -> anyhow::Result<()> {
+    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state()
+    -> anyhow::Result<()> {
         let Some(config) = test_state_config() else {
             return Ok(());
         };

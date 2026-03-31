@@ -7,8 +7,8 @@ use polars::io::parquet::write::{ParquetCompression, ParquetWriter};
 use polars::prelude::{
     AnyValue, BinaryChunked, DataFrame, IntoSeries, NamedFrom, NewChunkedArray, Series,
 };
-use tokio::time::sleep;
 use token_source::TokenSource;
+use tokio::time::sleep;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -17,15 +17,17 @@ use gcloud_bigquery::http::job::{
     CreateDisposition, Job, JobConfiguration, JobConfigurationLoad, JobReference, JobState,
     JobType, WriteDisposition,
 };
-use gcloud_bigquery::http::table::{ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema};
+use gcloud_bigquery::http::table::{
+    ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
+};
 
 use super::BigQueryDestination;
-use crate::destinations::with_metadata_schema;
 use crate::destinations::bigquery::values::{
     anyvalue_to_bool, anyvalue_to_bytes, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
     anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
     dataframe_to_json_rows,
 };
+use crate::destinations::with_metadata_schema;
 use crate::types::{ColumnSchema, DataType, TableSchema};
 
 impl BigQueryDestination {
@@ -437,9 +439,9 @@ fn collect_parquet_binary_values(series: &Series) -> Result<Vec<Option<Vec<u8>>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
     use polars::io::SerReader;
     use polars::io::parquet::read::ParquetReader;
     use polars::prelude::NamedFrom;

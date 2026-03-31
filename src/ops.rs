@@ -130,7 +130,9 @@ pub(crate) async fn cmd_report(
     };
 
     let recent_runs = if let Some(stats_db) = &stats_db {
-        stats_db.recent_runs(connection_filter.as_deref(), limit).await?
+        stats_db
+            .recent_runs(connection_filter.as_deref(), limit)
+            .await?
     } else {
         Vec::new()
     };

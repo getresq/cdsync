@@ -462,7 +462,6 @@ impl PostgresSource {
     pub fn cdc_enabled(&self) -> bool {
         self.config.cdc.unwrap_or(true)
     }
-
 }
 
 fn split_table_name(table: &str) -> (String, String) {

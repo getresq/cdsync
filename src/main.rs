@@ -2,6 +2,8 @@ mod admin_api;
 mod config;
 mod destinations;
 mod dotenv;
+#[cfg(test)]
+mod main_tests;
 mod ops;
 mod runner;
 mod sources;
@@ -10,8 +12,6 @@ mod stats;
 mod telemetry;
 mod tls;
 mod types;
-#[cfg(test)]
-mod main_tests;
 
 use crate::config::{Config, DestinationConfig, SourceConfig};
 use crate::destinations::bigquery::BigQueryDestination;

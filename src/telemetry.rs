@@ -234,12 +234,8 @@ fn metrics() -> &'static ReplicationMetrics {
                 .build(),
             retry_attempts_total: meter.u64_counter("cdsync_retry_attempts_total").build(),
             cdc_pending_events: meter.u64_histogram("cdsync_cdc_pending_events").build(),
-            cdc_commit_queue_depth: meter
-                .u64_histogram("cdsync_cdc_commit_queue_depth")
-                .build(),
-            cdc_inflight_commits: meter
-                .u64_histogram("cdsync_cdc_inflight_commits")
-                .build(),
+            cdc_commit_queue_depth: meter.u64_histogram("cdsync_cdc_commit_queue_depth").build(),
+            cdc_inflight_commits: meter.u64_histogram("cdsync_cdc_inflight_commits").build(),
             cdc_backpressure_waits_total: meter
                 .u64_counter("cdsync_cdc_backpressure_waits_total")
                 .build(),

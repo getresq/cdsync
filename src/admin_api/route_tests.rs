@@ -277,7 +277,10 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
     let config = client.get(format!("{base_url}/v1/config")).send().await?;
     assert_eq!(config.status(), StatusCode::OK);
     let config_json = config.json::<serde_json::Value>().await?;
-    assert_eq!(config_json["state"]["url"], "postgres://postgres:***@example.com:5432/state");
+    assert_eq!(
+        config_json["state"]["url"],
+        "postgres://postgres:***@example.com:5432/state"
+    );
     assert_eq!(
         config_json["observability"]["otlp_headers"]["authorization"],
         "***"
@@ -310,7 +313,10 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     let (base_url, handle) = spawn_test_server(state).await?;
     let client = Client::new();
 
-    let connections = client.get(format!("{base_url}/v1/connections")).send().await?;
+    let connections = client
+        .get(format!("{base_url}/v1/connections"))
+        .send()
+        .await?;
     assert_eq!(connections.status(), StatusCode::OK);
     let connections_json = connections.json::<serde_json::Value>().await?;
     assert_eq!(connections_json[0]["id"], "app");
@@ -323,7 +329,10 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(connection.status(), StatusCode::OK);
     let connection_json = connection.json::<serde_json::Value>().await?;
     assert_eq!(connection_json["config"]["id"], "app");
-    assert_eq!(connection_json["state"]["postgres_cdc"]["slot_name"], "slot_app");
+    assert_eq!(
+        connection_json["state"]["postgres_cdc"]["slot_name"],
+        "slot_app"
+    );
 
     let progress = client
         .get(format!("{base_url}/v1/connections/app/progress"))
@@ -333,7 +342,10 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     let progress_json = progress.json::<serde_json::Value>().await?;
     assert_eq!(progress_json["current_run"]["run_id"], "run-1");
     assert_eq!(progress_json["tables"][0]["table_name"], "public.accounts");
-    assert_eq!(progress_json["tables"][0]["checkpoint"]["last_primary_key"], "42");
+    assert_eq!(
+        progress_json["tables"][0]["checkpoint"]["last_primary_key"],
+        "42"
+    );
     assert_eq!(progress_json["tables"][0]["stats"]["rows_written"], 10);
 
     let runs = client

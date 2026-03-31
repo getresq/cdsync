@@ -555,7 +555,6 @@ impl BigQueryDestination {
         })?;
         Ok(())
     }
-
 }
 
 #[async_trait]
