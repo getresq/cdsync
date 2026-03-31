@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use gcloud_bigquery::http::table::{TableFieldSchema, TableFieldType};
 use gcloud_bigquery::http::tabledata::list::{Tuple as BqTuple, Value as BqValue};
 use polars::frame::DataFrame;
@@ -22,7 +22,6 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
                 DataType::Bool => TableFieldType::Bool,
                 DataType::Timestamp => TableFieldType::Timestamp,
                 DataType::Date => TableFieldType::Date,
-                DataType::Time => TableFieldType::Time,
                 DataType::Interval => TableFieldType::Float64,
                 DataType::Bytes => TableFieldType::Bytes,
                 DataType::Numeric => TableFieldType::Numeric,
@@ -260,15 +259,6 @@ pub(super) fn anyvalue_to_date_days(value: &AnyValue) -> Result<i32> {
     }
 }
 
-pub(super) fn anyvalue_to_time_micros(value: &AnyValue) -> Result<i64> {
-    match value {
-        AnyValue::String(value) => time_string_to_micros(value),
-        AnyValue::StringOwned(value) => time_string_to_micros(&value.to_string()),
-        AnyValue::Time(value) => Ok(*value / 1_000),
-        other => anyhow::bail!("unsupported time value {:?}", other),
-    }
-}
-
 pub(super) fn anyvalue_to_bytes(value: &AnyValue) -> Result<Vec<u8>> {
     match value {
         AnyValue::Binary(bytes) => Ok(bytes.to_vec()),
@@ -300,13 +290,6 @@ pub(super) fn timestamp_string_to_micros(value: &str) -> Result<i64> {
     Ok(timestamp.timestamp_micros())
 }
 
-pub(super) fn time_string_to_micros(value: &str) -> Result<i64> {
-    let time = NaiveTime::parse_from_str(value, "%H:%M:%S%.f")
-        .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M:%S"))
-        .with_context(|| format!("parsing time {}", value))?;
-    Ok((time.num_seconds_from_midnight() as i64 * 1_000_000) + (time.nanosecond() as i64 / 1_000))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,18 +306,6 @@ mod tests {
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].data_type, TableFieldType::String);
-    }
-
-    #[test]
-    fn bq_fields_from_schema_maps_time_to_time() {
-        let fields = bq_fields_from_schema(&[ColumnSchema {
-            name: "opens_at".to_string(),
-            data_type: DataType::Time,
-            nullable: true,
-        }]);
-
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].data_type, TableFieldType::Time);
     }
 
     #[test]

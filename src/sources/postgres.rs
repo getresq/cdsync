@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use etl::config::{PgConnectionConfig, TlsConfig};
 use etl::destination::Destination as EtlDestinationTrait;
 use etl::replication::client::PgReplicationClient;

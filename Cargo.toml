@@ -25,7 +25,7 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry-http = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
-polars = { version = "0.51.0", features = ["lazy", "dtype-datetime", "dtype-date", "dtype-time", "dtype-decimal", "json", "parquet"] }
+polars = { version = "0.51.0", features = ["lazy", "dtype-datetime", "dtype-date", "dtype-decimal", "json", "parquet"] }
 postgres-replication = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "c4b473b478b3adfbf8667d2fbe895d8423f1290b" }
 prost = "0.14"
 prost-reflect = "0.16"

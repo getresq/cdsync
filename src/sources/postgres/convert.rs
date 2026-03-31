@@ -8,7 +8,6 @@ pub(super) fn pg_type_to_data_type(data_type: &str) -> DataType {
         "boolean" => DataType::Bool,
         "timestamp without time zone" | "timestamp with time zone" => DataType::Timestamp,
         "date" => DataType::Date,
-        "time without time zone" => DataType::Time,
         "interval" => DataType::Interval,
         "json" | "jsonb" => DataType::Json,
         "bytea" => DataType::Bytes,
@@ -186,17 +185,6 @@ pub(super) fn pg_value_to_anyvalue(
                 None
             }
         }
-        DataType::Time => {
-            if let Ok(value) = row.try_get::<Option<NaiveTime>, _>(name) {
-                value
-                    .map(|v| v.format("%H:%M:%S%.6f").to_string())
-                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
-            } else if let Ok(value) = row.try_get::<Option<String>, _>(name) {
-                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
-            } else {
-                None
-            }
-        }
         DataType::Bytes => row
             .try_get::<Option<Vec<u8>>, _>(name)?
             .map(|v| AnyValue::StringOwned(PlSmallStr::from(encode_base64(&v)))),
@@ -277,17 +265,6 @@ pub(super) fn tokio_pg_value_to_anyvalue(
                 value
                     .and_then(|v| parse_postgres_interval_to_seconds(&v).ok())
                     .map(AnyValue::Float64)
-            } else {
-                None
-            }
-        }
-        DataType::Time => {
-            if let Ok(value) = row.try_get::<_, Option<NaiveTime>>(name) {
-                value
-                    .map(|v| v.format("%H:%M:%S%.6f").to_string())
-                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
-            } else if let Ok(value) = row.try_get::<_, Option<String>>(name) {
-                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
             } else {
                 None
             }
@@ -432,7 +409,6 @@ pub(super) fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType
         Type::BOOL => DataType::Bool,
         Type::TIMESTAMP | Type::TIMESTAMPTZ => DataType::Timestamp,
         Type::DATE => DataType::Date,
-        Type::TIME => DataType::Time,
         Type::INTERVAL => DataType::Interval,
         Type::JSON | Type::JSONB => DataType::Json,
         Type::BYTEA => DataType::Bytes,

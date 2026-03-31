@@ -37,7 +37,6 @@ pub enum DataType {
     Bool,
     Timestamp,
     Date,
-    Time,
     Interval,
     Bytes,
     Numeric,

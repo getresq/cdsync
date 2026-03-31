@@ -23,8 +23,7 @@ use gcloud_bigquery::http::table::{
 use super::BigQueryDestination;
 use crate::destinations::bigquery::values::{
     anyvalue_to_bool, anyvalue_to_bytes, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
-    anyvalue_to_owned_string, anyvalue_to_time_micros, anyvalue_to_timestamp_micros,
-    bq_fields_from_schema,
+    anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
 };
 use crate::destinations::with_metadata_schema;
 use crate::types::{ColumnSchema, DataType, TableSchema};
@@ -275,12 +274,6 @@ fn parquet_batch_load_series(series: &Series, column: &ColumnSchema) -> Result<S
             out = out.cast(&polars::prelude::DataType::Date)?;
             Ok(out)
         }
-        DataType::Time => {
-            let values = collect_parquet_time_values(series)?;
-            let mut out = Series::new(column.name.as_str().into(), values);
-            out = out.cast(&polars::prelude::DataType::Time)?;
-            Ok(out)
-        }
         DataType::Bytes => {
             let values = collect_parquet_binary_values(series)?;
             let refs: Vec<Option<&[u8]>> = values.iter().map(|value| value.as_deref()).collect();
@@ -383,19 +376,6 @@ fn collect_parquet_date_values(series: &Series) -> Result<Vec<Option<i32>>> {
         .collect()
 }
 
-fn collect_parquet_time_values(series: &Series) -> Result<Vec<Option<i64>>> {
-    series
-        .iter()
-        .map(|value| {
-            if matches!(value, AnyValue::Null) {
-                Ok(None)
-            } else {
-                anyvalue_to_time_micros(&value).map(|micros| Some(micros * 1_000))
-            }
-        })
-        .collect()
-}
-
 fn collect_parquet_binary_values(series: &Series) -> Result<Vec<Option<Vec<u8>>>> {
     series
         .iter()
@@ -440,11 +420,6 @@ mod tests {
                     nullable: false,
                 },
                 ColumnSchema {
-                    name: "event_time".to_string(),
-                    data_type: DataType::Time,
-                    nullable: false,
-                },
-                ColumnSchema {
                     name: "raw_bytes".to_string(),
                     data_type: DataType::Bytes,
                     nullable: true,
@@ -479,7 +454,6 @@ mod tests {
             )
             .into(),
             polars::prelude::Series::new("event_date".into(), &["2026-03-30"]).into(),
-            polars::prelude::Series::new("event_time".into(), &["01:36:12.186373"]).into(),
             polars::prelude::Series::new("raw_bytes".into(), &[STANDARD.encode(b"abc")]).into(),
             polars::prelude::Series::new("name".into(), &["alpha"]).into(),
             polars::prelude::Series::new(
@@ -511,10 +485,6 @@ mod tests {
         assert_eq!(
             parquet.column("event_date").expect("event_date").dtype(),
             &polars::prelude::DataType::Date
-        );
-        assert_eq!(
-            parquet.column("event_time").expect("event_time").dtype(),
-            &polars::prelude::DataType::Time
         );
         assert_eq!(
             parquet.column("raw_bytes").expect("raw_bytes").dtype(),

@@ -23,10 +23,6 @@ fn maps_pg_types_to_internal_types() {
         DataType::Timestamp
     );
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::TIME),
-        DataType::Time
-    );
-    assert_eq!(
         pg_type_to_data_type_from_type(&etl::types::Type::INTERVAL),
         DataType::Interval
     );
