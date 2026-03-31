@@ -223,8 +223,19 @@ impl PostgresSource {
                                 &mut table_apply_locks,
                                 max_inflight_commits,
                             );
+                            crate::telemetry::record_cdc_pipeline_depths(
+                                slot_name,
+                                pending_events.len() as u64,
+                                queued_batches.len() as u64,
+                                watermark_tracker.inflight_commits() as u64,
+                            );
 
                             while queued_batches.len() >= max_commit_queue_depth {
+                                crate::telemetry::record_cdc_backpressure_wait(
+                                    slot_name,
+                                    queued_batches.len() as u64,
+                                    max_commit_queue_depth as u64,
+                                );
                                 let Some(advance) = drain_one_cdc_apply(
                                     &mut inflight_apply,
                                     &mut watermark_tracker,
@@ -428,6 +439,13 @@ impl PostgresSource {
                 )
                 .await?;
             }
+
+            crate::telemetry::record_cdc_pipeline_depths(
+                slot_name,
+                pending_events.len() as u64,
+                queued_batches.len() as u64,
+                watermark_tracker.inflight_commits() as u64,
+            );
         }
 
         dispatch_cdc_batches(
@@ -437,6 +455,12 @@ impl PostgresSource {
             dest,
             &mut table_apply_locks,
             max_inflight_commits,
+        );
+        crate::telemetry::record_cdc_pipeline_depths(
+            slot_name,
+            pending_events.len() as u64,
+            queued_batches.len() as u64,
+            watermark_tracker.inflight_commits() as u64,
         );
         while let Some(advance) =
             drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker).await?
@@ -461,6 +485,12 @@ impl PostgresSource {
                 dest,
                 &mut table_apply_locks,
                 max_inflight_commits,
+            );
+            crate::telemetry::record_cdc_pipeline_depths(
+                slot_name,
+                pending_events.len() as u64,
+                queued_batches.len() as u64,
+                watermark_tracker.inflight_commits() as u64,
             );
         }
 

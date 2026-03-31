@@ -56,6 +56,10 @@ struct ReplicationMetrics {
     checkpoint_saves_total: Counter<u64>,
     bigquery_row_errors_total: Counter<u64>,
     retry_attempts_total: Counter<u64>,
+    cdc_pending_events: Histogram<u64>,
+    cdc_commit_queue_depth: Histogram<u64>,
+    cdc_inflight_commits: Histogram<u64>,
+    cdc_backpressure_waits_total: Counter<u64>,
     reconcile_tables_total: Counter<u64>,
     reconcile_mismatches_total: Counter<u64>,
     sync_runs_total: Counter<u64>,
@@ -165,6 +169,35 @@ pub fn record_retry_attempt(connection_id: &str, scope: &str) {
     );
 }
 
+pub fn record_cdc_pipeline_depths(
+    slot_name: &str,
+    pending_events: u64,
+    commit_queue_depth: u64,
+    inflight_commits: u64,
+) {
+    let metrics = metrics();
+    let attrs = [KeyValue::new("slot_name", slot_name.to_string())];
+    metrics.cdc_pending_events.record(pending_events, &attrs);
+    metrics
+        .cdc_commit_queue_depth
+        .record(commit_queue_depth, &attrs);
+    metrics
+        .cdc_inflight_commits
+        .record(inflight_commits, &attrs);
+}
+
+pub fn record_cdc_backpressure_wait(slot_name: &str, queue_depth: u64, queue_capacity: u64) {
+    let metrics = metrics();
+    metrics.cdc_backpressure_waits_total.add(
+        1,
+        &[
+            KeyValue::new("slot_name", slot_name.to_string()),
+            KeyValue::new("queue_depth", queue_depth as i64),
+            KeyValue::new("queue_capacity", queue_capacity as i64),
+        ],
+    );
+}
+
 pub fn record_reconcile_table(connection_id: &str, matched: bool) {
     let metrics = metrics();
     let attrs = [
@@ -200,6 +233,16 @@ fn metrics() -> &'static ReplicationMetrics {
                 .u64_counter("cdsync_bigquery_row_errors_total")
                 .build(),
             retry_attempts_total: meter.u64_counter("cdsync_retry_attempts_total").build(),
+            cdc_pending_events: meter.u64_histogram("cdsync_cdc_pending_events").build(),
+            cdc_commit_queue_depth: meter
+                .u64_histogram("cdsync_cdc_commit_queue_depth")
+                .build(),
+            cdc_inflight_commits: meter
+                .u64_histogram("cdsync_cdc_inflight_commits")
+                .build(),
+            cdc_backpressure_waits_total: meter
+                .u64_counter("cdsync_cdc_backpressure_waits_total")
+                .build(),
             reconcile_tables_total: meter.u64_counter("cdsync_reconcile_tables_total").build(),
             reconcile_mismatches_total: meter
                 .u64_counter("cdsync_reconcile_mismatches_total")

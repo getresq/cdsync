@@ -1,22 +1,20 @@
 # Mission
 
-Mission: Start enforcing a file-size and module-separation rule by breaking apart oversized Rust files along responsibility boundaries instead of continuing to accumulate large grab-bag modules.
+Mission: Start hardening the WAL pipeline/backpressure path by making the CDC commit queue and backpressure behavior explicitly observable instead of only implicitly bounded in code.
 
 ## Done Criteria
 
-1. Files over 1k LOC are reduced where the split is low-risk and logically clean.
-2. The extracted modules represent real responsibility boundaries, not arbitrary shuffling.
-3. The refactor preserves behavior and keeps tests/clippy clean.
+1. CDC runtime emits explicit metrics for pending events and commit queue/in-flight depth.
+2. Backpressure waits are recorded so operators can tell when BigQuery/apply throughput is throttling WAL consumption.
+3. The change stays bounded to observability/runtime signaling and does not redesign the whole CDC engine in one pass.
 
 ## Guardrails
 
-- Prefer structural refactors over semantic rewrites.
-- Keep public APIs stable unless a break is necessary.
-- Do not mix unrelated feature work into the reorganization pass.
+- Preserve commit ordering and existing correctness guarantees.
+- Do not change the existing bounded-queue behavior unless there is a clear correctness reason.
 - No compiler warnings, no clippy warnings, no broken tests.
 
 ## Critical Learnings
 
-- Decision: `bigquery.rs` is easiest to split first because it already has clear batch-load, storage-write, and value-conversion seams.
-- Decision: `main.rs` can come back under the cap by extracting status/report/reconcile operations and test modules without touching the sync/run path yet.
-- Constraint: `src/sources/postgres.rs` is still the largest remaining hard violation and will need a larger CDC/snapshot extraction than the lighter refactors completed here.
+- Decision: The extracted `cdc_runtime.rs` is now the cleanest seam for queue/backpressure instrumentation.
+- Constraint: We already have bounded queues and watermark-based advancement; the immediate gap is visibility, not the absence of any queueing at all.
