@@ -1,3 +1,7 @@
+[features]
+default = []
+monitor-ui = ["dep:crossterm", "dep:ratatui"]
+
 [package]
 name = "cdsync"
 version = "0.1.0"
@@ -12,6 +16,7 @@ bigdecimal = "0.4"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", optional = true }
 dotenvy = "0.15"
 etl = { git = "https://github.com/supabase/etl", package = "etl", default-features = false }
 etl-postgres = { git = "https://github.com/supabase/etl", package = "etl-postgres", default-features = false, features = ["replication"] }
@@ -33,6 +38,7 @@ prost-reflect = "0.16"
 prost-types = "0.14"
 native-tls = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
+ratatui = { version = "0.29", optional = true }
 rustls = { version = "0.23", features = ["ring"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

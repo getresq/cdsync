@@ -4,6 +4,8 @@ mod destinations;
 mod dotenv;
 #[cfg(test)]
 mod main_tests;
+#[cfg(feature = "monitor-ui")]
+mod monitor;
 mod ops;
 mod runner;
 mod sources;
@@ -105,6 +107,8 @@ enum Commands {
         #[arg(long)]
         table: Option<String>,
     },
+    #[cfg(feature = "monitor-ui")]
+    Monitor(monitor::MonitorArgs),
 }
 
 struct SyncConnectionRequest<'a> {
@@ -308,6 +312,8 @@ async fn main() -> Result<()> {
             connection,
             table,
         } => ops::cmd_reconcile(config, connection, table).await,
+        #[cfg(feature = "monitor-ui")]
+        Commands::Monitor(args) => monitor::cmd_monitor(args).await,
     }
 }
 
