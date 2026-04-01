@@ -490,6 +490,207 @@ fn snapshot_resume_tasks_skip_completed_chunks_and_keep_saved_progress() {
 }
 
 #[test]
+fn checkpoint_has_material_sync_progress_ignores_schema_only_checkpoints() {
+    let schema_only = TableCheckpoint {
+        schema_hash: Some("hash-a".to_string()),
+        schema_snapshot: Some(vec![SchemaFieldSnapshot {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }]),
+        schema_primary_key: Some("id".to_string()),
+        ..Default::default()
+    };
+    assert!(!super::cdc_sync::checkpoint_has_material_sync_progress(
+        &schema_only
+    ));
+
+    let completed = TableCheckpoint {
+        last_synced_at: Some(Utc::now()),
+        ..Default::default()
+    };
+    assert!(super::cdc_sync::checkpoint_has_material_sync_progress(
+        &completed
+    ));
+}
+
+fn test_resolved_table(name: &str) -> ResolvedPostgresTable {
+    ResolvedPostgresTable {
+        name: name.to_string(),
+        primary_key: "id".to_string(),
+        updated_at_column: Some("updated_at".to_string()),
+        soft_delete: false,
+        soft_delete_column: None,
+        where_clause: None,
+        columns: ColumnSelection {
+            include: Vec::new(),
+            exclude: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn initial_snapshot_table_ids_select_new_tables_under_existing_cdc_lsn() {
+    let table_accounts = TableId::new(1);
+    let table_messages = TableId::new(2);
+    let table_users = TableId::new(3);
+    let table_ids = HashMap::from([
+        (table_accounts, test_resolved_table("public.accounts")),
+        (table_messages, test_resolved_table("public.messages")),
+        (table_users, test_resolved_table("public.users")),
+    ]);
+    let mut state = ConnectionState::default();
+    state.postgres.insert(
+        "public.accounts".to_string(),
+        TableCheckpoint {
+            last_synced_at: Some(Utc::now()),
+            ..Default::default()
+        },
+    );
+    state.postgres.insert(
+        "public.messages".to_string(),
+        TableCheckpoint {
+            schema_hash: Some("hash-a".to_string()),
+            schema_snapshot: Some(vec![SchemaFieldSnapshot {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }]),
+            schema_primary_key: Some("id".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let initial_tables =
+        super::cdc_sync::initial_snapshot_table_ids(&table_ids, &state, Some("0/16B6C50"));
+    assert_eq!(initial_tables, HashSet::from([table_messages, table_users]));
+
+    let no_lsn_tables = super::cdc_sync::initial_snapshot_table_ids(&table_ids, &state, None);
+    assert!(no_lsn_tables.is_empty());
+}
+
+#[test]
+fn should_preserve_existing_backlog_only_for_bootstrap_snapshots() {
+    let table_accounts = TableId::new(1);
+    let table_messages = TableId::new(2);
+    let table_ids = HashMap::from([
+        (table_accounts, test_resolved_table("public.accounts")),
+        (table_messages, test_resolved_table("public.messages")),
+    ]);
+    let mut state = ConnectionState::default();
+    let snapshot_progress_tables = HashSet::new();
+    let initial_snapshot_tables = HashSet::from([table_messages]);
+    let resync_tables = HashSet::new();
+
+    assert!(super::cdc_sync::should_preserve_existing_backlog(
+        &table_ids,
+        &state,
+        &snapshot_progress_tables,
+        &resync_tables,
+        &initial_snapshot_tables,
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+    ));
+
+    state.postgres.insert(
+        "public.accounts".to_string(),
+        TableCheckpoint {
+            snapshot_start_lsn: Some("0/200".to_string()),
+            snapshot_chunks: vec![SnapshotChunkCheckpoint {
+                start_primary_key: None,
+                end_primary_key: None,
+                last_primary_key: Some("10".to_string()),
+                complete: false,
+            }],
+            ..Default::default()
+        },
+    );
+    let snapshot_progress_tables = super::cdc_sync::snapshot_progress_table_ids(&table_ids, &state);
+    assert!(!super::cdc_sync::should_preserve_existing_backlog(
+        &table_ids,
+        &state,
+        &snapshot_progress_tables,
+        &resync_tables,
+        &initial_snapshot_tables,
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+    ));
+
+    state
+        .postgres
+        .get_mut("public.accounts")
+        .expect("accounts checkpoint")
+        .snapshot_preserve_backlog = true;
+    assert!(super::cdc_sync::should_preserve_existing_backlog(
+        &table_ids,
+        &state,
+        &snapshot_progress_tables,
+        &resync_tables,
+        &initial_snapshot_tables,
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+    ));
+}
+
+#[test]
+fn snapshot_table_ids_keep_resume_bootstrap_scope_narrow() {
+    let include_tables = HashSet::from([TableId::new(1), TableId::new(2), TableId::new(3)]);
+    let snapshot_progress_tables = HashSet::from([TableId::new(1)]);
+    let resync_tables = HashSet::from([TableId::new(2)]);
+    let initial_snapshot_tables = HashSet::from([TableId::new(3)]);
+
+    let selected = super::cdc_sync::snapshot_table_ids(
+        &include_tables,
+        &HashSet::new(),
+        &resync_tables,
+        &initial_snapshot_tables,
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+        false,
+    );
+    assert_eq!(selected, HashSet::from([TableId::new(2), TableId::new(3)]));
+
+    let resume_selected = super::cdc_sync::snapshot_table_ids(
+        &include_tables,
+        &snapshot_progress_tables,
+        &resync_tables,
+        &initial_snapshot_tables,
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+        true,
+    );
+    assert_eq!(
+        resume_selected,
+        HashSet::from([TableId::new(1), TableId::new(3)])
+    );
+}
+
+#[test]
+fn snapshot_table_write_plan_truncates_new_bootstrap_tables_on_resume() {
+    let plan = super::cdc_sync::snapshot_table_write_plan(
+        crate::types::SyncMode::Incremental,
+        true,
+        false,
+        true,
+        false,
+        false,
+    );
+    assert!(matches!(plan.write_mode, WriteMode::Append));
+    assert!(plan.truncate_before_copy);
+
+    let resumed_progress = super::cdc_sync::snapshot_table_write_plan(
+        crate::types::SyncMode::Incremental,
+        true,
+        true,
+        true,
+        false,
+        false,
+    );
+    assert!(matches!(resumed_progress.write_mode, WriteMode::Upsert));
+    assert!(!resumed_progress.truncate_before_copy);
+}
+
+#[test]
 fn build_select_columns_casts_string_columns_to_text() {
     let schema = TableSchema {
         name: "public.example".to_string(),
@@ -705,14 +906,8 @@ async fn write_snapshot_batch_uses_requested_write_mode() -> anyhow::Result<()> 
     };
     let batch = DataFrame::new(vec![Series::new("id".into(), &[1_i64]).into()])?;
 
-    super::snapshot_sync::write_snapshot_batch(
-        &dest,
-        &schema,
-        &batch,
-        WriteMode::Upsert,
-        "id",
-    )
-    .await?;
+    super::snapshot_sync::write_snapshot_batch(&dest, &schema, &batch, WriteMode::Upsert, "id")
+        .await?;
 
     assert!(matches!(
         dest.write_modes.lock().await.as_slice(),

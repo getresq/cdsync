@@ -82,5 +82,7 @@ pub struct TableCheckpoint {
     pub schema_primary_key: Option<String>,
     pub snapshot_start_lsn: Option<String>,
     #[serde(default)]
+    pub snapshot_preserve_backlog: bool,
+    #[serde(default)]
     pub snapshot_chunks: Vec<SnapshotChunkCheckpoint>,
 }
