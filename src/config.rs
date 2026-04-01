@@ -1,4 +1,6 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,14 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.connections.is_empty() {
             anyhow::bail!("config must include at least one connection");
+        }
+        if self.admin_api.as_ref().is_some_and(AdminApiConfig::enabled) {
+            let auth = self
+                .admin_api
+                .as_ref()
+                .and_then(|admin_api| admin_api.auth.as_ref())
+                .context("admin_api.auth is required when admin_api.enabled=true")?;
+            auth.validate()?;
         }
         for connection in &self.connections {
             connection.validate()?;
@@ -80,12 +90,107 @@ pub struct LoggingConfig {
 pub struct AdminApiConfig {
     pub enabled: Option<bool>,
     pub bind: Option<String>,
+    pub auth: Option<AdminApiAuthConfig>,
 }
 
 impl AdminApiConfig {
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(false)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdminApiAuthConfig {
+    #[serde(default)]
+    pub service_jwt_public_keys: HashMap<String, String>,
+    pub service_jwt_public_keys_json: Option<String>,
+    #[serde(default)]
+    pub service_jwt_allowed_issuers: Vec<String>,
+    #[serde(default)]
+    pub service_jwt_allowed_audiences: Vec<String>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+}
+
+impl AdminApiAuthConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.resolved_public_keys()?.is_empty() {
+            anyhow::bail!(
+                "admin_api.auth requires service JWT public keys via service_jwt_public_keys, service_jwt_public_keys_json, or CDSYNC_SERVICE_JWT_PUBLIC_KEYS_JSON"
+            );
+        }
+        if self.resolved_allowed_issuers().is_empty() {
+            anyhow::bail!(
+                "admin_api.auth requires allowed issuers via service_jwt_allowed_issuers or CDSYNC_SERVICE_JWT_ALLOWED_ISSUERS"
+            );
+        }
+        if self.resolved_allowed_audiences().is_empty() {
+            anyhow::bail!(
+                "admin_api.auth requires allowed audiences via service_jwt_allowed_audiences or CDSYNC_SERVICE_JWT_ALLOWED_AUDIENCES"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolved_allowed_issuers(&self) -> Vec<String> {
+        if !self.service_jwt_allowed_issuers.is_empty() {
+            return self.service_jwt_allowed_issuers.clone();
+        }
+        split_csv_env(std::env::var("CDSYNC_SERVICE_JWT_ALLOWED_ISSUERS").ok())
+    }
+
+    pub fn resolved_allowed_audiences(&self) -> Vec<String> {
+        if !self.service_jwt_allowed_audiences.is_empty() {
+            return self.service_jwt_allowed_audiences.clone();
+        }
+        let env_values = split_csv_env(std::env::var("CDSYNC_SERVICE_JWT_ALLOWED_AUDIENCES").ok());
+        if !env_values.is_empty() {
+            return env_values;
+        }
+        vec!["cdsync".to_string()]
+    }
+
+    pub fn resolved_required_scopes(&self) -> Vec<String> {
+        if !self.required_scopes.is_empty() {
+            return self.required_scopes.clone();
+        }
+        vec!["cdsync:admin".to_string()]
+    }
+
+    pub fn resolved_public_keys(&self) -> anyhow::Result<HashMap<String, String>> {
+        if !self.service_jwt_public_keys.is_empty() {
+            return Ok(normalize_public_keys(&self.service_jwt_public_keys));
+        }
+        let raw = self
+            .service_jwt_public_keys_json
+            .clone()
+            .or_else(|| std::env::var("CDSYNC_SERVICE_JWT_PUBLIC_KEYS_JSON").ok());
+        let Some(raw) = raw else {
+            return Ok(HashMap::new());
+        };
+        let parsed: HashMap<String, String> =
+            serde_json::from_str(&raw).context("invalid service JWT public keys JSON")?;
+        Ok(normalize_public_keys(&parsed))
+    }
+}
+
+fn split_csv_env(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_public_keys(raw: &HashMap<String, String>) -> HashMap<String, String> {
+    raw.iter()
+        .filter_map(|(kid, pem)| {
+            let normalized = pem.replace("\\n", "\n").trim().to_string();
+            (!kid.trim().is_empty() && !normalized.is_empty()).then(|| (kid.clone(), normalized))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +519,12 @@ logging:
 admin_api:
   enabled: false
   bind: "127.0.0.1:8080"
+  auth:
+    service_jwt_allowed_issuers: ["caller-service"]
+    service_jwt_allowed_audiences: ["cdsync"]
+    required_scopes: ["cdsync:admin"]
+    # Public keys should come from the environment, not inline config.
+    # See .env.example for CDSYNC_SERVICE_JWT_* placeholders.
 
 observability:
   service_name: "cdsync"
@@ -592,5 +703,31 @@ connections:
         let metadata = cfg.metadata_columns();
         assert_eq!(metadata.synced_at, "_synced_custom");
         assert_eq!(metadata.deleted_at, "_deleted_custom");
+    }
+
+    #[test]
+    fn validate_requires_admin_api_auth_when_enabled() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@host:5432/db"
+admin_api:
+  enabled: true
+  bind: "127.0.0.1:8080"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: false
+      tables:
+        - name: "public.accounts"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+"#;
+        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        assert!(cfg.validate().is_err());
     }
 }

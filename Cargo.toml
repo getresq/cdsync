@@ -21,6 +21,7 @@ google-cloud-gax = "1"
 gcloud-googleapis = "1.3.0"
 globset = "0.4"
 hex = "0.4"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-http = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace", "metrics"] }

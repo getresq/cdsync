@@ -2,9 +2,9 @@
 mod route_tests;
 
 use crate::config::{
-    AdminApiConfig, BigQueryConfig, Config, ConnectionConfig, DestinationConfig, LoggingConfig,
-    MetadataConfig, ObservabilityConfig, PostgresConfig, SalesforceConfig, SourceConfig,
-    SyncConfig,
+    AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig,
+    DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
+    SalesforceConfig, SourceConfig, SyncConfig,
 };
 use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, SyncState, SyncStateStore};
@@ -12,13 +12,18 @@ use crate::stats::{RunSummary, StatsDb, TableStatsSnapshot};
 use crate::types::TableCheckpoint;
 use anyhow::Context;
 use async_trait::async_trait;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -30,10 +35,33 @@ pub struct AdminApiState {
     cfg: Arc<Config>,
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
+    auth_verifier: Arc<AdminApiServiceJwtVerifier>,
     started_at: DateTime<Utc>,
     mode: String,
     connection_id: String,
 }
+
+#[derive(Clone)]
+struct AdminApiServiceJwtVerifier {
+    public_keys: HashMap<String, DecodingKey>,
+    allowed_issuers: Vec<String>,
+    allowed_audiences: Vec<String>,
+    required_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdminApiServiceJwtClaims {
+    exp: usize,
+    iat: usize,
+    iss: String,
+    aud: String,
+    sub: String,
+    jti: String,
+    scope: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdminApiAuthContext;
 
 #[async_trait]
 trait AdminStateBackend: Send + Sync {
@@ -103,6 +131,141 @@ impl From<anyhow::Error> for AdminApiError {
     }
 }
 
+#[derive(Debug)]
+struct AdminApiAuthError(&'static str);
+
+impl IntoResponse for AdminApiAuthError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": self.0,
+            })),
+        )
+            .into_response()
+    }
+}
+
+impl AdminApiServiceJwtVerifier {
+    fn from_config(config: &AdminApiAuthConfig) -> anyhow::Result<Self> {
+        install_jwt_crypto_provider();
+        let public_keys = config
+            .resolved_public_keys()?
+            .into_iter()
+            .map(|(kid, pem)| {
+                let key = DecodingKey::from_rsa_pem(pem.as_bytes())
+                    .with_context(|| format!("invalid RS256 public key for kid {}", kid))?;
+                Ok((kid, key))
+            })
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
+        Ok(Self {
+            public_keys,
+            allowed_issuers: config.resolved_allowed_issuers(),
+            allowed_audiences: config.resolved_allowed_audiences(),
+            required_scopes: config.resolved_required_scopes(),
+        })
+    }
+
+    fn validate_bearer(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<AdminApiAuthContext, AdminApiAuthError> {
+        let auth_header = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(AdminApiAuthError("missing Authorization header"))?;
+        if !auth_header.starts_with("Bearer ") {
+            return Err(AdminApiAuthError("invalid Authorization header format"));
+        }
+        let token = auth_header.trim_start_matches("Bearer ").trim();
+        if token.is_empty() {
+            return Err(AdminApiAuthError("missing bearer token"));
+        }
+        self.validate_token(token)
+    }
+
+    fn validate_token(&self, token: &str) -> Result<AdminApiAuthContext, AdminApiAuthError> {
+        let header = decode_header(token).map_err(|_| AdminApiAuthError("invalid token"))?;
+        if header.alg != Algorithm::RS256 {
+            return Err(AdminApiAuthError("invalid token algorithm"));
+        }
+        let key_id = header
+            .kid
+            .as_deref()
+            .ok_or(AdminApiAuthError("missing token key id"))?;
+        let public_key = self
+            .public_keys
+            .get(key_id)
+            .ok_or(AdminApiAuthError("unknown token key id"))?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_required_spec_claims(&["exp", "iat", "iss", "aud", "sub", "jti"]);
+        validation.set_issuer(&self.allowed_issuers);
+        validation.set_audience(&self.allowed_audiences);
+
+        let decoded = decode::<AdminApiServiceJwtClaims>(token, public_key, &validation)
+            .map_err(map_jwt_decode_error)?;
+
+        if !key_id.starts_with(&format!("{}-", decoded.claims.iss)) {
+            return Err(AdminApiAuthError("token key id does not match issuer"));
+        }
+        if decoded.claims.exp == 0
+            || decoded.claims.iat == 0
+            || decoded.claims.aud.trim().is_empty()
+            || decoded.claims.sub.trim().is_empty()
+            || decoded.claims.jti.trim().is_empty()
+        {
+            return Err(AdminApiAuthError("invalid token"));
+        }
+
+        let scopes = normalize_scopes(&decoded.claims.scope);
+        if !self
+            .required_scopes
+            .iter()
+            .any(|required| scopes.iter().any(|scope| scope == required))
+        {
+            return Err(AdminApiAuthError("service token missing required scope"));
+        }
+
+        let _ = (decoded.claims.sub, decoded.claims.iss, scopes, key_id);
+        Ok(AdminApiAuthContext)
+    }
+}
+
+fn normalize_scopes(scope: &str) -> Vec<String> {
+    scope
+        .split_whitespace()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn install_jwt_crypto_provider() {
+    let _ = JWT_CRYPTO_PROVIDER.install_default();
+}
+
+fn map_jwt_decode_error(err: jsonwebtoken::errors::Error) -> AdminApiAuthError {
+    if matches!(
+        err.kind(),
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature
+    ) {
+        AdminApiAuthError("token has expired")
+    } else {
+        AdminApiAuthError("invalid token")
+    }
+}
+
+async fn require_admin_api_auth(
+    State(state): State<AdminApiState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, AdminApiAuthError> {
+    let auth = state.auth_verifier.validate_bearer(request.headers())?;
+    request.extensions_mut().insert(auth);
+    Ok(next.run(request).await)
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -167,11 +330,25 @@ struct ScrubbedConfig {
     state: ScrubbedStateConfig,
     metadata: Option<MetadataConfig>,
     logging: Option<LoggingConfig>,
-    admin_api: Option<AdminApiConfig>,
+    admin_api: Option<ScrubbedAdminApiConfig>,
     observability: Option<ScrubbedObservabilityConfig>,
     sync: Option<SyncConfig>,
     stats: Option<ScrubbedStatsConfig>,
     connections: Vec<ScrubbedConnectionConfig>,
+}
+
+#[derive(Serialize)]
+struct ScrubbedAdminApiConfig {
+    enabled: Option<bool>,
+    bind: Option<String>,
+    auth: Option<ScrubbedAdminApiAuthConfig>,
+}
+
+#[derive(Serialize)]
+struct ScrubbedAdminApiAuthConfig {
+    service_jwt_allowed_issuers: Vec<String>,
+    service_jwt_allowed_audiences: Vec<String>,
+    required_scopes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -288,6 +465,11 @@ pub async fn spawn_admin_api(
         .unwrap_or("127.0.0.1:8080")
         .parse::<SocketAddr>()
         .with_context(|| "invalid admin_api.bind")?;
+    let auth_cfg = admin_cfg
+        .auth
+        .as_ref()
+        .context("admin_api.auth is required when admin_api.enabled=true")?;
+    let auth_verifier = Arc::new(AdminApiServiceJwtVerifier::from_config(auth_cfg)?);
 
     let state_store: Arc<dyn AdminStateBackend> =
         Arc::new(SyncStateStore::open_with_config(&cfg.state).await?);
@@ -301,6 +483,7 @@ pub async fn spawn_admin_api(
         cfg: Arc::new(cfg.clone()),
         state_store,
         stats_db,
+        auth_verifier,
         started_at: Utc::now(),
         mode: mode.to_string(),
         connection_id: connection_id.to_string(),
@@ -323,9 +506,11 @@ pub async fn spawn_admin_api(
 }
 
 fn router(state: AdminApiState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .with_state(state.clone());
+    let v1 = Router::new()
         .route("/v1/status", get(status))
         .route("/v1/config", get(config))
         .route("/v1/connections", get(connections))
@@ -333,7 +518,13 @@ fn router(state: AdminApiState) -> Router {
         .route("/v1/connections/{id}/checkpoints", get(checkpoints))
         .route("/v1/connections/{id}/progress", get(progress))
         .route("/v1/connections/{id}/runs", get(runs))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_api_auth,
+        ))
+        .with_state(state.clone());
+
+    protected.merge(v1).with_state(state)
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -505,7 +696,7 @@ fn scrub_config(cfg: &Config) -> ScrubbedConfig {
         },
         metadata: cfg.metadata.clone(),
         logging: cfg.logging.clone(),
-        admin_api: cfg.admin_api.clone(),
+        admin_api: cfg.admin_api.as_ref().map(scrub_admin_api_config),
         observability: cfg.observability.as_ref().map(scrub_observability_config),
         sync: cfg.sync.clone(),
         stats: cfg.stats.as_ref().map(|stats| ScrubbedStatsConfig {
@@ -513,6 +704,21 @@ fn scrub_config(cfg: &Config) -> ScrubbedConfig {
             schema: stats.schema.clone(),
         }),
         connections: cfg.connections.iter().map(scrub_connection).collect(),
+    }
+}
+
+fn scrub_admin_api_config(admin_api: &AdminApiConfig) -> ScrubbedAdminApiConfig {
+    ScrubbedAdminApiConfig {
+        enabled: admin_api.enabled,
+        bind: admin_api.bind.clone(),
+        auth: admin_api
+            .auth
+            .as_ref()
+            .map(|auth| ScrubbedAdminApiAuthConfig {
+                service_jwt_allowed_issuers: auth.resolved_allowed_issuers(),
+                service_jwt_allowed_audiences: auth.resolved_allowed_audiences(),
+                required_scopes: auth.resolved_required_scopes(),
+            }),
     }
 }
 

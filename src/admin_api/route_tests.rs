@@ -1,7 +1,8 @@
 use super::*;
 use crate::config::{
-    BigQueryConfig, Config, ConnectionConfig, LoggingConfig, MetadataConfig, ObservabilityConfig,
-    PostgresConfig, PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
+    AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig, LoggingConfig,
+    MetadataConfig, ObservabilityConfig, PostgresConfig, PostgresTableConfig, SourceConfig,
+    StateConfig, StatsConfig, SyncConfig,
 };
 use crate::state::{ConnectionState, PostgresCdcState};
 use crate::stats::{RunSummary, TableStatsSnapshot};
@@ -9,6 +10,7 @@ use crate::types::TableCheckpoint;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use chrono::{TimeZone, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -40,6 +42,56 @@ struct FakeStatsBackend {
     runs: Vec<RunSummary>,
     run_tables: HashMap<String, Vec<TableStatsSnapshot>>,
     ping_error: Option<String>,
+}
+
+const TEST_KID: &str = "caller-service-test-20260401-01";
+const TEST_PRIVATE_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCnqmojl7pWw+Vq
+/zX8CpkQLCpOgvT8JuChGB5d15nl7pTt8jeYH+yCznxYu5nyOo1OXqYAhRzKaQ01
+IQXgrOo4GFKIPc+7XWThFF62Ay3jIYyeeauyD/s2rfIYDheJTvLPl+E7cbvX8hxy
+DxSemUNd9Mn38PiYILzb1s3zOn830rkTSD7iPpYsx9ItvCxpWmq2euBfjflC6voE
+CxbLvBMK/Z8e4eXvlRuEEPrKDnuB2w3CLdjr3klglT8XHhkRORRMSQRGKvJg/Jir
+GSEdGTMw+VIMBAKSVla4WjbyZGXVesA4KOP+7kfKqvAJGXALKd+JycngFHPpA6sU
+1aOgV2RLAgMBAAECggEAGNuqvdkuftOvbWQmKFaX5+5sXVSMJuBKuIefZPFkt1Le
+kMKzHGJLSf98LxmtUtz8e0yMFxKlOJtHooNhYDSyyxtMDTgA1vobTUWcXybshDrC
+ovJOEunMqIg0lv1r3ucuF7ogYhRUMcmLDxwORg9aDhGPaiu3Z7Ke3Yck5LVdDDT7
+nHVFv436NVZ+n+x3cVhsRIhblLACaHbfP9Qb96bG9acsQZbbH72stV4kWSt1CwBi
+yJFo2v+h1AHn7AUrxikFulUACf0z5BJ600ISotkWyyVHc+gM146Yyc5ZeRL6Tnmq
+PACxMsLXCqcYh45RLu6pBpAmP4sSe5Xah7bjdlzwLQKBgQDi7b6V8+BhCy0kF513
+FtbIV7Zwji8kDcl1G+JHD3MHt4YFu/PNqbEma2j0oak7acMw6oxNoFEhXFCg/3y+
+t71+wY/DTFRYX8iL/xeRryiDZvD12NV3j5mH6fK8Oiu4sxMXwolusUC+8pyFuWI/
+eIV4h9zsf0HWN+udHrN+Zu72tQKBgQC9JRsnyHLlaQng1S9+q6mfoZswCz02LZn8
+IngKxaiMiINkTbsiXIBeCPh+vVBCaepd/wcdEzwyXgn/Wp1rYyTumS6eoFuT5eyq
+SUKt9FfYKOE0vZGqtAcVfAbiWBiMov3sGc5FfCchf5EGgVS2NgluSVxAW8uRRzkd
+7QhcOuLO/wKBgQCzRdqwoA982tV4k+dkM3jOoOySEuGO/A1RJQwn0z6us/9+/DLp
+IMvAbE5oJGaLd0wqksDwelxdnI5eAjhMet+LCeNHCEAB6PmID6hRAS1iUaq+reRG
+Jf3Gb73BkbsEmQPWW2szNXjO4N9ijUfemJno1HxloUsjrt3GLIDktPDHmQKBgA8E
+KiK/bDfAXhNmeW3SDRZqSxrGWaa6ehYlWmhohtgZYm0NKsUwmNReW/Qb7YpIRF4Q
+CC2LwGSzSJHoTMUgyubSbHwVeQ/F2kMuq8eJtYuouzBnuG/X+RQAk79WhSRtMEGV
+TuX/VE/5g7cDf4kzww3pbxSA9SlkgSlaDybbWfRbAoGBAK/vWfHGKpCxUKefbwnW
+n39PxGMwuG94QQd8sRRxkwgzs8phKwLXBwTzN8cZ1vLjrjQaHiRAarJ6Nl28lfTP
+BJDvfWrriikStbF6cX5uEWyUgvIZBjtd+Q+c7IRAm2zl/loZ+nYbk4+G13yTXkjb
+RZZXUhlVF0i1Uviw8GQfe9su
+-----END PRIVATE KEY-----";
+const TEST_PUBLIC_KEY_PEM: &str = r"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp6pqI5e6VsPlav81/AqZ
+ECwqToL0/CbgoRgeXdeZ5e6U7fI3mB/sgs58WLuZ8jqNTl6mAIUcymkNNSEF4Kzq
+OBhSiD3Pu11k4RRetgMt4yGMnnmrsg/7Nq3yGA4XiU7yz5fhO3G71/Iccg8UnplD
+XfTJ9/D4mCC829bN8zp/N9K5E0g+4j6WLMfSLbwsaVpqtnrgX435Qur6BAsWy7wT
+Cv2fHuHl75UbhBD6yg57gdsNwi3Y695JYJU/Fx4ZETkUTEkERiryYPyYqxkhHRkz
+MPlSDAQCklZWuFo28mRl1XrAOCjj/u5HyqrwCRlwCynficnJ4BRz6QOrFNWjoFdk
+SwIDAQAB
+-----END PUBLIC KEY-----";
+
+#[derive(serde::Serialize)]
+struct TestServiceJwtClaims {
+    exp: usize,
+    iat: usize,
+    iss: String,
+    aud: String,
+    sub: String,
+    jti: String,
+    scope: String,
 }
 
 #[async_trait]
@@ -133,6 +185,16 @@ fn test_config() -> Config {
         admin_api: Some(AdminApiConfig {
             enabled: Some(true),
             bind: Some("127.0.0.1:0".to_string()),
+            auth: Some(AdminApiAuthConfig {
+                service_jwt_public_keys: HashMap::from([(
+                    TEST_KID.to_string(),
+                    TEST_PUBLIC_KEY_PEM.to_string(),
+                )]),
+                service_jwt_public_keys_json: None,
+                service_jwt_allowed_issuers: vec!["caller-service".to_string()],
+                service_jwt_allowed_audiences: vec!["cdsync".to_string()],
+                required_scopes: vec!["cdsync:admin".to_string()],
+            }),
         }),
         observability: Some(ObservabilityConfig {
             service_name: Some("cdsync".to_string()),
@@ -156,6 +218,29 @@ fn test_config() -> Config {
             schema: Some("cdsync_stats".to_string()),
         }),
     }
+}
+
+fn auth_header(scopes: &[&str]) -> String {
+    install_jwt_crypto_provider();
+    let now = Utc::now().timestamp() as usize;
+    let claims = TestServiceJwtClaims {
+        exp: now + 600,
+        iat: now,
+        iss: "caller-service".to_string(),
+        aud: "cdsync".to_string(),
+        sub: "caller-service-admin".to_string(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        scope: scopes.join(" "),
+    };
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(TEST_KID.to_string());
+    let token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).expect("encoding key"),
+    )
+    .expect("encode token");
+    format!("Bearer {token}")
 }
 
 fn test_state() -> SyncState {
@@ -237,10 +322,21 @@ fn test_admin_state(
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
 ) -> AdminApiState {
+    let cfg = test_config();
+    let auth_verifier = Arc::new(
+        AdminApiServiceJwtVerifier::from_config(
+            cfg.admin_api
+                .as_ref()
+                .and_then(|admin_api| admin_api.auth.as_ref())
+                .expect("admin api auth"),
+        )
+        .expect("auth verifier"),
+    );
     AdminApiState {
-        cfg: Arc::new(test_config()),
+        cfg: Arc::new(cfg),
         state_store,
         stats_db,
+        auth_verifier,
         started_at: Utc.with_ymd_and_hms(2026, 4, 1, 9, 59, 0).unwrap(),
         mode: "run".to_string(),
         connection_id: "app".to_string(),
@@ -267,14 +363,24 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
     assert_eq!(ready.status(), StatusCode::OK);
     assert_eq!(ready.json::<serde_json::Value>().await?["ok"], true);
 
-    let status = client.get(format!("{base_url}/v1/status")).send().await?;
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let status = client
+        .get(format!("{base_url}/v1/status"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
     assert_eq!(status.status(), StatusCode::OK);
     let status_json = status.json::<serde_json::Value>().await?;
     assert_eq!(status_json["mode"], "run");
     assert_eq!(status_json["connection_id"], "app");
     assert_eq!(status_json["connection_count"], 1);
 
-    let config = client.get(format!("{base_url}/v1/config")).send().await?;
+    let config = client
+        .get(format!("{base_url}/v1/config"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
     assert_eq!(config.status(), StatusCode::OK);
     let config_json = config.json::<serde_json::Value>().await?;
     assert_eq!(
@@ -312,9 +418,11 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     );
     let (base_url, handle) = spawn_test_server(state).await?;
     let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
 
     let connections = client
         .get(format!("{base_url}/v1/connections"))
+        .header("Authorization", &auth)
         .send()
         .await?;
     assert_eq!(connections.status(), StatusCode::OK);
@@ -324,6 +432,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
 
     let connection = client
         .get(format!("{base_url}/v1/connections/app"))
+        .header("Authorization", &auth)
         .send()
         .await?;
     assert_eq!(connection.status(), StatusCode::OK);
@@ -336,6 +445,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
 
     let progress = client
         .get(format!("{base_url}/v1/connections/app/progress"))
+        .header("Authorization", &auth)
         .send()
         .await?;
     assert_eq!(progress.status(), StatusCode::OK);
@@ -350,6 +460,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
 
     let runs = client
         .get(format!("{base_url}/v1/connections/app/runs?limit=1"))
+        .header("Authorization", &auth)
         .send()
         .await?;
     assert_eq!(runs.status(), StatusCode::OK);
@@ -372,14 +483,43 @@ async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Resul
     );
     let (base_url, handle) = spawn_test_server(state).await?;
     let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
 
     let runs = client
         .get(format!("{base_url}/v1/connections/app/runs"))
+        .header("Authorization", &auth)
         .send()
         .await?;
     assert_eq!(runs.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let runs_json = runs.json::<serde_json::Value>().await?;
     assert_eq!(runs_json["error"], "stats are disabled for this service");
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()> {
+    let state = test_admin_state(
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+
+    let missing = client.get(format!("{base_url}/v1/status")).send().await?;
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scope = client
+        .get(format!("{base_url}/v1/status"))
+        .header("Authorization", auth_header(&["other:scope"]))
+        .send()
+        .await?;
+    assert_eq!(wrong_scope.status(), StatusCode::UNAUTHORIZED);
 
     handle.abort();
     let _ = handle.await;
