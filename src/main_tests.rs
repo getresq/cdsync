@@ -67,6 +67,7 @@ mod reconcile_tests {
 mod sync_selection_tests {
     use super::*;
     use crate::config::StatsConfig;
+    use tokio::fs;
     use tokio::time::{Duration, sleep};
 
     fn test_connection(id: &str, enabled: Option<bool>) -> crate::config::ConnectionConfig {
@@ -119,10 +120,26 @@ mod sync_selection_tests {
         }
     }
 
+    fn test_cdc_connection(id: &str) -> crate::config::ConnectionConfig {
+        let mut connection = test_connection(id, Some(true));
+        if let crate::config::SourceConfig::Postgres(pg) = &mut connection.source {
+            pg.cdc = Some(true);
+            pg.publication = Some("cdsync_app_pub".to_string());
+        }
+        connection
+    }
+
     fn test_state_config() -> Option<crate::config::StateConfig> {
         std::env::var("CDSYNC_TEST_STATE_URL")
             .ok()
             .map(|url| crate::config::StateConfig { url, schema: None })
+    }
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cdsync-{name}-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ))
     }
 
     fn test_stats_config() -> Option<(String, StatsConfig)> {
@@ -165,6 +182,30 @@ mod sync_selection_tests {
         let connections = vec![test_connection("disabled", Some(false))];
         let err = select_sync_connections(&connections, Some("disabled")).expect_err("disabled");
         assert!(err.to_string().contains("is disabled"));
+    }
+
+    #[test]
+    fn run_supervisor_mode_is_specific_for_single_connection() {
+        let polling = test_connection("polling", Some(true));
+        let cdc = test_cdc_connection("cdc");
+
+        let selected = vec![&polling];
+        assert_eq!(run_supervisor_mode(&selected), "scheduled_polling");
+        assert_eq!(run_connection_label(&selected), "polling");
+
+        let selected = vec![&cdc];
+        assert_eq!(run_supervisor_mode(&selected), "cdc_follow");
+        assert_eq!(run_connection_label(&selected), "cdc");
+    }
+
+    #[test]
+    fn run_supervisor_mode_uses_multi_connection_for_multiple_workers() {
+        let first = test_connection("first", Some(true));
+        let second = test_cdc_connection("second");
+        let selected = vec![&first, &second];
+
+        assert_eq!(run_supervisor_mode(&selected), "multi_connection");
+        assert_eq!(run_connection_label(&selected), "all");
     }
 
     #[tokio::test]
@@ -288,6 +329,57 @@ mod sync_selection_tests {
         assert_eq!(tables[0].table_name, "public.accounts");
         assert_eq!(tables[0].rows_read, 7);
         assert_eq!(tables[0].rows_upserted, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cmd_run_multi_connection_fails_fast_on_invalid_polling_connection() -> anyhow::Result<()>
+    {
+        let config_path = temp_config_path("run-multi-invalid");
+        let raw = r#"
+state:
+  url: "postgres://user:pass@host:5432/db"
+admin_api:
+  enabled: false
+connections:
+  - id: "first"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: false
+      tables:
+        - name: "public.accounts"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+      emulator_grpc: "localhost:9051"
+  - id: "second"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: false
+      tables:
+        - name: "public.orders"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+      emulator_grpc: "localhost:9051"
+"#;
+        fs::write(&config_path, raw).await?;
+
+        let result = cmd_run(config_path.clone(), None).await;
+
+        let _ = fs::remove_file(&config_path).await;
+        let err = result.expect_err("invalid polling config should fail");
+        assert!(err
+            .to_string()
+            .contains("run mode requires connection.schedule.every"));
         Ok(())
     }
 }

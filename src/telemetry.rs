@@ -56,6 +56,8 @@ struct ReplicationMetrics {
     checkpoint_saves_total: Counter<u64>,
     bigquery_row_errors_total: Counter<u64>,
     retry_attempts_total: Counter<u64>,
+    connection_worker_events_total: Counter<u64>,
+    connection_checkpoint_age_seconds: Histogram<u64>,
     cdc_pending_events: Histogram<u64>,
     cdc_commit_queue_depth: Histogram<u64>,
     cdc_inflight_commits: Histogram<u64>,
@@ -169,6 +171,29 @@ pub fn record_retry_attempt(connection_id: &str, scope: &str) {
     );
 }
 
+pub fn record_connection_worker_event(connection_id: &str, mode: &str, event: &str) {
+    let metrics = metrics();
+    metrics.connection_worker_events_total.add(
+        1,
+        &[
+            KeyValue::new("connection_id", connection_id.to_string()),
+            KeyValue::new("mode", mode.to_string()),
+            KeyValue::new("event", event.to_string()),
+        ],
+    );
+}
+
+pub fn record_connection_checkpoint_age(connection_id: &str, source_kind: &str, age_seconds: u64) {
+    let metrics = metrics();
+    metrics.connection_checkpoint_age_seconds.record(
+        age_seconds,
+        &[
+            KeyValue::new("connection_id", connection_id.to_string()),
+            KeyValue::new("source_kind", source_kind.to_string()),
+        ],
+    );
+}
+
 pub fn record_cdc_pipeline_depths(
     slot_name: &str,
     pending_events: u64,
@@ -233,6 +258,12 @@ fn metrics() -> &'static ReplicationMetrics {
                 .u64_counter("cdsync_bigquery_row_errors_total")
                 .build(),
             retry_attempts_total: meter.u64_counter("cdsync_retry_attempts_total").build(),
+            connection_worker_events_total: meter
+                .u64_counter("cdsync_connection_worker_events_total")
+                .build(),
+            connection_checkpoint_age_seconds: meter
+                .u64_histogram("cdsync_connection_checkpoint_age_seconds")
+                .build(),
             cdc_pending_events: meter.u64_histogram("cdsync_cdc_pending_events").build(),
             cdc_commit_queue_depth: meter.u64_histogram("cdsync_cdc_commit_queue_depth").build(),
             cdc_inflight_commits: meter.u64_histogram("cdsync_cdc_inflight_commits").build(),

@@ -88,7 +88,7 @@ struct TestServiceJwtClaims {
     exp: usize,
     iat: usize,
     iss: String,
-    aud: String,
+    aud: serde_json::Value,
     sub: String,
     jti: String,
     scope: String,
@@ -221,13 +221,21 @@ fn test_config() -> Config {
 }
 
 fn auth_header(scopes: &[&str]) -> String {
+    auth_header_with_audiences(scopes, &[serde_json::Value::String("cdsync".to_string())])
+}
+
+fn auth_header_with_audiences(scopes: &[&str], audiences: &[serde_json::Value]) -> String {
     install_jwt_crypto_provider();
     let now = Utc::now().timestamp() as usize;
     let claims = TestServiceJwtClaims {
         exp: now + 600,
         iat: now,
         iss: "caller-service".to_string(),
-        aud: "cdsync".to_string(),
+        aud: if audiences.len() == 1 {
+            audiences[0].clone()
+        } else {
+            serde_json::Value::Array(audiences.to_vec())
+        },
         sub: "caller-service-admin".to_string(),
         jti: uuid::Uuid::new_v4().to_string(),
         scope: scopes.join(" "),
@@ -258,6 +266,7 @@ fn test_state() -> SyncState {
     connection.postgres.insert(
         "public.accounts".to_string(),
         TableCheckpoint {
+            last_synced_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 9, 58, 0).unwrap()),
             last_primary_key: Some("42".to_string()),
             ..Default::default()
         },
@@ -340,6 +349,10 @@ fn test_admin_state(
         started_at: Utc.with_ymd_and_hms(2026, 4, 1, 9, 59, 0).unwrap(),
         mode: "run".to_string(),
         connection_id: "app".to_string(),
+        managed_connection_count: 1,
+        config_hash: "config-hash".to_string(),
+        deploy_revision: Some("deploy-123".to_string()),
+        last_restart_reason: "startup".to_string(),
     }
 }
 
@@ -375,6 +388,9 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
     assert_eq!(status_json["mode"], "run");
     assert_eq!(status_json["connection_id"], "app");
     assert_eq!(status_json["connection_count"], 1);
+    assert_eq!(status_json["config_hash"], "config-hash");
+    assert_eq!(status_json["deploy_revision"], "deploy-123");
+    assert_eq!(status_json["last_restart_reason"], "startup");
 
     let config = client
         .get(format!("{base_url}/v1/config"))
@@ -429,6 +445,9 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     let connections_json = connections.json::<serde_json::Value>().await?;
     assert_eq!(connections_json[0]["id"], "app");
     assert_eq!(connections_json[0]["last_sync_status"], "success");
+    assert_eq!(connections_json[0]["phase"], "healthy");
+    assert_eq!(connections_json[0]["reason_code"], "healthy");
+    assert!(connections_json[0]["max_checkpoint_age_seconds"].as_i64().is_some());
 
     let connection = client
         .get(format!("{base_url}/v1/connections/app"))
@@ -443,6 +462,19 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
         "slot_app"
     );
 
+    let runtime = client
+        .get(format!("{base_url}/v1/connections/app/runtime"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
+    assert_eq!(runtime.status(), StatusCode::OK);
+    let runtime_json = runtime.json::<serde_json::Value>().await?;
+    assert_eq!(runtime_json["phase"], "healthy");
+    assert_eq!(runtime_json["reason_code"], "healthy");
+    assert_eq!(runtime_json["config_hash"], "config-hash");
+    assert_eq!(runtime_json["deploy_revision"], "deploy-123");
+    assert!(runtime_json["max_checkpoint_age_seconds"].as_i64().is_some());
+
     let progress = client
         .get(format!("{base_url}/v1/connections/app/progress"))
         .header("Authorization", &auth)
@@ -451,12 +483,28 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(progress.status(), StatusCode::OK);
     let progress_json = progress.json::<serde_json::Value>().await?;
     assert_eq!(progress_json["current_run"]["run_id"], "run-1");
+    assert_eq!(progress_json["runtime"]["phase"], "healthy");
     assert_eq!(progress_json["tables"][0]["table_name"], "public.accounts");
     assert_eq!(
         progress_json["tables"][0]["checkpoint"]["last_primary_key"],
         "42"
     );
     assert_eq!(progress_json["tables"][0]["stats"]["rows_written"], 10);
+    assert_eq!(progress_json["tables"][0]["phase"], "healthy");
+    assert_eq!(progress_json["tables"][0]["reason_code"], "healthy");
+    assert!(progress_json["tables"][0]["checkpoint_age_seconds"].as_i64().is_some());
+    assert!(progress_json["tables"][0]["lag_seconds"].as_i64().is_some());
+
+    let tables = client
+        .get(format!("{base_url}/v1/connections/app/tables"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
+    assert_eq!(tables.status(), StatusCode::OK);
+    let tables_json = tables.json::<serde_json::Value>().await?;
+    assert_eq!(tables_json[0]["table_name"], "public.accounts");
+    assert_eq!(tables_json[0]["phase"], "healthy");
+    assert_eq!(tables_json[0]["reason_code"], "healthy");
 
     let runs = client
         .get(format!("{base_url}/v1/connections/app/runs?limit=1"))
@@ -523,5 +571,41 @@ async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()>
 
     handle.abort();
     let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_accepts_array_audience_tokens() -> anyhow::Result<()> {
+    let (runs, run_tables) = test_runs();
+    let state = test_admin_state(
+        Arc::new(FakeStateBackend {
+            ping_error: None,
+            state: test_state(),
+        }),
+        Some(Arc::new(FakeStatsBackend {
+            ping_error: None,
+            runs,
+            run_tables,
+        })),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base_url}/v1/status"))
+        .header(
+            "Authorization",
+            auth_header_with_audiences(
+                &["cdsync:admin"],
+                &[
+                    serde_json::Value::String("other-service".to_string()),
+                    serde_json::Value::String("cdsync".to_string()),
+                ],
+            ),
+        )
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    handle.abort();
     Ok(())
 }

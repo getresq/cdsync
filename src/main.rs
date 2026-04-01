@@ -67,7 +67,7 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
-        connection: String,
+        connection: Option<String>,
     },
     Migrate {
         #[arg(long)]
@@ -520,6 +520,15 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         );
         refresh_postgres_checkpoints_from_store(&state_handle, connection_state).await;
         state_handle.save_connection_state(connection_state).await?;
+        if let Some(age_seconds) =
+            max_checkpoint_age_seconds(connection_state, connection, Utc::now())
+        {
+            telemetry::record_connection_checkpoint_age(
+                &connection.id,
+                connection_source_kind(connection),
+                age_seconds,
+            );
+        }
         lease.release().await?;
 
         result?;
@@ -880,35 +889,25 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
-    let cfg = Config::load(&config_path).await?;
-    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-
-    let connection = cfg
-        .connections
-        .iter()
-        .find(|connection| connection.id == connection_id)
-        .context("connection not found")?;
-
-    let (shutdown_controller, shutdown_signal) = ShutdownController::new();
-    let signal_controller = shutdown_controller.clone();
-    let signal_task = tokio::spawn(async move {
-        wait_for_termination_signal().await;
-        signal_controller.shutdown();
-    });
-
-    let mode = match (&connection.source, &connection.destination) {
+fn connection_run_mode(connection: &crate::config::ConnectionConfig) -> &'static str {
+    match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
             "cdc_follow"
         }
         _ => "scheduled_polling",
-    };
-    let admin_task =
-        admin_api::spawn_admin_api(&cfg, &connection.id, mode, shutdown_signal.clone()).await?;
+    }
+}
 
-    let result = match (&connection.source, &connection.destination) {
+async fn run_connection_worker(
+    config_path: PathBuf,
+    connection: crate::config::ConnectionConfig,
+    shutdown_signal: ShutdownSignal,
+) -> Result<()> {
+    let mode = connection_run_mode(&connection);
+    telemetry::record_connection_worker_event(&connection.id, mode, "started");
+    match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
-            cmd_sync(SyncCommandRequest {
+            let result = cmd_sync(SyncCommandRequest {
                 config_path,
                 full: false,
                 incremental: true,
@@ -916,17 +915,24 @@ async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
                 connection_filter: Some(connection.id.clone()),
                 schema_diff_enabled: false,
                 follow: true,
-                shutdown: Some(shutdown_signal.clone()),
+                shutdown: Some(shutdown_signal),
             })
-            .await
+            .await;
+            telemetry::record_connection_worker_event(
+                &connection.id,
+                mode,
+                if result.is_ok() { "succeeded" } else { "failed" },
+            );
+            result
         }
         _ => {
-            let interval = schedule_interval(connection)?;
+            let interval = schedule_interval(&connection)?;
             loop {
                 if shutdown_signal.is_shutdown() {
+                    telemetry::record_connection_worker_event(&connection.id, mode, "stopped");
                     break;
                 }
-                cmd_sync(SyncCommandRequest {
+                let result = cmd_sync(SyncCommandRequest {
                     config_path: config_path.clone(),
                     full: false,
                     incremental: true,
@@ -936,11 +942,122 @@ async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
                     follow: false,
                     shutdown: Some(shutdown_signal.clone()),
                 })
-                .await?;
+                .await;
+                if result.is_err() {
+                    telemetry::record_connection_worker_event(&connection.id, mode, "failed");
+                }
+                result?;
                 if wait_backoff(interval, Some(shutdown_signal.clone())).await {
+                    telemetry::record_connection_worker_event(&connection.id, mode, "stopped");
                     break;
                 }
             }
+            telemetry::record_connection_worker_event(&connection.id, mode, "succeeded");
+            Ok(())
+        }
+    }
+}
+
+fn run_supervisor_mode(selected_connections: &[&crate::config::ConnectionConfig]) -> String {
+    if selected_connections.len() == 1 {
+        connection_run_mode(selected_connections[0]).to_string()
+    } else {
+        "multi_connection".to_string()
+    }
+}
+
+fn run_connection_label(selected_connections: &[&crate::config::ConnectionConfig]) -> String {
+    if selected_connections.len() == 1 {
+        selected_connections[0].id.clone()
+    } else {
+        "all".to_string()
+    }
+}
+
+fn connection_source_kind(connection: &crate::config::ConnectionConfig) -> &'static str {
+    match &connection.source {
+        SourceConfig::Postgres(_) => "postgres",
+        SourceConfig::Salesforce(_) => "salesforce",
+    }
+}
+
+fn max_checkpoint_age_seconds(
+    state: &ConnectionState,
+    connection: &crate::config::ConnectionConfig,
+    now: chrono::DateTime<Utc>,
+) -> Option<u64> {
+    let checkpoints = match &connection.source {
+        SourceConfig::Postgres(_) => state.postgres.values(),
+        SourceConfig::Salesforce(_) => state.salesforce.values(),
+    };
+    checkpoints
+        .filter_map(|checkpoint| checkpoint.last_synced_at)
+        .map(|last_synced_at| (now - last_synced_at).num_seconds().max(0) as u64)
+        .max()
+}
+
+async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<()> {
+    let cfg = Config::load(&config_path).await?;
+    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let selected_connections = select_sync_connections(&cfg.connections, connection_id.as_deref())?;
+
+    let (shutdown_controller, shutdown_signal) = ShutdownController::new();
+    let signal_controller = shutdown_controller.clone();
+    let signal_task = tokio::spawn(async move {
+        wait_for_termination_signal().await;
+        signal_controller.shutdown();
+    });
+
+    let mode = run_supervisor_mode(&selected_connections);
+    let connection_label = run_connection_label(&selected_connections);
+    let admin_task = admin_api::spawn_admin_api(
+        &cfg,
+        &connection_label,
+        selected_connections.len(),
+        &mode,
+        shutdown_signal.clone(),
+    )
+    .await?;
+
+    let result = if selected_connections.len() == 1 {
+        run_connection_worker(
+            config_path,
+            (*selected_connections[0]).clone(),
+            shutdown_signal.clone(),
+        )
+        .await
+    } else {
+        let mut workers = FuturesUnordered::new();
+        for connection in selected_connections {
+            workers.push(tokio::spawn(run_connection_worker(
+                config_path.clone(),
+                (*connection).clone(),
+                shutdown_signal.clone(),
+            )));
+        }
+
+        let mut first_error: Option<anyhow::Error> = None;
+        while let Some(result) = workers.next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    shutdown_controller.shutdown();
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::Error::new(err));
+                    }
+                    shutdown_controller.shutdown();
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
             Ok(())
         }
     };

@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,6 +40,10 @@ pub struct AdminApiState {
     started_at: DateTime<Utc>,
     mode: String,
     connection_id: String,
+    managed_connection_count: usize,
+    config_hash: String,
+    deploy_revision: Option<String>,
+    last_restart_reason: String,
 }
 
 #[derive(Clone)]
@@ -50,11 +55,27 @@ struct AdminApiServiceJwtVerifier {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AdminApiServiceJwtAudience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl AdminApiServiceJwtAudience {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Single(value) => value.trim().is_empty(),
+            Self::Multiple(values) => values.iter().all(|value| value.trim().is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct AdminApiServiceJwtClaims {
     exp: usize,
     iat: usize,
     iss: String,
-    aud: String,
+    aud: AdminApiServiceJwtAudience,
     sub: String,
     jti: String,
     scope: String,
@@ -212,7 +233,7 @@ impl AdminApiServiceJwtVerifier {
         }
         if decoded.claims.exp == 0
             || decoded.claims.iat == 0
-            || decoded.claims.aud.trim().is_empty()
+            || decoded.claims.aud.is_empty()
             || decoded.claims.sub.trim().is_empty()
             || decoded.claims.jti.trim().is_empty()
         {
@@ -284,6 +305,9 @@ struct StatusResponse {
     mode: String,
     connection_id: String,
     connection_count: usize,
+    config_hash: String,
+    deploy_revision: Option<String>,
+    last_restart_reason: String,
 }
 
 #[derive(Serialize)]
@@ -296,6 +320,9 @@ struct ConnectionSummary {
     last_sync_finished_at: Option<DateTime<Utc>>,
     last_sync_status: Option<String>,
     last_error: Option<String>,
+    phase: &'static str,
+    reason_code: &'static str,
+    max_checkpoint_age_seconds: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -315,6 +342,7 @@ struct ProgressResponse {
     connection_id: String,
     state: Option<ConnectionState>,
     current_run: Option<RunSummary>,
+    runtime: ConnectionRuntime,
     tables: Vec<TableProgress>,
 }
 
@@ -323,6 +351,27 @@ struct TableProgress {
     table_name: String,
     checkpoint: Option<TableCheckpoint>,
     stats: Option<TableStatsSnapshot>,
+    phase: &'static str,
+    reason_code: &'static str,
+    checkpoint_age_seconds: Option<i64>,
+    lag_seconds: Option<i64>,
+    snapshot_chunks_total: usize,
+    snapshot_chunks_complete: usize,
+}
+
+#[derive(Serialize)]
+struct ConnectionRuntime {
+    connection_id: String,
+    phase: &'static str,
+    reason_code: &'static str,
+    last_sync_started_at: Option<DateTime<Utc>>,
+    last_sync_finished_at: Option<DateTime<Utc>>,
+    last_sync_status: Option<String>,
+    last_error: Option<String>,
+    max_checkpoint_age_seconds: Option<i64>,
+    config_hash: String,
+    deploy_revision: Option<String>,
+    last_restart_reason: String,
 }
 
 #[derive(Serialize)]
@@ -446,9 +495,15 @@ struct RunsQuery {
     limit: Option<usize>,
 }
 
+fn config_hash(cfg: &Config) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(cfg).context("serializing config for hashing")?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 pub async fn spawn_admin_api(
     cfg: &Config,
     connection_id: &str,
+    managed_connection_count: usize,
     mode: &str,
     shutdown: ShutdownSignal,
 ) -> anyhow::Result<Option<JoinHandle<anyhow::Result<()>>>> {
@@ -487,6 +542,15 @@ pub async fn spawn_admin_api(
         started_at: Utc::now(),
         mode: mode.to_string(),
         connection_id: connection_id.to_string(),
+        managed_connection_count,
+        config_hash: config_hash(cfg)?,
+        deploy_revision: std::env::var("CDSYNC_DEPLOY_REVISION")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        last_restart_reason: std::env::var("CDSYNC_LAST_RESTART_REASON")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "startup".to_string()),
     };
 
     let app = router(state);
@@ -515,8 +579,10 @@ fn router(state: AdminApiState) -> Router {
         .route("/v1/config", get(config))
         .route("/v1/connections", get(connections))
         .route("/v1/connections/{id}", get(connection))
+        .route("/v1/connections/{id}/runtime", get(connection_runtime))
         .route("/v1/connections/{id}/checkpoints", get(checkpoints))
         .route("/v1/connections/{id}/progress", get(progress))
+        .route("/v1/connections/{id}/tables", get(connection_tables))
         .route("/v1/connections/{id}/runs", get(runs))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -546,7 +612,10 @@ async fn status(State(state): State<AdminApiState>) -> Json<StatusResponse> {
         started_at: state.started_at,
         mode: state.mode,
         connection_id: state.connection_id,
-        connection_count: state.cfg.connections.len(),
+        connection_count: state.managed_connection_count,
+        config_hash: state.config_hash,
+        deploy_revision: state.deploy_revision,
+        last_restart_reason: state.last_restart_reason,
     })
 }
 
@@ -558,12 +627,22 @@ async fn connections(
     State(state): State<AdminApiState>,
 ) -> Result<Json<Vec<ConnectionSummary>>, AdminApiError> {
     let sync_state = state.state_store.load_state().await?;
+    let now = Utc::now();
     let items = state
         .cfg
         .connections
         .iter()
         .map(|connection| {
             let current = sync_state.connections.get(&connection.id);
+            let runtime = derive_connection_runtime(
+                connection,
+                current,
+                None,
+                now,
+                &state.config_hash,
+                state.deploy_revision.as_deref(),
+                &state.last_restart_reason,
+            );
             ConnectionSummary {
                 id: connection.id.clone(),
                 enabled: connection.enabled(),
@@ -573,6 +652,9 @@ async fn connections(
                 last_sync_finished_at: current.and_then(|c| c.last_sync_finished_at),
                 last_sync_status: current.and_then(|c| c.last_sync_status.clone()),
                 last_error: current.and_then(|c| c.last_error.clone()),
+                phase: runtime.phase,
+                reason_code: runtime.reason_code,
+                max_checkpoint_age_seconds: runtime.max_checkpoint_age_seconds,
             }
         })
         .collect();
@@ -621,6 +703,29 @@ async fn runs(
     Ok(Json(runs))
 }
 
+async fn connection_runtime(
+    State(state): State<AdminApiState>,
+    Path(connection_id): Path<String>,
+) -> Result<Json<ConnectionRuntime>, AdminApiError> {
+    let sync_state = state.state_store.load_state().await?;
+    let connection = state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == connection_id)
+        .context("connection not found")?;
+    let runtime = derive_connection_runtime(
+        connection,
+        sync_state.connections.get(&connection_id),
+        None,
+        Utc::now(),
+        &state.config_hash,
+        state.deploy_revision.as_deref(),
+        &state.last_restart_reason,
+    );
+    Ok(Json(runtime))
+}
+
 async fn progress(
     State(state): State<AdminApiState>,
     Path(connection_id): Path<String>,
@@ -644,38 +749,71 @@ async fn progress(
     } else {
         (None, Vec::new())
     };
-
-    let mut table_names = std::collections::BTreeSet::new();
-    if let Some(state) = &connection_state {
-        let checkpoint_map = active_checkpoint_map(state, &config.source);
-        table_names.extend(checkpoint_map.keys().cloned());
-    }
-    table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
-
-    let run_table_map: std::collections::HashMap<_, _> = run_tables
-        .into_iter()
-        .map(|table| (table.table_name.clone(), table))
-        .collect();
-
-    let tables = table_names
-        .into_iter()
-        .map(|table_name| TableProgress {
-            checkpoint: connection_state.as_ref().and_then(|state| {
-                active_checkpoint_map(state, &config.source)
-                    .get(&table_name)
-                    .cloned()
-            }),
-            stats: run_table_map.get(&table_name).cloned(),
-            table_name,
-        })
-        .collect();
+    let now = Utc::now();
+    let runtime = derive_connection_runtime(
+        config,
+        connection_state.as_ref(),
+        current_run.as_ref(),
+        now,
+        &state.config_hash,
+        state.deploy_revision.as_deref(),
+        &state.last_restart_reason,
+    );
+    let tables = build_table_progress(
+        config,
+        connection_state.as_ref(),
+        &run_tables,
+        now,
+        runtime.reason_code,
+    );
 
     Ok(Json(ProgressResponse {
         connection_id,
         state: connection_state,
         current_run,
+        runtime,
         tables,
     }))
+}
+
+async fn connection_tables(
+    State(state): State<AdminApiState>,
+    Path(connection_id): Path<String>,
+) -> Result<Json<Vec<TableProgress>>, AdminApiError> {
+    let sync_state = state.state_store.load_state().await?;
+    let connection_state = sync_state.connections.get(&connection_id).cloned();
+    let config = state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == connection_id)
+        .context("connection not found")?;
+    let run_tables = if let Some(stats_db) = &state.stats_db {
+        let runs = stats_db.recent_runs(Some(&connection_id), 1).await?;
+        if let Some(run) = runs.into_iter().next() {
+            stats_db.run_tables(&run.run_id).await?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let runtime = derive_connection_runtime(
+        config,
+        connection_state.as_ref(),
+        None,
+        Utc::now(),
+        &state.config_hash,
+        state.deploy_revision.as_deref(),
+        &state.last_restart_reason,
+    );
+    Ok(Json(build_table_progress(
+        config,
+        connection_state.as_ref(),
+        &run_tables,
+        Utc::now(),
+        runtime.reason_code,
+    )))
 }
 
 fn active_checkpoint_map<'a>(
@@ -686,6 +824,188 @@ fn active_checkpoint_map<'a>(
         SourceConfig::Postgres(_) => &state.postgres,
         SourceConfig::Salesforce(_) => &state.salesforce,
     }
+}
+
+fn configured_entity_names(connection: &ConnectionConfig) -> std::collections::BTreeSet<String> {
+    match &connection.source {
+        SourceConfig::Postgres(pg) => pg
+            .tables
+            .as_ref()
+            .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+            .unwrap_or_default(),
+        SourceConfig::Salesforce(sf) => sf
+            .objects
+            .as_ref()
+            .map(|objects| objects.iter().map(|object| object.name.clone()).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn checkpoint_age_seconds(checkpoint: Option<&TableCheckpoint>, now: DateTime<Utc>) -> Option<i64> {
+    checkpoint
+        .and_then(|checkpoint| checkpoint.last_synced_at)
+        .map(|last_synced_at| (now - last_synced_at).num_seconds().max(0))
+}
+
+fn max_checkpoint_age_seconds(
+    state: Option<&ConnectionState>,
+    source: &SourceConfig,
+    now: DateTime<Utc>,
+) -> Option<i64> {
+    state.and_then(|state| {
+        active_checkpoint_map(state, source)
+            .values()
+            .filter_map(|checkpoint| checkpoint_age_seconds(Some(checkpoint), now))
+            .max()
+    })
+}
+
+fn classify_error_reason(error: Option<&str>) -> &'static str {
+    let Some(error) = error else {
+        return "healthy";
+    };
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("schema change") || normalized.contains("incompatible schema") {
+        "schema_blocked"
+    } else if normalized.contains("publication") {
+        "publication_blocked"
+    } else if normalized.contains("already locked") {
+        "lock_contention"
+    } else {
+        "last_run_failed"
+    }
+}
+
+fn checkpoint_has_incomplete_snapshot(checkpoint: Option<&TableCheckpoint>) -> bool {
+    checkpoint.is_some_and(|checkpoint| {
+        !checkpoint.snapshot_chunks.is_empty()
+            && checkpoint.snapshot_chunks.iter().any(|chunk| !chunk.complete)
+    })
+}
+
+fn derive_connection_runtime(
+    connection: &ConnectionConfig,
+    state: Option<&ConnectionState>,
+    _current_run: Option<&RunSummary>,
+    now: DateTime<Utc>,
+    config_hash: &str,
+    deploy_revision: Option<&str>,
+    last_restart_reason: &str,
+) -> ConnectionRuntime {
+    let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref()) {
+        Some("running") if state.is_some_and(|state| {
+            active_checkpoint_map(state, &connection.source)
+                .values()
+                .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
+        }) => ("snapshotting", "snapshot_in_progress"),
+        Some("running")
+            if matches!(&connection.source, SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)) =>
+        {
+            ("running", "cdc_following")
+        }
+        Some("running") => ("syncing", "sync_in_progress"),
+        Some("failed") => {
+            let reason = classify_error_reason(state.and_then(|state| state.last_error.as_deref()));
+            if matches!(reason, "schema_blocked" | "publication_blocked") {
+                ("blocked", reason)
+            } else {
+                ("error", reason)
+            }
+        }
+        Some("success") => ("healthy", "healthy"),
+        _ => ("idle", "never_synced"),
+    };
+
+    ConnectionRuntime {
+        connection_id: connection.id.clone(),
+        phase,
+        reason_code,
+        last_sync_started_at: state.and_then(|state| state.last_sync_started_at),
+        last_sync_finished_at: state.and_then(|state| state.last_sync_finished_at),
+        last_sync_status: state.and_then(|state| state.last_sync_status.clone()),
+        last_error: state.and_then(|state| state.last_error.clone()),
+        max_checkpoint_age_seconds: max_checkpoint_age_seconds(state, &connection.source, now),
+        config_hash: config_hash.to_string(),
+        deploy_revision: deploy_revision.map(ToOwned::to_owned),
+        last_restart_reason: last_restart_reason.to_string(),
+    }
+}
+
+fn build_table_progress(
+    connection: &ConnectionConfig,
+    state: Option<&ConnectionState>,
+    run_tables: &[TableStatsSnapshot],
+    now: DateTime<Utc>,
+    connection_reason_code: &'static str,
+) -> Vec<TableProgress> {
+    let mut table_names = configured_entity_names(connection);
+    if let Some(state) = state {
+        table_names.extend(active_checkpoint_map(state, &connection.source).keys().cloned());
+    }
+    table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
+
+    let run_table_map: std::collections::HashMap<_, _> = run_tables
+        .iter()
+        .cloned()
+        .map(|table| (table.table_name.clone(), table))
+        .collect();
+
+    table_names
+        .into_iter()
+        .map(|table_name| {
+            let checkpoint = state.and_then(|state| {
+                active_checkpoint_map(state, &connection.source)
+                    .get(&table_name)
+                    .cloned()
+            });
+            let stats = run_table_map.get(&table_name).cloned();
+            let checkpoint_age_seconds = checkpoint_age_seconds(checkpoint.as_ref(), now);
+            let snapshot_chunks_total = checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.snapshot_chunks.len())
+                .unwrap_or(0);
+            let snapshot_chunks_complete = checkpoint
+                .as_ref()
+                .map(|checkpoint| {
+                    checkpoint
+                        .snapshot_chunks
+                        .iter()
+                        .filter(|chunk| chunk.complete)
+                        .count()
+                })
+                .unwrap_or(0);
+            let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref())
+            {
+                Some("failed") if matches!(connection_reason_code, "schema_blocked" | "publication_blocked") => {
+                    ("blocked", connection_reason_code)
+                }
+                Some("failed") => ("error", connection_reason_code),
+                Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
+                    ("snapshotting", "snapshot_in_progress")
+                }
+                Some("running")
+                    if matches!(&connection.source, SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)) =>
+                {
+                    ("running", "cdc_following")
+                }
+                Some("running") => ("syncing", "sync_in_progress"),
+                Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
+                _ => ("pending", "never_synced"),
+            };
+
+            TableProgress {
+                table_name,
+                checkpoint,
+                stats,
+                phase,
+                reason_code,
+                checkpoint_age_seconds,
+                lag_seconds: checkpoint_age_seconds,
+                snapshot_chunks_total,
+                snapshot_chunks_complete,
+            }
+        })
+        .collect()
 }
 
 fn scrub_config(cfg: &Config) -> ScrubbedConfig {

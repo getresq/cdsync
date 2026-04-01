@@ -1,5 +1,8 @@
 use super::snapshot_sync::save_snapshot_progress;
 use super::*;
+use crate::destinations::Destination;
+use async_trait::async_trait;
+use polars::prelude::{NamedFrom, Series};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -657,5 +660,63 @@ async fn save_snapshot_progress_persists_checkpoint_updates() -> anyhow::Result<
         Some("10")
     );
     assert!(checkpoint.snapshot_chunks[0].complete);
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordingDestination {
+    write_modes: Mutex<Vec<WriteMode>>,
+}
+
+#[async_trait]
+impl Destination for RecordingDestination {
+    async fn ensure_table(&self, _schema: &TableSchema) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn truncate_table(&self, _table: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &self,
+        _table: &str,
+        _schema: &TableSchema,
+        _frame: &DataFrame,
+        mode: WriteMode,
+        _primary_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.write_modes.lock().await.push(mode);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn write_snapshot_batch_uses_requested_write_mode() -> anyhow::Result<()> {
+    let dest = RecordingDestination::default();
+    let schema = TableSchema {
+        name: "public__accounts".to_string(),
+        columns: vec![ColumnSchema {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Some("id".to_string()),
+    };
+    let batch = DataFrame::new(vec![Series::new("id".into(), &[1_i64]).into()])?;
+
+    super::snapshot_sync::write_snapshot_batch(
+        &dest,
+        &schema,
+        &batch,
+        WriteMode::Upsert,
+        "id",
+    )
+    .await?;
+
+    assert!(matches!(
+        dest.write_modes.lock().await.as_slice(),
+        [WriteMode::Upsert]
+    ));
     Ok(())
 }

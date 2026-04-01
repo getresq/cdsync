@@ -1,5 +1,22 @@
 use super::*;
 
+pub(super) async fn write_snapshot_batch(
+    dest: &dyn Destination,
+    schema: &TableSchema,
+    batch: &DataFrame,
+    write_mode: WriteMode,
+    primary_key: &str,
+) -> Result<()> {
+    dest.write_batch(
+        &schema.name,
+        schema,
+        batch,
+        write_mode,
+        Some(primary_key),
+    )
+    .await
+}
+
 impl PostgresSource {
     pub(super) async fn resolve_primary_key_type_info(
         &self,
@@ -650,14 +667,7 @@ impl PostgresSource {
                 }
 
                 let load_start = Instant::now();
-                dest.write_batch(
-                    &schema.name,
-                    schema,
-                    &batch,
-                    WriteMode::Append,
-                    Some(&table.primary_key),
-                )
-                .await?;
+                write_snapshot_batch(dest, schema, &batch, write_mode, &table.primary_key).await?;
                 if let Some(stats) = &stats {
                     let upserted = if matches!(write_mode, WriteMode::Upsert) {
                         rows.len()
