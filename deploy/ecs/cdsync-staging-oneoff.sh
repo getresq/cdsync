@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DB_HOST="${CDSYNC_DB_HOST:-staging-postgres-private.c0qssstf2cvw.us-east-1.rds.amazonaws.com}"
+DB_NAME="${CDSYNC_DB_NAME:-resq}"
+DB_USER="${CDSYNC_DB_USER:-cdsync_staging}"
+STATE_SCHEMA="${CDSYNC_STATE_SCHEMA:-cdsync_state}"
+STATS_SCHEMA="${CDSYNC_STATS_SCHEMA:-cdsync_stats}"
+CONNECTION_ID="${CDSYNC_CONNECTION_ID:-staging_app}"
+OBSERVABILITY_SERVICE_NAME="${CDSYNC_OBSERVABILITY_SERVICE_NAME:-cdsync-staging-oneoff}"
+BIGQUERY_PROJECT_ID="${CDSYNC_BIGQUERY_PROJECT_ID:-nora-461013}"
+BIGQUERY_DATASET="${CDSYNC_DESTINATION_DATASET:-cdsync_e2e_real}"
+BIGQUERY_LOCATION="${CDSYNC_BIGQUERY_LOCATION:-US}"
+BATCH_LOAD_BUCKET="${CDSYNC_BATCH_LOAD_BUCKET:-nora-461013-cdsync-staging-loads}"
+BATCH_LOAD_PREFIX="${CDSYNC_BATCH_LOAD_PREFIX:-staging-app}"
+PUBLICATION="${CDSYNC_PUBLICATION:-cdsync_staging_pub}"
+CDC_PIPELINE_ID="${CDSYNC_CDC_PIPELINE_ID:-1101}"
+RUN_MIGRATE="${CDSYNC_RUN_MIGRATE:-0}"
+
+DB_URL="postgres://${DB_USER}:${CDSYNC_DB_PASSWORD}@${DB_HOST}:5432/${DB_NAME}?sslmode=require"
+
 printf '%s' "$CDSYNC_GCP_KEY_B64" | base64 -d >/tmp/gcp-key.json
 
 cat >/tmp/rds-ca.pem <<'EOF'
@@ -32,15 +50,15 @@ EOF
 
 cat >/tmp/config.yaml <<EOF
 state:
-  url: "postgres://cdsync_staging:${CDSYNC_DB_PASSWORD}@staging-postgres-private.c0qssstf2cvw.us-east-1.rds.amazonaws.com:5432/resq?sslmode=require"
-  schema: "cdsync_state"
+  url: "${DB_URL}"
+  schema: "${STATE_SCHEMA}"
 
 logging:
   level: "info"
   json: true
 
 observability:
-  service_name: "cdsync-staging-oneoff"
+  service_name: "${OBSERVABILITY_SERVICE_NAME}"
   metrics_interval_seconds: 30
 
 sync:
@@ -50,19 +68,19 @@ sync:
   max_concurrency: 4
 
 stats:
-  url: "postgres://cdsync_staging:${CDSYNC_DB_PASSWORD}@staging-postgres-private.c0qssstf2cvw.us-east-1.rds.amazonaws.com:5432/resq?sslmode=require"
-  schema: "cdsync_stats"
+  url: "${DB_URL}"
+  schema: "${STATS_SCHEMA}"
 
 connections:
-  - id: "staging_app"
+  - id: "${CONNECTION_ID}"
     enabled: true
     source:
       type: postgres
-      url: "postgres://cdsync_staging:${CDSYNC_DB_PASSWORD}@staging-postgres-private.c0qssstf2cvw.us-east-1.rds.amazonaws.com:5432/resq?sslmode=require"
+      url: "${DB_URL}"
       cdc: true
-      publication: "cdsync_staging_pub"
+      publication: "${PUBLICATION}"
       schema_changes: auto
-      cdc_pipeline_id: 1101
+      cdc_pipeline_id: ${CDC_PIPELINE_ID}
       cdc_batch_size: 5000
       cdc_max_fill_ms: 2000
       cdc_max_pending_events: 100000
@@ -117,16 +135,19 @@ connections:
           soft_delete: true
     destination:
       type: bigquery
-      project_id: "nora-461013"
-      dataset: "cdsync_e2e_real"
-      location: "US"
+      project_id: "${BIGQUERY_PROJECT_ID}"
+      dataset: "${BIGQUERY_DATASET}"
+      location: "${BIGQUERY_LOCATION}"
       service_account_key_path: "/tmp/gcp-key.json"
       partition_by_synced_at: true
       storage_write_enabled: false
-      batch_load_bucket: "nora-461013-cdsync-staging-loads"
-      batch_load_prefix: "staging-app"
+      batch_load_bucket: "${BATCH_LOAD_BUCKET}"
+      batch_load_prefix: "${BATCH_LOAD_PREFIX}"
 EOF
 
-cdsync validate --config /tmp/config.yaml --connection staging_app --verbose
-cdsync sync --config /tmp/config.yaml --connection staging_app --incremental --schema-diff
-cdsync report --config /tmp/config.yaml --connection staging_app --limit 10
+if [[ "${RUN_MIGRATE}" == "1" ]]; then
+  cdsync migrate --config /tmp/config.yaml
+fi
+cdsync validate --config /tmp/config.yaml --connection "${CONNECTION_ID}" --verbose
+cdsync sync --config /tmp/config.yaml --connection "${CONNECTION_ID}" --incremental --schema-diff
+cdsync report --config /tmp/config.yaml --connection "${CONNECTION_ID}" --limit 10

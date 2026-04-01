@@ -29,6 +29,7 @@ use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use url::Url;
+use uuid::Uuid;
 
 use self::storage_write::StorageWriteTableWriter;
 use self::values::{
@@ -555,6 +556,36 @@ impl BigQueryDestination {
         })?;
         Ok(())
     }
+
+    async fn drop_table_if_exists(&self, table: &str) -> Result<()> {
+        if self.dry_run {
+            info!("dry-run: drop {}", table);
+            return Ok(());
+        }
+        self.invalidate_storage_writer(table).await;
+        if let Some(emulator_http) = &self.config.emulator_http {
+            let client = reqwest::Client::new();
+            let url = format!(
+                "{}/projects/{}/datasets/{}/tables/{}",
+                emulator_http, self.config.project_id, self.config.dataset, table
+            );
+            let response = client.delete(url).send().await?;
+            if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            anyhow::bail!("emulator delete table failed: {}", response.status());
+        }
+        match self
+            .client
+            .table()
+            .delete(&self.config.project_id, &self.config.dataset, table)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(BqError::Response(err)) if err.code == 404 => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
 }
 
 #[async_trait]
@@ -620,11 +651,21 @@ impl Destination for BigQueryDestination {
                         self.append_rows(table, schema, frame, Some(pk)).await?;
                         return Ok(());
                     }
-                    let staging = format!("{table}_staging");
+                    let staging = upsert_staging_table_id(table);
                     self.ensure_table_internal(schema, &staging, false).await?;
-                    self.truncate_table(&staging).await?;
-                    self.append_rows(&staging, schema, frame, Some(pk)).await?;
-                    self.merge_staging(table, &staging, schema, pk).await?;
+                    let result: Result<()> = async {
+                        self.append_rows(&staging, schema, frame, Some(pk)).await?;
+                        self.merge_staging(table, &staging, schema, pk).await
+                    }
+                    .await;
+                    if let Err(err) = self.drop_table_if_exists(&staging).await {
+                        warn!(
+                            table = %staging,
+                            error = %err,
+                            "failed to drop BigQuery staging table after upsert"
+                        );
+                    }
+                    result?;
                 } else {
                     warn!("no primary key for {table}; falling back to append");
                     self.append_rows(table, schema, frame, None).await?;
@@ -632,5 +673,24 @@ impl Destination for BigQueryDestination {
             }
         }
         Ok(())
+    }
+}
+
+fn upsert_staging_table_id(table: &str) -> String {
+    format!("{table}_staging_{}", Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upsert_staging_table_id;
+
+    #[test]
+    fn upsert_staging_table_id_is_unique_per_write() {
+        let first = upsert_staging_table_id("public__accounts");
+        let second = upsert_staging_table_id("public__accounts");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("public__accounts_staging_"));
+        assert!(second.starts_with("public__accounts_staging_"));
     }
 }

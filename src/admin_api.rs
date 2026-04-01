@@ -496,7 +496,9 @@ struct RunsQuery {
 }
 
 fn config_hash(cfg: &Config) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(cfg).context("serializing config for hashing")?;
+    let mut value = serde_json::to_value(cfg).context("serializing config for hashing")?;
+    canonicalize_json_value(&mut value);
+    let bytes = serde_json::to_vec(&value).context("serializing canonical config for hashing")?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -849,12 +851,15 @@ fn checkpoint_age_seconds(checkpoint: Option<&TableCheckpoint>, now: DateTime<Ut
 
 fn max_checkpoint_age_seconds(
     state: Option<&ConnectionState>,
-    source: &SourceConfig,
+    connection: &ConnectionConfig,
     now: DateTime<Utc>,
 ) -> Option<i64> {
     state.and_then(|state| {
-        active_checkpoint_map(state, source)
-            .values()
+        let configured = configured_entity_names(connection);
+        active_checkpoint_map(state, &connection.source)
+            .iter()
+            .filter(|(entity_name, _)| configured.is_empty() || configured.contains(*entity_name))
+            .map(|(_, checkpoint)| checkpoint)
             .filter_map(|checkpoint| checkpoint_age_seconds(Some(checkpoint), now))
             .max()
     })
@@ -924,7 +929,7 @@ fn derive_connection_runtime(
         last_sync_finished_at: state.and_then(|state| state.last_sync_finished_at),
         last_sync_status: state.and_then(|state| state.last_sync_status.clone()),
         last_error: state.and_then(|state| state.last_error.clone()),
-        max_checkpoint_age_seconds: max_checkpoint_age_seconds(state, &connection.source, now),
+        max_checkpoint_age_seconds: max_checkpoint_age_seconds(state, connection, now),
         config_hash: config_hash.to_string(),
         deploy_revision: deploy_revision.map(ToOwned::to_owned),
         last_restart_reason: last_restart_reason.to_string(),
@@ -1146,10 +1151,127 @@ fn scrub_url(raw: &str) -> String {
     raw.to_string()
 }
 
+fn canonicalize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (_, child) in &mut entries {
+                canonicalize_json_value(child);
+            }
+            object.extend(entries);
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                canonicalize_json_value(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig,
+        DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
+        PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
+    };
     use crate::types::TableCheckpoint;
+    use chrono::TimeZone;
+    use std::collections::HashMap;
+
+    fn test_hash_config(
+        otlp_headers: HashMap<String, String>,
+        public_keys: HashMap<String, String>,
+    ) -> Config {
+        Config {
+            connections: vec![ConnectionConfig {
+                id: "app".to_string(),
+                enabled: Some(true),
+                source: SourceConfig::Postgres(PostgresConfig {
+                    url: "postgres://postgres:secret@example.com:5432/app".to_string(),
+                    tables: Some(vec![PostgresTableConfig {
+                        name: "public.accounts".to_string(),
+                        primary_key: Some("id".to_string()),
+                        updated_at_column: Some("updated_at".to_string()),
+                        soft_delete: Some(false),
+                        soft_delete_column: None,
+                        where_clause: None,
+                        columns: None,
+                    }]),
+                    table_selection: None,
+                    batch_size: Some(1000),
+                    cdc: Some(true),
+                    publication: Some("cdsync_pub".to_string()),
+                    schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
+                    cdc_pipeline_id: Some(1),
+                    cdc_batch_size: Some(1000),
+                    cdc_max_fill_ms: Some(2000),
+                    cdc_max_pending_events: Some(100_000),
+                    cdc_idle_timeout_seconds: Some(10),
+                    cdc_tls: Some(false),
+                    cdc_tls_ca_path: None,
+                    cdc_tls_ca: None,
+                }),
+                destination: DestinationConfig::BigQuery(BigQueryConfig {
+                    project_id: "proj".to_string(),
+                    dataset: "dataset".to_string(),
+                    location: Some("US".to_string()),
+                    service_account_key_path: None,
+                    service_account_key: None,
+                    partition_by_synced_at: Some(true),
+                    storage_write_enabled: Some(false),
+                    batch_load_bucket: None,
+                    batch_load_prefix: None,
+                    emulator_http: Some("http://localhost:9050".to_string()),
+                    emulator_grpc: Some("localhost:9051".to_string()),
+                }),
+                schedule: None,
+            }],
+            state: StateConfig {
+                url: "postgres://postgres:secret@example.com:5432/state".to_string(),
+                schema: Some("cdsync_state".to_string()),
+            },
+            metadata: Some(MetadataConfig {
+                synced_at_column: Some("_synced".to_string()),
+                deleted_at_column: Some("_deleted".to_string()),
+            }),
+            logging: Some(LoggingConfig {
+                level: Some("info".to_string()),
+                json: Some(false),
+            }),
+            admin_api: Some(AdminApiConfig {
+                enabled: Some(true),
+                bind: Some("127.0.0.1:8080".to_string()),
+                auth: Some(AdminApiAuthConfig {
+                    service_jwt_public_keys: public_keys,
+                    service_jwt_public_keys_json: None,
+                    service_jwt_allowed_issuers: vec!["caller-service".to_string()],
+                    service_jwt_allowed_audiences: vec!["cdsync".to_string()],
+                    required_scopes: vec!["cdsync:admin".to_string()],
+                }),
+            }),
+            observability: Some(ObservabilityConfig {
+                service_name: Some("cdsync".to_string()),
+                otlp_traces_endpoint: Some("https://trace.example".to_string()),
+                otlp_metrics_endpoint: Some("https://metrics.example".to_string()),
+                otlp_headers: Some(otlp_headers),
+                metrics_interval_seconds: Some(30),
+            }),
+            sync: Some(SyncConfig {
+                default_batch_size: Some(1000),
+                max_retries: Some(5),
+                retry_backoff_ms: Some(1000),
+                max_concurrency: Some(4),
+            }),
+            stats: Some(StatsConfig {
+                url: Some("postgres://postgres:secret@example.com:5432/stats".to_string()),
+                schema: Some("cdsync_stats".to_string()),
+            }),
+        }
+    }
 
     #[test]
     fn scrub_observability_config_redacts_header_values() {
@@ -1210,6 +1332,103 @@ mod tests {
                 .get("Account")
                 .and_then(|checkpoint| checkpoint.last_primary_key.as_deref()),
             Some("001")
+        );
+    }
+
+    #[test]
+    fn config_hash_is_stable_for_map_backed_config() {
+        let config_a = test_hash_config(
+            HashMap::from([
+                ("authorization".to_string(), "Bearer secret".to_string()),
+                ("x-api-key".to_string(), "key-a".to_string()),
+            ]),
+            HashMap::from([
+                ("caller-service-a".to_string(), "pem-a".to_string()),
+                ("caller-service-b".to_string(), "pem-b".to_string()),
+            ]),
+        );
+        let config_b = test_hash_config(
+            HashMap::from([
+                ("x-api-key".to_string(), "key-a".to_string()),
+                ("authorization".to_string(), "Bearer secret".to_string()),
+            ]),
+            HashMap::from([
+                ("caller-service-b".to_string(), "pem-b".to_string()),
+                ("caller-service-a".to_string(), "pem-a".to_string()),
+            ]),
+        );
+
+        assert_eq!(
+            config_hash(&config_a).expect("hash a"),
+            config_hash(&config_b).expect("hash b")
+        );
+    }
+
+    #[test]
+    fn max_checkpoint_age_seconds_ignores_removed_config_entities() {
+        let connection = ConnectionConfig {
+            id: "app".to_string(),
+            enabled: Some(true),
+            source: SourceConfig::Postgres(PostgresConfig {
+                url: "postgres://postgres:secret@example.com:5432/app".to_string(),
+                tables: Some(vec![PostgresTableConfig {
+                    name: "public.accounts".to_string(),
+                    primary_key: Some("id".to_string()),
+                    updated_at_column: Some("updated_at".to_string()),
+                    soft_delete: Some(false),
+                    soft_delete_column: None,
+                    where_clause: None,
+                    columns: None,
+                }]),
+                table_selection: None,
+                batch_size: Some(1000),
+                cdc: Some(false),
+                publication: None,
+                schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
+                cdc_pipeline_id: None,
+                cdc_batch_size: None,
+                cdc_max_fill_ms: None,
+                cdc_max_pending_events: None,
+                cdc_idle_timeout_seconds: None,
+                cdc_tls: None,
+                cdc_tls_ca_path: None,
+                cdc_tls_ca: None,
+            }),
+            destination: DestinationConfig::BigQuery(BigQueryConfig {
+                project_id: "proj".to_string(),
+                dataset: "dataset".to_string(),
+                location: Some("US".to_string()),
+                service_account_key_path: None,
+                service_account_key: None,
+                partition_by_synced_at: Some(true),
+                storage_write_enabled: Some(false),
+                batch_load_bucket: None,
+                batch_load_prefix: None,
+                emulator_http: Some("http://localhost:9050".to_string()),
+                emulator_grpc: Some("localhost:9051".to_string()),
+            }),
+            schedule: None,
+        };
+        let now = Utc.with_ymd_and_hms(2026, 4, 1, 12, 0, 0).unwrap();
+        let mut state = ConnectionState::default();
+        state.postgres.insert(
+            "public.accounts".to_string(),
+            TableCheckpoint {
+                last_synced_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 11, 59, 0).unwrap()),
+                ..Default::default()
+            },
+        );
+        state.postgres.insert(
+            "public.removed_table".to_string(),
+            TableCheckpoint {
+                last_synced_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).unwrap()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            max_checkpoint_age_seconds(Some(&state), &connection, now),
+            Some(60)
         );
     }
 }

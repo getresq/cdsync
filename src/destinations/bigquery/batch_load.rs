@@ -15,7 +15,7 @@ use gcloud_bigquery::http::job::{
     JobType, WriteDisposition,
 };
 use gcloud_bigquery::http::table::{
-    DecimalTargetType, ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
+    ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
 };
 
 use super::BigQueryDestination;
@@ -112,42 +112,15 @@ impl BigQueryDestination {
     ) -> Result<()> {
         let job_id = format!("cdsync_load_{}", Uuid::new_v4().simple());
         let location = self.config.location.clone();
-        let job = Job {
-            job_reference: JobReference {
-                project_id: self.config.project_id.clone(),
-                job_id: job_id.clone(),
-                location: location.clone(),
-            },
-            configuration: JobConfiguration {
-                job_type: "LOAD".to_string(),
-                job: JobType::Load(JobConfigurationLoad {
-                    source_uris: vec![source_uri.to_string()],
-                    schema: Some(BqTableSchema {
-                        fields: bq_fields_from_schema(&schema.columns),
-                    }),
-                    destination_table: TableReference {
-                        project_id: self.config.project_id.clone(),
-                        dataset_id: self.config.dataset.clone(),
-                        table_id: table_id.to_string(),
-                    },
-                    create_disposition: Some(CreateDisposition::CreateIfNeeded),
-                    write_disposition: Some(WriteDisposition::WriteAppend),
-                    source_format: Some(SourceFormat::Parquet),
-                    max_bad_records: Some(0),
-                    autodetect: Some(false),
-                    ignore_unknown_values: Some(false),
-                    decimal_target_types: Some(vec![
-                        DecimalTargetType::Bignumeric,
-                        DecimalTargetType::Numeric,
-                        DecimalTargetType::String,
-                    ]),
-                    parquet_options: Some(ParquetOptions::default()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let job = build_load_job(
+            &self.config.project_id,
+            &self.config.dataset,
+            table_id,
+            schema,
+            source_uri,
+            &job_id,
+            location.as_deref(),
+        );
 
         let created = self
             .client
@@ -195,6 +168,48 @@ impl BigQueryDestination {
 
 const PARQUET_FILE_EXTENSION: &str = "parquet";
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
+
+fn build_load_job(
+    project_id: &str,
+    dataset_id: &str,
+    table_id: &str,
+    schema: &TableSchema,
+    source_uri: &str,
+    job_id: &str,
+    location: Option<&str>,
+) -> Job {
+    Job {
+        job_reference: JobReference {
+            project_id: project_id.to_string(),
+            job_id: job_id.to_string(),
+            location: location.map(ToOwned::to_owned),
+        },
+        configuration: JobConfiguration {
+            job_type: "LOAD".to_string(),
+            job: JobType::Load(JobConfigurationLoad {
+                source_uris: vec![source_uri.to_string()],
+                schema: Some(BqTableSchema {
+                    fields: bq_fields_from_schema(&schema.columns),
+                }),
+                destination_table: TableReference {
+                    project_id: project_id.to_string(),
+                    dataset_id: dataset_id.to_string(),
+                    table_id: table_id.to_string(),
+                },
+                create_disposition: Some(CreateDisposition::CreateIfNeeded),
+                write_disposition: Some(WriteDisposition::WriteAppend),
+                source_format: Some(SourceFormat::Parquet),
+                max_bad_records: Some(0),
+                autodetect: Some(false),
+                ignore_unknown_values: Some(false),
+                parquet_options: Some(ParquetOptions::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 fn batch_load_object_name(prefix: Option<&str>, table_id: &str, extension: &str) -> String {
     let base = format!(
@@ -537,5 +552,34 @@ mod tests {
             parquet.column("payload").expect("payload").dtype(),
             &polars::prelude::DataType::String
         );
+    }
+
+    #[test]
+    fn build_load_job_omits_decimal_target_types_when_schema_is_explicit() {
+        let schema = TableSchema {
+            name: "public__documents".to_string(),
+            columns: vec![ColumnSchema {
+                name: "amount".to_string(),
+                data_type: DataType::Numeric,
+                nullable: true,
+            }],
+            primary_key: None,
+        };
+
+        let job = build_load_job(
+            "proj",
+            "dataset",
+            "public__documents",
+            &schema,
+            "gs://bucket/path.parquet",
+            "job_123",
+            Some("US"),
+        );
+
+        let JobType::Load(load) = job.configuration.job else {
+            panic!("expected load job");
+        };
+        assert!(load.schema.is_some());
+        assert!(load.decimal_target_types.is_none());
     }
 }

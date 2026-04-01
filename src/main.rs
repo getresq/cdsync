@@ -25,6 +25,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures::stream::{FuturesUnordered, StreamExt};
+use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -262,6 +264,7 @@ async fn refresh_postgres_checkpoints_from_store(
 #[tokio::main]
 async fn main() -> Result<()> {
     tls::install_rustls_provider();
+    let _ = JWT_CRYPTO_PROVIDER.install_default();
     dotenv::load_dotenv()?;
     let cli = Cli::parse();
     match cli.command {
@@ -907,6 +910,13 @@ async fn run_connection_worker(
     telemetry::record_connection_worker_event(&connection.id, mode, "started");
     match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
+            let cfg = Config::load(&config_path).await?;
+            let checkpoint_age_task = spawn_checkpoint_age_reporter(
+                &cfg,
+                &connection,
+                shutdown_signal.clone(),
+            )
+            .await?;
             let result = cmd_sync(SyncCommandRequest {
                 config_path,
                 full: false,
@@ -918,6 +928,10 @@ async fn run_connection_worker(
                 shutdown: Some(shutdown_signal),
             })
             .await;
+            if let Some(task) = checkpoint_age_task {
+                task.abort();
+                let _ = task.await;
+            }
             telemetry::record_connection_worker_event(
                 &connection.id,
                 mode,
@@ -981,19 +995,130 @@ fn connection_source_kind(connection: &crate::config::ConnectionConfig) -> &'sta
     }
 }
 
+fn configured_entity_names(
+    connection: &crate::config::ConnectionConfig,
+) -> std::collections::BTreeSet<String> {
+    match &connection.source {
+        SourceConfig::Postgres(pg) => pg
+            .tables
+            .as_ref()
+            .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+            .unwrap_or_default(),
+        SourceConfig::Salesforce(sf) => sf
+            .objects
+            .as_ref()
+            .map(|objects| objects.iter().map(|object| object.name.clone()).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn connection_checkpoint_age_seconds(
+    sync_state: &crate::state::SyncState,
+    connection: &crate::config::ConnectionConfig,
+    now: chrono::DateTime<Utc>,
+) -> Option<u64> {
+    sync_state
+        .connections
+        .get(&connection.id)
+        .and_then(|state| max_checkpoint_age_seconds(state, connection, now))
+}
+
 fn max_checkpoint_age_seconds(
     state: &ConnectionState,
     connection: &crate::config::ConnectionConfig,
     now: chrono::DateTime<Utc>,
 ) -> Option<u64> {
+    let configured = configured_entity_names(connection);
     let checkpoints = match &connection.source {
-        SourceConfig::Postgres(_) => state.postgres.values(),
-        SourceConfig::Salesforce(_) => state.salesforce.values(),
+        SourceConfig::Postgres(_) => state.postgres.iter().collect::<Vec<_>>(),
+        SourceConfig::Salesforce(_) => state.salesforce.iter().collect::<Vec<_>>(),
     };
     checkpoints
-        .filter_map(|checkpoint| checkpoint.last_synced_at)
+        .into_iter()
+        .filter(|(entity_name, _)| configured.is_empty() || configured.contains(*entity_name))
+        .filter_map(|(_, checkpoint)| checkpoint.last_synced_at)
         .map(|last_synced_at| (now - last_synced_at).num_seconds().max(0) as u64)
         .max()
+}
+
+async fn spawn_checkpoint_age_reporter(
+    cfg: &Config,
+    connection: &crate::config::ConnectionConfig,
+    shutdown_signal: ShutdownSignal,
+) -> Result<Option<JoinHandle<()>>> {
+    if !matches!(
+        (&connection.source, &connection.destination),
+        (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true)
+    ) {
+        return Ok(None);
+    }
+
+    let state_store = SyncStateStore::open_with_config(&cfg.state).await?;
+    let interval = Duration::from_secs(
+        cfg.observability
+            .as_ref()
+            .and_then(|obs| obs.metrics_interval_seconds)
+            .unwrap_or(30),
+    );
+    let connection = connection.clone();
+    let connection_id = connection.id.clone();
+    let source_kind = connection_source_kind(&connection);
+
+    Ok(Some(tokio::spawn(async move {
+        run_checkpoint_age_reporter(
+            interval,
+            shutdown_signal,
+            move || {
+                let state_store = state_store.clone();
+                let connection = connection.clone();
+                async move {
+                    let sync_state = state_store.load_state().await?;
+                    Ok(connection_checkpoint_age_seconds(
+                        &sync_state,
+                        &connection,
+                        Utc::now(),
+                    ))
+                }
+            },
+            move |age_seconds| {
+                telemetry::record_connection_checkpoint_age(
+                    &connection_id,
+                    source_kind,
+                    age_seconds,
+                );
+            },
+        )
+        .await;
+    })))
+}
+
+async fn run_checkpoint_age_reporter<LoadAge, LoadFuture, RecordAge>(
+    interval: Duration,
+    shutdown_signal: ShutdownSignal,
+    mut load_age: LoadAge,
+    mut record_age: RecordAge,
+) where
+    LoadAge: FnMut() -> LoadFuture,
+    LoadFuture: Future<Output = Result<Option<u64>>>,
+    RecordAge: FnMut(u64),
+{
+    let mut shutdown_signal = shutdown_signal;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                match load_age().await {
+                    Ok(Some(age_seconds)) => record_age(age_seconds),
+                    Ok(None) => {}
+                    Err(err) => warn!(error = %err, "failed to record checkpoint age sample"),
+                }
+            }
+            changed = shutdown_signal.changed() => {
+                if changed {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<()> {

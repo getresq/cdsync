@@ -67,6 +67,9 @@ mod reconcile_tests {
 mod sync_selection_tests {
     use super::*;
     use crate::config::StatsConfig;
+    use chrono::TimeZone;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
     use tokio::time::{Duration, sleep};
 
@@ -206,6 +209,51 @@ mod sync_selection_tests {
 
         assert_eq!(run_supervisor_mode(&selected), "multi_connection");
         assert_eq!(run_connection_label(&selected), "all");
+    }
+
+    #[test]
+    fn max_checkpoint_age_seconds_ignores_removed_tables() {
+        let connection = test_connection("app", Some(true));
+        let now = Utc.with_ymd_and_hms(2026, 4, 1, 12, 0, 0).unwrap();
+        let mut state = ConnectionState::default();
+        state.postgres.insert(
+            "public.accounts".to_string(),
+            TableCheckpoint {
+                last_synced_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 11, 59, 0).unwrap()),
+                ..Default::default()
+            },
+        );
+        state.postgres.insert(
+            "public.removed_table".to_string(),
+            TableCheckpoint {
+                last_synced_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).unwrap()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(max_checkpoint_age_seconds(&state, &connection, now), Some(60));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_age_reporter_records_before_shutdown() {
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let recorded_clone = Arc::clone(&recorded);
+        let (shutdown_controller, shutdown_signal) = crate::runner::ShutdownController::new();
+
+        let reporter = tokio::spawn(run_checkpoint_age_reporter(
+            Duration::from_millis(5),
+            shutdown_signal,
+            || async { Ok(Some(42)) },
+            move |_| {
+                recorded_clone.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+
+        sleep(Duration::from_millis(20)).await;
+        shutdown_controller.shutdown();
+        reporter.await.expect("reporter task");
+
+        assert!(recorded.load(Ordering::Relaxed) >= 1);
     }
 
     #[tokio::test]
