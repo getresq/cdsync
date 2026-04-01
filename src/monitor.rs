@@ -1077,7 +1077,7 @@ SwIDAQAB
         let snapshot = MonitorSnapshot {
             status: StatusResponse {
                 service: "cdsync".to_string(),
-                version: "0.1.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 started_at: Utc::now(),
                 mode: "run".to_string(),
                 connection_id: "all".to_string(),
@@ -1110,7 +1110,7 @@ SwIDAQAB
         let snapshot = MonitorSnapshot {
             status: StatusResponse {
                 service: "cdsync".to_string(),
-                version: "0.1.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 started_at: Utc::now(),
                 mode: "run".to_string(),
                 connection_id: "all".to_string(),
