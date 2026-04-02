@@ -1,6 +1,12 @@
 use super::*;
 use rustls::pki_types::pem::PemObject;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotCopyExit {
+    Completed,
+    Interrupted,
+}
+
 pub(super) async fn write_snapshot_batch(
     dest: &dyn Destination,
     schema: &TableSchema,
@@ -8,14 +14,32 @@ pub(super) async fn write_snapshot_batch(
     write_mode: WriteMode,
     primary_key: &str,
 ) -> Result<()> {
-    dest.write_batch(
-        &schema.name,
-        schema,
-        batch,
-        write_mode,
-        Some(primary_key),
+    dest.write_batch(&schema.name, schema, batch, write_mode, Some(primary_key))
+        .await
+}
+
+pub(super) async fn finalize_snapshot_copy_progress(
+    checkpoint_state: &Arc<Mutex<TableCheckpoint>>,
+    table_name: &str,
+    chunk: Option<SnapshotChunkRange>,
+    last_primary_key: Option<String>,
+    exit: SnapshotCopyExit,
+    state_handle: Option<&StateHandle>,
+) -> Result<bool> {
+    if !matches!(exit, SnapshotCopyExit::Completed) {
+        return Ok(false);
+    }
+
+    save_snapshot_progress(
+        checkpoint_state,
+        table_name,
+        chunk,
+        last_primary_key,
+        true,
+        state_handle,
     )
-    .await
+    .await?;
+    Ok(true)
 }
 
 impl PostgresSource {
@@ -621,6 +645,7 @@ impl PostgresSource {
         let mut extracted_rows = 0usize;
         let mut loaded_batches = 0usize;
         let mut completed = false;
+        let mut copy_exit = SnapshotCopyExit::Completed;
         let chunk_start = chunk.map(|range| range.start_pk);
         let chunk_end = chunk.map(|range| range.end_pk);
         let snapshot_label = snapshot_name.unwrap_or("resume");
@@ -628,6 +653,7 @@ impl PostgresSource {
         let run_result: Result<()> = async {
             loop {
                 if snapshot_shutdown_requested(shutdown.as_ref()) {
+                    copy_exit = SnapshotCopyExit::Interrupted;
                     info!(
                         table = %table.name,
                         snapshot_name = snapshot_label,
@@ -726,6 +752,7 @@ impl PostgresSource {
                 .await?;
 
                 if snapshot_shutdown_requested(shutdown.as_ref()) {
+                    copy_exit = SnapshotCopyExit::Interrupted;
                     info!(
                         table = %table.name,
                         extracted_rows,
@@ -739,7 +766,7 @@ impl PostgresSource {
                 }
             }
 
-            completed = true;
+            completed = matches!(copy_exit, SnapshotCopyExit::Completed);
             Ok(())
         }
         .await;
@@ -747,15 +774,27 @@ impl PostgresSource {
         release_exported_snapshot_reader(&connection, completed).await?;
         run_result?;
 
-        save_snapshot_progress(
+        let snapshot_completed = finalize_snapshot_copy_progress(
             &checkpoint_state,
             &table.name,
             chunk,
             last_pk.clone(),
-            true,
+            copy_exit,
             state_handle.as_ref(),
         )
         .await?;
+        if !snapshot_completed {
+            info!(
+                table = %table.name,
+                extracted_rows,
+                loaded_batches,
+                snapshot_name = snapshot_label,
+                chunk_start,
+                chunk_end,
+                "shutdown requested during exported snapshot copy; preserving checkpoint for resume"
+            );
+            return Ok(());
+        }
 
         info!(
             table = %table.name,

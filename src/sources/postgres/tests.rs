@@ -61,6 +61,20 @@ fn snapshot_shutdown_requested_tracks_signal_state() {
 }
 
 #[test]
+fn cdc_snapshot_completion_requires_success_without_shutdown() {
+    let (controller, signal) = crate::runner::ShutdownController::new();
+    assert!(super::cdc_sync::cdc_snapshot_completed(true, Some(&signal)));
+
+    controller.shutdown();
+
+    assert!(!super::cdc_sync::cdc_snapshot_completed(
+        true,
+        Some(&signal)
+    ));
+    assert!(!super::cdc_sync::cdc_snapshot_completed(false, None));
+}
+
+#[test]
 fn next_cdc_wait_timeout_uses_pending_fill_deadline_when_sooner() {
     let mut pending = HashMap::new();
     pending.insert(
@@ -971,6 +985,42 @@ async fn save_snapshot_progress_persists_checkpoint_updates() -> anyhow::Result<
         Some("10")
     );
     assert!(checkpoint.snapshot_chunks[0].complete);
+    Ok(())
+}
+
+#[tokio::test]
+async fn finalize_snapshot_copy_progress_skips_completion_when_interrupted() -> anyhow::Result<()> {
+    let checkpoint_state = Arc::new(Mutex::new(TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("6".to_string()),
+            complete: false,
+        }],
+        ..Default::default()
+    }));
+
+    let completed = super::snapshot_sync::finalize_snapshot_copy_progress(
+        &checkpoint_state,
+        "public.accounts",
+        Some(SnapshotChunkRange {
+            start_pk: 1,
+            end_pk: 10,
+        }),
+        Some("10".to_string()),
+        super::snapshot_sync::SnapshotCopyExit::Interrupted,
+        None,
+    )
+    .await?;
+
+    assert!(!completed);
+    let checkpoint = checkpoint_state.lock().await.clone();
+    assert_eq!(
+        checkpoint.snapshot_chunks[0].last_primary_key.as_deref(),
+        Some("6")
+    );
+    assert!(!checkpoint.snapshot_chunks[0].complete);
     Ok(())
 }
 

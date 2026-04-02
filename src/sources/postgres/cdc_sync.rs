@@ -1,4 +1,4 @@
-use super::snapshot_sync::release_exported_snapshot_slot;
+use super::snapshot_sync::{release_exported_snapshot_slot, snapshot_shutdown_requested};
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +185,13 @@ pub(super) fn cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>) -> Re
         );
     }
     Ok(slot_name)
+}
+
+pub(super) fn cdc_snapshot_completed(
+    run_succeeded: bool,
+    shutdown: Option<&ShutdownSignal>,
+) -> bool {
+    run_succeeded && !snapshot_shutdown_requested(shutdown)
 }
 
 impl PostgresSource {
@@ -710,8 +717,10 @@ impl PostgresSource {
                 Ok(())
             }
             .await;
+            let snapshot_completed =
+                cdc_snapshot_completed(snapshot_result.is_ok(), shutdown.as_ref());
             if let Some(slot_guard) = slot_guard {
-                release_exported_snapshot_slot(slot_guard, snapshot_result.is_ok()).await?;
+                release_exported_snapshot_slot(slot_guard, snapshot_completed).await?;
             }
             if preserve_existing_backlog
                 && let Err(err) = replication_client.delete_slot(&snapshot_slot_name).await
@@ -720,6 +729,21 @@ impl PostgresSource {
                 return Err(err.into());
             }
             snapshot_result?;
+            if !snapshot_completed {
+                for (table_name, checkpoint_state) in &snapshot_checkpoint_states {
+                    let checkpoint = checkpoint_state.lock().await.clone();
+                    state.postgres.insert(table_name.clone(), checkpoint);
+                }
+                info!(
+                    connection = %state_handle
+                        .as_ref()
+                        .map(|handle| handle.connection_id())
+                        .unwrap_or("postgres"),
+                    snapshot_table_count = snapshot_checkpoint_states.len(),
+                    "shutdown requested during CDC snapshot; preserving resumable snapshot progress"
+                );
+                return Ok(());
+            }
             if !preserve_existing_backlog {
                 let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
                 cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
