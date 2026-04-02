@@ -37,6 +37,7 @@ pub struct CdcTableInfo {
     pub primary_key: String,
     pub soft_delete: bool,
     dest_source_indices: Vec<usize>,
+    source_primary_key_index: usize,
     source_soft_delete_index: Option<usize>,
 }
 
@@ -57,6 +58,11 @@ struct CdcCommitTableWork {
     rows: Vec<TableRow>,
     delete_rows: Vec<TableRow>,
     truncate: bool,
+}
+
+enum PendingTableRowAction {
+    Upsert(TableRow),
+    Delete(TableRow),
 }
 
 const CDC_FRAME_BUILD_BLOCKING_ROWS: usize = 512;
@@ -81,12 +87,15 @@ impl CdcTableInfo {
             dest_source_indices.push(idx);
         }
 
-        if !source_index_by_name.contains_key(&spec.primary_key) {
-            return Err(anyhow::anyhow!(
-                "primary key {} not found in source schema",
-                spec.primary_key
-            ));
-        }
+        let source_primary_key_index = source_index_by_name
+            .get(&spec.primary_key)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "primary key {} not found in source schema",
+                    spec.primary_key
+                )
+            })?;
 
         let source_soft_delete_index = spec
             .soft_delete_column
@@ -102,6 +111,7 @@ impl CdcTableInfo {
             primary_key: spec.primary_key,
             soft_delete: spec.soft_delete,
             dest_source_indices,
+            source_primary_key_index,
             source_soft_delete_index,
         })
     }
@@ -325,68 +335,7 @@ impl EtlBigQueryDestination {
 
     pub async fn write_table_events(&self, table_id: TableId, events: Vec<Event>) -> EtlResult<()> {
         let info = self.get_table(table_id).await?;
-        let mut work = CdcCommitTableWork {
-            table_id,
-            rows: Vec::new(),
-            delete_rows: Vec::new(),
-            truncate: false,
-        };
-
-        for event in events {
-            match event {
-                Event::Insert(insert_event) => {
-                    if insert_event.table_id != table_id {
-                        return Err(etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "received mixed-table CDC insert batch"
-                        ));
-                    }
-                    work.rows.push(insert_event.table_row);
-                }
-                Event::Update(update_event) => {
-                    if update_event.table_id != table_id {
-                        return Err(etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "received mixed-table CDC update batch"
-                        ));
-                    }
-                    work.rows.push(update_event.table_row);
-                }
-                Event::Delete(delete_event) => {
-                    if delete_event.table_id != table_id {
-                        return Err(etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "received mixed-table CDC delete batch"
-                        ));
-                    }
-                    if !info.soft_delete {
-                        continue;
-                    }
-                    if let Some((_, old_row)) = delete_event.old_table_row {
-                        work.delete_rows.push(old_row);
-                    } else {
-                        warn!(
-                            table = %info.source_name,
-                            "skipping delete event without primary key"
-                        );
-                    }
-                }
-                Event::Truncate(truncate_event) => {
-                    if !truncate_event
-                        .rel_ids
-                        .iter()
-                        .any(|rel_id| TableId::new(*rel_id) == table_id)
-                    {
-                        return Err(etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "received mixed-table CDC truncate batch"
-                        ));
-                    }
-                    work.truncate = true;
-                }
-                Event::Begin(_) | Event::Commit(_) | Event::Relation(_) | Event::Unsupported => {}
-            }
-        }
+        let work = compact_table_events(&info, table_id, events)?;
 
         let synced_at = Utc::now();
         self.apply_table_work(&info, work, synced_at, synced_at)
@@ -506,6 +455,140 @@ async fn build_cdc_frame(
                 err.to_string()
             )
         })?
+}
+
+fn compact_table_events(
+    info: &CdcTableInfo,
+    table_id: TableId,
+    events: Vec<Event>,
+) -> EtlResult<CdcCommitTableWork> {
+    let mut row_actions: HashMap<String, PendingTableRowAction> = HashMap::new();
+    let mut truncate = false;
+
+    for event in events {
+        match event {
+            Event::Insert(insert_event) => {
+                if insert_event.table_id != table_id {
+                    return Err(etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "received mixed-table CDC insert batch"
+                    ));
+                }
+                let key = primary_key_identity(info, &insert_event.table_row)?;
+                row_actions.insert(key, PendingTableRowAction::Upsert(insert_event.table_row));
+            }
+            Event::Update(update_event) => {
+                if update_event.table_id != table_id {
+                    return Err(etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "received mixed-table CDC update batch"
+                    ));
+                }
+                let key = primary_key_identity(info, &update_event.table_row)?;
+                row_actions.insert(key, PendingTableRowAction::Upsert(update_event.table_row));
+            }
+            Event::Delete(delete_event) => {
+                if delete_event.table_id != table_id {
+                    return Err(etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "received mixed-table CDC delete batch"
+                    ));
+                }
+                if !info.soft_delete {
+                    continue;
+                }
+                if let Some((_, old_row)) = delete_event.old_table_row {
+                    let key = primary_key_identity(info, &old_row)?;
+                    row_actions.insert(key, PendingTableRowAction::Delete(old_row));
+                } else {
+                    warn!(
+                        table = %info.source_name,
+                        "skipping delete event without primary key"
+                    );
+                }
+            }
+            Event::Truncate(truncate_event) => {
+                if !truncate_event
+                    .rel_ids
+                    .iter()
+                    .any(|rel_id| TableId::new(*rel_id) == table_id)
+                {
+                    return Err(etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "received mixed-table CDC truncate batch"
+                    ));
+                }
+                truncate = true;
+                row_actions.clear();
+            }
+            Event::Begin(_) | Event::Commit(_) | Event::Relation(_) | Event::Unsupported => {}
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut delete_rows = Vec::new();
+    for action in row_actions.into_values() {
+        match action {
+            PendingTableRowAction::Upsert(row) => rows.push(row),
+            PendingTableRowAction::Delete(row) => delete_rows.push(row),
+        }
+    }
+
+    Ok(CdcCommitTableWork {
+        table_id,
+        rows,
+        delete_rows,
+        truncate,
+    })
+}
+
+fn primary_key_identity(info: &CdcTableInfo, row: &TableRow) -> EtlResult<String> {
+    let cell = row
+        .values
+        .get(info.source_primary_key_index)
+        .ok_or_else(|| {
+            etl::etl_error!(
+                ErrorKind::ConversionError,
+                "missing primary key value in CDC row",
+                info.primary_key.clone()
+            )
+        })?;
+    cell_identity_key(cell)
+}
+
+fn cell_identity_key(cell: &Cell) -> EtlResult<String> {
+    let key = match cell {
+        Cell::Null => {
+            return Err(etl::etl_error!(
+                ErrorKind::ConversionError,
+                "null primary key value in CDC row"
+            ));
+        }
+        Cell::Bool(value) => value.to_string(),
+        Cell::String(value) => value.clone(),
+        Cell::I16(value) => value.to_string(),
+        Cell::I32(value) => value.to_string(),
+        Cell::U32(value) => value.to_string(),
+        Cell::I64(value) => value.to_string(),
+        Cell::F32(value) => value.to_string(),
+        Cell::F64(value) => value.to_string(),
+        Cell::Numeric(value) => value.to_string(),
+        Cell::Date(value) => value.format("%Y-%m-%d").to_string(),
+        Cell::Time(value) => format_time(value),
+        Cell::Timestamp(value) => Utc.from_utc_datetime(value).to_rfc3339(),
+        Cell::TimestampTz(value) => value.to_rfc3339(),
+        Cell::Uuid(value) => value.to_string(),
+        Cell::Json(value) => value.to_string(),
+        Cell::Bytes(value) => encode_base64(value),
+        Cell::Array(array) => serde_json::to_string(&array_to_json(array)).map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::ConversionError,
+                "failed to encode array primary key",
+                err.to_string()
+            )
+        })?,
+    };
+    Ok(key)
 }
 
 fn table_rows_to_frame(
@@ -812,7 +895,10 @@ mod tests {
     use super::*;
     use crate::types::{ColumnSchema, DataType, TableSchema};
     use chrono::{DateTime, TimeZone, Utc};
-    use etl::types::{Cell, ColumnSchema as EtlColumnSchema, TableId, TableName, TableRow, Type};
+    use etl::types::{
+        Cell, ColumnSchema as EtlColumnSchema, DeleteEvent, Event, InsertEvent, TableId, TableName,
+        TableRow, TruncateEvent, Type, UpdateEvent,
+    };
 
     fn build_info() -> CdcTableInfo {
         let table_id = TableId::new(1);
@@ -935,5 +1021,94 @@ mod tests {
             frame.column("elapsed").expect("elapsed").dtype(),
             &PolarsDataType::Float64
         );
+    }
+
+    #[test]
+    fn compact_table_events_keeps_latest_row_per_primary_key() {
+        let info = build_info();
+        let table_id = info.table_id;
+        let events = vec![
+            Event::Insert(InsertEvent {
+                start_lsn: etl::types::PgLsn::from(0),
+                commit_lsn: etl::types::PgLsn::from(1),
+                table_id,
+                table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
+            }),
+            Event::Update(UpdateEvent {
+                start_lsn: etl::types::PgLsn::from(2),
+                commit_lsn: etl::types::PgLsn::from(3),
+                table_id,
+                table_row: TableRow::new(vec![Cell::I64(1), Cell::Bool(true)]),
+                old_table_row: None,
+            }),
+        ];
+
+        let work = compact_table_events(&info, table_id, events).expect("work");
+        assert!(!work.truncate);
+        assert_eq!(work.rows.len(), 1);
+        assert!(work.delete_rows.is_empty());
+        assert_eq!(
+            work.rows[0],
+            TableRow::new(vec![Cell::I64(1), Cell::Bool(true)])
+        );
+    }
+
+    #[test]
+    fn compact_table_events_delete_then_upsert_keeps_latest_live_row() {
+        let info = build_info();
+        let table_id = info.table_id;
+        let events = vec![
+            Event::Delete(DeleteEvent {
+                start_lsn: etl::types::PgLsn::from(0),
+                commit_lsn: etl::types::PgLsn::from(1),
+                table_id,
+                old_table_row: Some((false, TableRow::new(vec![Cell::I64(1), Cell::Null]))),
+            }),
+            Event::Update(UpdateEvent {
+                start_lsn: etl::types::PgLsn::from(2),
+                commit_lsn: etl::types::PgLsn::from(3),
+                table_id,
+                table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
+                old_table_row: None,
+            }),
+        ];
+
+        let work = compact_table_events(&info, table_id, events).expect("work");
+        assert_eq!(work.rows.len(), 1);
+        assert!(work.delete_rows.is_empty());
+    }
+
+    #[test]
+    fn compact_table_events_truncate_discards_prior_buffered_rows() {
+        let info = build_info();
+        let table_id = info.table_id;
+        let events = vec![
+            Event::Insert(InsertEvent {
+                start_lsn: etl::types::PgLsn::from(0),
+                commit_lsn: etl::types::PgLsn::from(1),
+                table_id,
+                table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
+            }),
+            Event::Truncate(TruncateEvent {
+                start_lsn: etl::types::PgLsn::from(2),
+                commit_lsn: etl::types::PgLsn::from(3),
+                options: 0,
+                rel_ids: vec![table_id.into_inner()],
+            }),
+            Event::Insert(InsertEvent {
+                start_lsn: etl::types::PgLsn::from(4),
+                commit_lsn: etl::types::PgLsn::from(5),
+                table_id,
+                table_row: TableRow::new(vec![Cell::I64(2), Cell::Null]),
+            }),
+        ];
+
+        let work = compact_table_events(&info, table_id, events).expect("work");
+        assert!(work.truncate);
+        assert_eq!(
+            work.rows,
+            vec![TableRow::new(vec![Cell::I64(2), Cell::Null])]
+        );
+        assert!(work.delete_rows.is_empty());
     }
 }

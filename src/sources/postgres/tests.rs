@@ -3,7 +3,9 @@ use super::*;
 use crate::destinations::Destination;
 use async_trait::async_trait;
 use polars::prelude::{NamedFrom, Series};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -46,12 +48,60 @@ fn maps_array_and_range_types_to_json() {
 #[test]
 fn snapshot_shutdown_requested_tracks_signal_state() {
     let (controller, signal) = crate::runner::ShutdownController::new();
-    assert!(!super::snapshot_sync::snapshot_shutdown_requested(Some(&signal)));
+    assert!(!super::snapshot_sync::snapshot_shutdown_requested(Some(
+        &signal
+    )));
 
     controller.shutdown();
 
-    assert!(super::snapshot_sync::snapshot_shutdown_requested(Some(&signal)));
+    assert!(super::snapshot_sync::snapshot_shutdown_requested(Some(
+        &signal
+    )));
     assert!(!super::snapshot_sync::snapshot_shutdown_requested(None));
+}
+
+#[test]
+fn next_cdc_wait_timeout_uses_pending_fill_deadline_when_sooner() {
+    let mut pending = HashMap::new();
+    pending.insert(
+        TableId::new(1),
+        super::cdc_pipeline::PendingTableApplyBatch {
+            sequences: vec![1],
+            events: Vec::new(),
+            event_count: 1,
+            first_buffered_at: Instant::now() - Duration::from_millis(1_500),
+        },
+    );
+
+    let timeout = super::cdc_runtime::next_cdc_wait_timeout(
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        &pending,
+    );
+    assert!(timeout <= Duration::from_millis(550));
+}
+
+#[test]
+fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
+    let mut pending = HashMap::new();
+    pending.insert(
+        TableId::new(1),
+        super::cdc_pipeline::PendingTableApplyBatch {
+            sequences: vec![1],
+            events: Vec::new(),
+            event_count: 1,
+            first_buffered_at: Instant::now() - Duration::from_secs(3),
+        },
+    );
+
+    assert!(super::cdc_runtime::cdc_fill_deadline_reached(
+        Duration::from_secs(2),
+        &pending,
+    ));
+    assert!(!super::cdc_runtime::cdc_fill_deadline_reached(
+        Duration::from_secs(5),
+        &pending,
+    ));
 }
 
 #[test]
@@ -740,8 +790,7 @@ fn cdc_slot_name_defaults_to_connection_scoped_name() {
 
 #[test]
 fn cdc_slot_name_sanitizes_connection_id() {
-    let slot_name =
-        super::cdc_sync::cdc_slot_name("App/Staging Public", None).expect("slot name");
+    let slot_name = super::cdc_sync::cdc_slot_name("App/Staging Public", None).expect("slot name");
     assert_eq!(slot_name, "cdsync_app_staging_public_cdc");
 }
 

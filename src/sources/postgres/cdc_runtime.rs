@@ -72,6 +72,8 @@ impl PostgresSource {
             pipeline_id,
             idle_timeout,
             max_pending_events,
+            apply_batch_size,
+            apply_max_fill,
             apply_concurrency,
             follow,
             shutdown,
@@ -105,17 +107,20 @@ impl PostgresSource {
         let mut shutdown_requested = false;
         let mut next_commit_sequence = 0u64;
         let mut queued_batches: VecDeque<CommittedCdcBatch> = VecDeque::new();
+        let mut pending_table_batches: HashMap<TableId, PendingTableApplyBatch> = HashMap::new();
         let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
         let mut watermark_tracker = CdcWatermarkTracker::default();
         let mut table_apply_locks: HashMap<TableId, Arc<Mutex<()>>> = HashMap::new();
-        let max_inflight_commits = apply_concurrency.max(1);
-        let max_commit_queue_depth = max_inflight_commits.saturating_mul(4).max(1);
+        let max_active_applies = apply_concurrency.max(1);
+        let max_commit_queue_depth = max_active_applies.saturating_mul(4).max(1);
 
         loop {
             if shutdown_requested && !in_tx {
                 break;
             }
 
+            let wait_timeout =
+                next_cdc_wait_timeout(idle_timeout, apply_max_fill, &pending_table_batches);
             let message = if let Some(shutdown) = shutdown.as_mut() {
                 tokio::select! {
                     changed = shutdown.changed(), if !shutdown_requested => {
@@ -128,11 +133,74 @@ impl PostgresSource {
                         }
                         continue;
                     }
-                    result = timeout(idle_timeout, stream.next()) => {
+                    result = inflight_apply.next(), if !inflight_apply.is_empty() => {
+                        for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+                            apply_cdc_watermark_advance(
+                                advance,
+                                &mut CdcWatermarkRuntime {
+                                    stats: &stats,
+                                    table_configs,
+                                    state,
+                                    state_handle: state_handle.as_ref(),
+                                },
+                                stream.as_mut(),
+                                last_received_lsn,
+                                &mut last_flushed_lsn,
+                            )
+                            .await?;
+                        }
+                        dispatch_cdc_batches(
+                            &mut queued_batches,
+                            &mut pending_table_batches,
+                            &mut inflight_apply,
+                            &mut watermark_tracker,
+                            dest,
+                            &mut table_apply_locks,
+                            CdcDispatchConfig {
+                                max_active_applies,
+                                apply_batch_size,
+                                max_fill: apply_max_fill,
+                                force_flush: false,
+                            },
+                        );
+                        crate::telemetry::record_cdc_pipeline_depths(
+                            slot_name,
+                            pending_events.len() as u64,
+                            (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches))
+                                as u64,
+                            watermark_tracker.inflight_commits() as u64,
+                        );
+                        continue;
+                    }
+                    result = timeout(wait_timeout, stream.next()) => {
                         match result {
                             Ok(Some(msg)) => msg?,
                             Ok(None) => break,
                             Err(_) => {
+                                if cdc_fill_deadline_reached(apply_max_fill, &pending_table_batches) {
+                                    dispatch_cdc_batches(
+                                        &mut queued_batches,
+                                        &mut pending_table_batches,
+                                        &mut inflight_apply,
+                                        &mut watermark_tracker,
+                                        dest,
+                                        &mut table_apply_locks,
+                                        CdcDispatchConfig {
+                                            max_active_applies,
+                                            apply_batch_size,
+                                            max_fill: apply_max_fill,
+                                            force_flush: true,
+                                        },
+                                    );
+                                    crate::telemetry::record_cdc_pipeline_depths(
+                                        slot_name,
+                                        pending_events.len() as u64,
+                                        (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches))
+                                            as u64,
+                                        watermark_tracker.inflight_commits() as u64,
+                                    );
+                                    continue;
+                                }
                                 if in_tx {
                                     continue;
                                 }
@@ -145,10 +213,74 @@ impl PostgresSource {
                     }
                 }
             } else {
-                match timeout(idle_timeout, stream.next()).await {
+                tokio::select! {
+                    result = inflight_apply.next(), if !inflight_apply.is_empty() => {
+                        for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+                            apply_cdc_watermark_advance(
+                                advance,
+                                &mut CdcWatermarkRuntime {
+                                    stats: &stats,
+                                    table_configs,
+                                    state,
+                                    state_handle: state_handle.as_ref(),
+                                },
+                                stream.as_mut(),
+                                last_received_lsn,
+                                &mut last_flushed_lsn,
+                            )
+                            .await?;
+                        }
+                        dispatch_cdc_batches(
+                            &mut queued_batches,
+                            &mut pending_table_batches,
+                            &mut inflight_apply,
+                            &mut watermark_tracker,
+                            dest,
+                            &mut table_apply_locks,
+                            CdcDispatchConfig {
+                                max_active_applies,
+                                apply_batch_size,
+                                max_fill: apply_max_fill,
+                                force_flush: false,
+                            },
+                        );
+                        crate::telemetry::record_cdc_pipeline_depths(
+                            slot_name,
+                            pending_events.len() as u64,
+                            (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches))
+                                as u64,
+                            watermark_tracker.inflight_commits() as u64,
+                        );
+                        continue;
+                    }
+                    result = timeout(wait_timeout, stream.next()) => match result {
                     Ok(Some(msg)) => msg?,
                     Ok(None) => break,
                     Err(_) => {
+                        if cdc_fill_deadline_reached(apply_max_fill, &pending_table_batches) {
+                            dispatch_cdc_batches(
+                                &mut queued_batches,
+                                &mut pending_table_batches,
+                                &mut inflight_apply,
+                                &mut watermark_tracker,
+                                dest,
+                                &mut table_apply_locks,
+                                CdcDispatchConfig {
+                                    max_active_applies,
+                                    apply_batch_size,
+                                    max_fill: apply_max_fill,
+                                    force_flush: true,
+                                },
+                            );
+                            crate::telemetry::record_cdc_pipeline_depths(
+                                slot_name,
+                                pending_events.len() as u64,
+                                (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches))
+                                    as u64,
+                                watermark_tracker.inflight_commits() as u64,
+                            );
+                            continue;
+                        }
                         if in_tx {
                             continue;
                         }
@@ -157,7 +289,7 @@ impl PostgresSource {
                         }
                         break;
                     }
-                }
+                }}
             };
 
             match message {
@@ -217,46 +349,65 @@ impl PostgresSource {
 
                             dispatch_cdc_batches(
                                 &mut queued_batches,
+                                &mut pending_table_batches,
                                 &mut inflight_apply,
                                 &mut watermark_tracker,
                                 dest,
                                 &mut table_apply_locks,
-                                max_inflight_commits,
+                                CdcDispatchConfig {
+                                    max_active_applies,
+                                    apply_batch_size,
+                                    max_fill: apply_max_fill,
+                                    force_flush: false,
+                                },
                             );
                             crate::telemetry::record_cdc_pipeline_depths(
                                 slot_name,
                                 pending_events.len() as u64,
-                                queued_batches.len() as u64,
+                                (queued_batches.len()
+                                    + pending_cdc_commit_count(&pending_table_batches))
+                                    as u64,
                                 watermark_tracker.inflight_commits() as u64,
                             );
 
-                            while queued_batches.len() >= max_commit_queue_depth {
+                            while watermark_tracker.inflight_commits() >= max_commit_queue_depth {
                                 crate::telemetry::record_cdc_backpressure_wait(
                                     slot_name,
-                                    queued_batches.len() as u64,
+                                    watermark_tracker.inflight_commits() as u64,
                                     max_commit_queue_depth as u64,
                                 );
-                                let Some(advance) = drain_one_cdc_apply(
+                                dispatch_cdc_batches(
+                                    &mut queued_batches,
+                                    &mut pending_table_batches,
                                     &mut inflight_apply,
                                     &mut watermark_tracker,
-                                )
-                                .await?
-                                else {
-                                    break;
-                                };
-                                apply_cdc_watermark_advance(
-                                    advance,
-                                    &mut CdcWatermarkRuntime {
-                                        stats: &stats,
-                                        table_configs,
-                                        state,
-                                        state_handle: state_handle.as_ref(),
+                                    dest,
+                                    &mut table_apply_locks,
+                                    CdcDispatchConfig {
+                                        max_active_applies,
+                                        apply_batch_size,
+                                        max_fill: apply_max_fill,
+                                        force_flush: true,
                                     },
-                                    stream.as_mut(),
-                                    last_received_lsn,
-                                    &mut last_flushed_lsn,
-                                )
-                                .await?;
+                                );
+                                for advance in
+                                    drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker)
+                                        .await?
+                                {
+                                    apply_cdc_watermark_advance(
+                                        advance,
+                                        &mut CdcWatermarkRuntime {
+                                            stats: &stats,
+                                            table_configs,
+                                            state,
+                                            state_handle: state_handle.as_ref(),
+                                        },
+                                        stream.as_mut(),
+                                        last_received_lsn,
+                                        &mut last_flushed_lsn,
+                                    )
+                                    .await?;
+                                }
                             }
                             in_tx = false;
                         }
@@ -265,11 +416,55 @@ impl PostgresSource {
                             if !include_tables.contains(&table_id) {
                                 continue;
                             }
+                            dispatch_cdc_batches(
+                                &mut queued_batches,
+                                &mut pending_table_batches,
+                                &mut inflight_apply,
+                                &mut watermark_tracker,
+                                dest,
+                                &mut table_apply_locks,
+                                CdcDispatchConfig {
+                                    max_active_applies,
+                                    apply_batch_size,
+                                    max_fill: apply_max_fill,
+                                    force_flush: false,
+                                },
+                            );
                             let table_lock = table_apply_locks
                                 .entry(table_id)
                                 .or_insert_with(|| Arc::new(Mutex::new(())))
                                 .clone();
                             let _guard = table_lock.lock().await;
+                            if let Some(pending_batch) = pending_table_batches.remove(&table_id) {
+                                dest.write_table_events(table_id, pending_batch.events)
+                                    .await
+                                    .map_err(|err| {
+                                        anyhow::anyhow!(
+                                            "applying buffered CDC table batch for {} before schema update failed: {}",
+                                            table_id.into_inner(),
+                                            err
+                                        )
+                                    })?;
+                                for sequence in pending_batch.sequences {
+                                    if let Some(advance) =
+                                        watermark_tracker.complete_fragment(sequence)?
+                                    {
+                                        apply_cdc_watermark_advance(
+                                            advance,
+                                            &mut CdcWatermarkRuntime {
+                                                stats: &stats,
+                                                table_configs,
+                                                state,
+                                                state_handle: state_handle.as_ref(),
+                                            },
+                                            stream.as_mut(),
+                                            last_received_lsn,
+                                            &mut last_flushed_lsn,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                             let mut relation_runtime = CdcRelationRuntime {
                                 table_configs,
                                 store,
@@ -422,9 +617,67 @@ impl PostgresSource {
             }
 
             while let Some(result) = inflight_apply.next().now_or_never() {
-                let Some(advance) = handle_cdc_apply_result(result, &mut watermark_tracker)? else {
-                    continue;
-                };
+                for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+                    apply_cdc_watermark_advance(
+                        advance,
+                        &mut CdcWatermarkRuntime {
+                            stats: &stats,
+                            table_configs,
+                            state,
+                            state_handle: state_handle.as_ref(),
+                        },
+                        stream.as_mut(),
+                        last_received_lsn,
+                        &mut last_flushed_lsn,
+                    )
+                    .await?;
+                }
+            }
+
+            dispatch_cdc_batches(
+                &mut queued_batches,
+                &mut pending_table_batches,
+                &mut inflight_apply,
+                &mut watermark_tracker,
+                dest,
+                &mut table_apply_locks,
+                CdcDispatchConfig {
+                    max_active_applies,
+                    apply_batch_size,
+                    max_fill: apply_max_fill,
+                    force_flush: false,
+                },
+            );
+            crate::telemetry::record_cdc_pipeline_depths(
+                slot_name,
+                pending_events.len() as u64,
+                (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches)) as u64,
+                watermark_tracker.inflight_commits() as u64,
+            );
+        }
+
+        dispatch_cdc_batches(
+            &mut queued_batches,
+            &mut pending_table_batches,
+            &mut inflight_apply,
+            &mut watermark_tracker,
+            dest,
+            &mut table_apply_locks,
+            CdcDispatchConfig {
+                max_active_applies,
+                apply_batch_size,
+                max_fill: apply_max_fill,
+                force_flush: true,
+            },
+        );
+        crate::telemetry::record_cdc_pipeline_depths(
+            slot_name,
+            pending_events.len() as u64,
+            (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches)) as u64,
+            watermark_tracker.inflight_commits() as u64,
+        );
+        while !inflight_apply.is_empty() || !pending_table_batches.is_empty() {
+            for advance in drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker).await? {
                 apply_cdc_watermark_advance(
                     advance,
                     &mut CdcWatermarkRuntime {
@@ -439,57 +692,24 @@ impl PostgresSource {
                 )
                 .await?;
             }
-
-            crate::telemetry::record_cdc_pipeline_depths(
-                slot_name,
-                pending_events.len() as u64,
-                queued_batches.len() as u64,
-                watermark_tracker.inflight_commits() as u64,
-            );
-        }
-
-        dispatch_cdc_batches(
-            &mut queued_batches,
-            &mut inflight_apply,
-            &mut watermark_tracker,
-            dest,
-            &mut table_apply_locks,
-            max_inflight_commits,
-        );
-        crate::telemetry::record_cdc_pipeline_depths(
-            slot_name,
-            pending_events.len() as u64,
-            queued_batches.len() as u64,
-            watermark_tracker.inflight_commits() as u64,
-        );
-        while let Some(advance) =
-            drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker).await?
-        {
-            apply_cdc_watermark_advance(
-                advance,
-                &mut CdcWatermarkRuntime {
-                    stats: &stats,
-                    table_configs,
-                    state,
-                    state_handle: state_handle.as_ref(),
-                },
-                stream.as_mut(),
-                last_received_lsn,
-                &mut last_flushed_lsn,
-            )
-            .await?;
             dispatch_cdc_batches(
                 &mut queued_batches,
+                &mut pending_table_batches,
                 &mut inflight_apply,
                 &mut watermark_tracker,
                 dest,
                 &mut table_apply_locks,
-                max_inflight_commits,
+                CdcDispatchConfig {
+                    max_active_applies,
+                    apply_batch_size,
+                    max_fill: apply_max_fill,
+                    force_flush: true,
+                },
             );
             crate::telemetry::record_cdc_pipeline_depths(
                 slot_name,
                 pending_events.len() as u64,
-                queued_batches.len() as u64,
+                (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches)) as u64,
                 watermark_tracker.inflight_commits() as u64,
             );
         }
@@ -629,4 +849,34 @@ impl PostgresSource {
 
         Ok(())
     }
+}
+
+pub(super) fn next_cdc_wait_timeout(
+    idle_timeout: Duration,
+    apply_max_fill: Duration,
+    pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
+) -> Duration {
+    let now = Instant::now();
+    pending_table_batches
+        .values()
+        .map(|pending| {
+            pending
+                .first_buffered_at
+                .checked_add(apply_max_fill)
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO)
+        })
+        .min()
+        .map(|pending_timeout| pending_timeout.min(idle_timeout))
+        .unwrap_or(idle_timeout)
+}
+
+pub(super) fn cdc_fill_deadline_reached(
+    apply_max_fill: Duration,
+    pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
+) -> bool {
+    let now = Instant::now();
+    pending_table_batches
+        .values()
+        .any(|pending| now.duration_since(pending.first_buffered_at) >= apply_max_fill)
 }

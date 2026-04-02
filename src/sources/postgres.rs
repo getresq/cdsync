@@ -193,6 +193,8 @@ struct CdcStreamConfig<'a> {
     pipeline_id: u64,
     idle_timeout: Duration,
     max_pending_events: usize,
+    apply_batch_size: usize,
+    apply_max_fill: Duration,
     apply_concurrency: usize,
     follow: bool,
     shutdown: Option<ShutdownSignal>,

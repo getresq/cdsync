@@ -231,6 +231,9 @@ impl PostgresSource {
             .unwrap_or(default_batch_size);
         let snapshot_concurrency = snapshot_concurrency.max(1);
         let cdc_apply_concurrency = self.config.cdc_apply_concurrency(snapshot_concurrency);
+        let cdc_apply_batch_size = batch_size.max(1);
+        let cdc_apply_max_fill =
+            Duration::from_millis(self.config.cdc_max_fill_ms.unwrap_or(2_000).max(1));
         let max_pending_events = self.config.cdc_max_pending_events.unwrap_or(100_000);
         let idle_timeout = Duration::from_secs(self.config.cdc_idle_timeout_seconds.unwrap_or(10));
 
@@ -781,6 +784,8 @@ impl PostgresSource {
                     pipeline_id: stream_pipeline_id,
                     idle_timeout,
                     max_pending_events,
+                    apply_batch_size: cdc_apply_batch_size,
+                    apply_max_fill: cdc_apply_max_fill,
                     apply_concurrency: cdc_apply_concurrency,
                     follow,
                     shutdown: shutdown.clone(),

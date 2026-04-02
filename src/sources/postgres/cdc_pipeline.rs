@@ -13,7 +13,7 @@ pub(super) struct CdcTableApplyBatch {
 }
 
 pub(super) struct CdcApplyFragmentAck {
-    pub(super) sequence: u64,
+    pub(super) sequences: Vec<u64>,
 }
 
 pub(super) struct CommitTrackerEntry {
@@ -38,6 +38,20 @@ pub(super) struct CdcWatermarkRuntime<'a> {
     pub(super) table_configs: &'a HashMap<TableId, ResolvedPostgresTable>,
     pub(super) state: &'a mut ConnectionState,
     pub(super) state_handle: Option<&'a StateHandle>,
+}
+
+pub(super) struct PendingTableApplyBatch {
+    pub(super) sequences: Vec<u64>,
+    pub(super) events: Vec<Event>,
+    pub(super) event_count: usize,
+    pub(super) first_buffered_at: Instant,
+}
+
+pub(super) struct CdcDispatchConfig {
+    pub(super) max_active_applies: usize,
+    pub(super) apply_batch_size: usize,
+    pub(super) max_fill: Duration,
+    pub(super) force_flush: bool,
 }
 
 impl CdcWatermarkTracker {
@@ -144,15 +158,14 @@ pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableAp
 
 pub(super) fn dispatch_cdc_batches(
     queued_batches: &mut VecDeque<CommittedCdcBatch>,
+    pending_table_batches: &mut HashMap<TableId, PendingTableApplyBatch>,
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
     watermark_tracker: &mut CdcWatermarkTracker,
     dest: &EtlBigQueryDestination,
     table_apply_locks: &mut HashMap<TableId, Arc<Mutex<()>>>,
-    max_inflight_commits: usize,
+    config: CdcDispatchConfig,
 ) {
-    while !queued_batches.is_empty() && watermark_tracker.inflight_commits() < max_inflight_commits
-    {
-        let batch = queued_batches.pop_front().expect("queue is not empty");
+    while let Some(batch) = queued_batches.pop_front() {
         let fragment_count = batch.table_batches.len().max(1);
         watermark_tracker.register_commit(
             batch.sequence,
@@ -162,56 +175,107 @@ pub(super) fn dispatch_cdc_batches(
         );
 
         if batch.table_batches.is_empty() {
-            let sequence = batch.sequence;
+            let sequences = vec![batch.sequence];
             inflight_apply.push(Box::pin(
-                async move { Ok(CdcApplyFragmentAck { sequence }) },
+                async move { Ok(CdcApplyFragmentAck { sequences }) },
             ));
             continue;
         }
 
         for table_batch in batch.table_batches {
-            let table_lock = table_apply_locks
+            let event_count = table_batch.events.len().max(1);
+            let pending = pending_table_batches
                 .entry(table_batch.table_id)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-            let apply_dest = dest.clone();
-            let sequence = batch.sequence;
-            let table_id = table_batch.table_id;
-            inflight_apply.push(Box::pin(async move {
-                let _guard = table_lock.lock().await;
-                apply_dest
-                    .write_table_events(table_id, table_batch.events)
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "applying CDC table batch for {} failed: {}",
-                            table_id.into_inner(),
-                            err
-                        )
-                    })?;
-                Ok(CdcApplyFragmentAck { sequence })
-            }));
+                .or_insert_with(|| PendingTableApplyBatch {
+                    sequences: Vec::new(),
+                    events: Vec::new(),
+                    event_count: 0,
+                    first_buffered_at: Instant::now(),
+                });
+            pending.sequences.push(batch.sequence);
+            pending.event_count += event_count;
+            pending.events.extend(table_batch.events);
         }
+    }
+
+    let now = Instant::now();
+    let mut ready_tables: Vec<(u64, TableId)> = pending_table_batches
+        .iter()
+        .filter_map(|(table_id, pending)| {
+            let should_flush = config.force_flush
+                || pending.event_count >= config.apply_batch_size
+                || now.duration_since(pending.first_buffered_at) >= config.max_fill;
+            should_flush.then_some((
+                pending.sequences.first().copied().unwrap_or_default(),
+                *table_id,
+            ))
+        })
+        .collect();
+    ready_tables.sort_by_key(|(sequence, _)| *sequence);
+
+    for (_, table_id) in ready_tables {
+        if inflight_apply.len() >= config.max_active_applies {
+            break;
+        }
+        let pending = pending_table_batches
+            .remove(&table_id)
+            .expect("pending batch missing for ready table");
+        let table_lock = table_apply_locks
+            .entry(table_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let apply_dest = dest.clone();
+        let sequences = pending.sequences;
+        let events = pending.events;
+        inflight_apply.push(Box::pin(async move {
+            let _guard = table_lock.lock().await;
+            apply_dest
+                .write_table_events(table_id, events)
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "applying CDC table batch for {} failed: {}",
+                        table_id.into_inner(),
+                        err
+                    )
+                })?;
+            Ok(CdcApplyFragmentAck { sequences })
+        }));
     }
 }
 
 pub(super) fn handle_cdc_apply_result(
     result: Option<Result<CdcApplyFragmentAck>>,
     watermark_tracker: &mut CdcWatermarkTracker,
-) -> Result<Option<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcWatermarkAdvance>> {
     let Some(result) = result else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let ack = result?;
-    watermark_tracker.complete_fragment(ack.sequence)
+    let mut advances = Vec::new();
+    for sequence in ack.sequences {
+        if let Some(advance) = watermark_tracker.complete_fragment(sequence)? {
+            advances.push(advance);
+        }
+    }
+    Ok(advances)
 }
 
 pub(super) async fn drain_one_cdc_apply(
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
     watermark_tracker: &mut CdcWatermarkTracker,
-) -> Result<Option<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcWatermarkAdvance>> {
     let result = inflight_apply.next().await;
     handle_cdc_apply_result(result, watermark_tracker)
+}
+
+pub(super) fn pending_cdc_commit_count(
+    pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
+) -> usize {
+    pending_table_batches
+        .values()
+        .map(|pending| pending.sequences.len())
+        .sum()
 }
 
 pub(super) async fn apply_cdc_watermark_advance(
