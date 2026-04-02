@@ -22,7 +22,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: useblacksmith/rust-cache@v3
         with:
-          cache-workspace-crates: true
+          shared-key: cdsync-${{ runner.os }}-${{ runner.arch }}-cargo
+          cache-targets: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Show sccache stats
@@ -40,7 +43,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: useblacksmith/rust-cache@v3
         with:
-          cache-workspace-crates: true
+          shared-key: cdsync-${{ runner.os }}-${{ runner.arch }}-cargo
+          cache-targets: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Show sccache stats
@@ -58,7 +64,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: useblacksmith/rust-cache@v3
         with:
-          cache-workspace-crates: true
+          shared-key: cdsync-${{ runner.os }}-${{ runner.arch }}-cargo
+          cache-targets: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Unit and non-ignored integration tests
         run: cargo test
       - name: Show sccache stats
@@ -76,7 +85,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: useblacksmith/rust-cache@v3
         with:
-          cache-workspace-crates: true
+          shared-key: cdsync-${{ runner.os }}-${{ runner.arch }}-cargo
+          cache-targets: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: Start emulator services
