@@ -1,4 +1,5 @@
 use super::*;
+use rustls::pki_types::pem::PemObject;
 
 pub(super) async fn write_snapshot_batch(
     dest: &dyn Destination,
@@ -786,11 +787,7 @@ async fn connect_replication_control_client(
 
     if pg_config.tls.enabled {
         let mut builder = native_tls::TlsConnector::builder();
-        if !pg_config.tls.trusted_root_certs.is_empty() {
-            builder.add_root_certificate(Certificate::from_pem(
-                pg_config.tls.trusted_root_certs.as_bytes(),
-            )?);
-        }
+        add_native_tls_root_certs(&mut builder, &pg_config.tls.trusted_root_certs)?;
         let connector = MakeNativeTlsConnect::new(builder.build()?);
         let (client, connection) = config.connect(connector).await?;
         tokio::spawn(async move {
@@ -825,11 +822,7 @@ async fn connect_snapshot_reader_client(pg_config: &PgConnectionConfig) -> Resul
 
     if pg_config.tls.enabled {
         let mut builder = native_tls::TlsConnector::builder();
-        if !pg_config.tls.trusted_root_certs.is_empty() {
-            builder.add_root_certificate(Certificate::from_pem(
-                pg_config.tls.trusted_root_certs.as_bytes(),
-            )?);
-        }
+        add_native_tls_root_certs(&mut builder, &pg_config.tls.trusted_root_certs)?;
         let connector = MakeNativeTlsConnect::new(builder.build()?);
         let (client, connection) = config.connect(connector).await?;
         tokio::spawn(async move {
@@ -848,6 +841,17 @@ async fn connect_snapshot_reader_client(pg_config: &PgConnectionConfig) -> Resul
         });
         Ok(client)
     }
+}
+
+fn add_native_tls_root_certs(
+    builder: &mut native_tls::TlsConnectorBuilder,
+    pem_bundle: &str,
+) -> Result<()> {
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem_bundle.as_bytes()) {
+        let cert = cert?;
+        builder.add_root_certificate(Certificate::from_der(cert.as_ref())?);
+    }
+    Ok(())
 }
 
 async fn create_exported_snapshot_slot_info(
