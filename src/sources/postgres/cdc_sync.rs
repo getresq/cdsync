@@ -218,6 +218,7 @@ impl PostgresSource {
             .publication
             .as_deref()
             .context("postgres.publication is required when CDC is enabled")?;
+        let publication_mode = self.config.publication_mode();
         let pipeline_id = self.config.cdc_pipeline_id;
         let stream_pipeline_id = pipeline_id.unwrap_or(1);
         let batch_size = self
@@ -234,8 +235,15 @@ impl PostgresSource {
 
         self.validate_wal_level().await?;
 
-        if !replication_client.publication_exists(publication).await? {
-            anyhow::bail!("publication '{}' does not exist", publication);
+        match publication_mode {
+            crate::config::PostgresPublicationMode::Validate => {
+                if !replication_client.publication_exists(publication).await? {
+                    anyhow::bail!("publication '{}' does not exist", publication);
+                }
+            }
+            crate::config::PostgresPublicationMode::Manage => {
+                self.reconcile_publication(publication, tables).await?;
+            }
         }
 
         self.validate_publication_tables(&replication_client, publication, tables)
@@ -778,13 +786,22 @@ impl PostgresSource {
             .publication
             .as_deref()
             .context("postgres.publication is required when CDC is enabled")?;
+        let publication_mode = self.config.publication_mode();
 
         self.validate_wal_level().await?;
 
         let pg_config = self.build_pg_connection_config().await?;
         let replication_client = PgReplicationClient::connect(pg_config.clone()).await?;
-        if !replication_client.publication_exists(publication).await? {
-            anyhow::bail!("publication '{}' does not exist", publication);
+
+        match publication_mode {
+            crate::config::PostgresPublicationMode::Validate => {
+                if !replication_client.publication_exists(publication).await? {
+                    anyhow::bail!("publication '{}' does not exist", publication);
+                }
+            }
+            crate::config::PostgresPublicationMode::Manage => {
+                self.reconcile_publication(publication, tables).await?;
+            }
         }
 
         self.validate_publication_tables(&replication_client, publication, tables)
@@ -892,6 +909,57 @@ impl PostgresSource {
             }
         }
         Ok(())
+    }
+
+    async fn reconcile_publication(
+        &self,
+        publication: &str,
+        tables: &[ResolvedPostgresTable],
+    ) -> Result<()> {
+        let publication_sql = quote_pg_identifier(publication);
+        let exists: bool = sqlx::query_scalar("select exists(select 1 from pg_publication where pubname = $1)")
+            .bind(publication)
+            .fetch_one(&self.pool)
+            .await?;
+        if !exists {
+            sqlx::query(&format!("create publication {};", publication_sql))
+                .execute(&self.pool)
+                .await?;
+        }
+
+        let table_list = Self::publication_table_spec_list(tables);
+
+        let statement = if table_list.is_empty() {
+            format!("alter publication {} set table;", publication_sql)
+        } else {
+            format!(
+                "alter publication {} set table {};",
+                publication_sql, table_list
+            )
+        };
+        sqlx::query(&statement).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub(super) fn publication_table_spec(table: &ResolvedPostgresTable) -> String {
+        let (schema_name, table_name) = split_table_name(&table.name);
+        let qualified = format!(
+            "{}.{}",
+            quote_pg_identifier(&schema_name),
+            quote_pg_identifier(&table_name)
+        );
+        match &table.where_clause {
+            Some(where_clause) => format!("{qualified} WHERE ({where_clause})"),
+            None => qualified,
+        }
+    }
+
+    pub(super) fn publication_table_spec_list(tables: &[ResolvedPostgresTable]) -> String {
+        tables
+            .iter()
+            .map(Self::publication_table_spec)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     async fn load_publication_filters(

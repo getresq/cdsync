@@ -77,6 +77,7 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
         batch_size: Some(1000),
         cdc: Some(true),
         publication: Some(publication.clone()),
+        publication_mode: None,
         schema_changes: Some(SchemaChangePolicy::Auto),
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(1000),

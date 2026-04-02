@@ -541,6 +541,37 @@ fn test_resolved_table(name: &str) -> ResolvedPostgresTable {
 }
 
 #[test]
+fn publication_table_spec_quotes_table_name() {
+    let table = test_resolved_table("public.accounts");
+    assert_eq!(
+        super::PostgresSource::publication_table_spec(&table),
+        "\"public\".\"accounts\""
+    );
+}
+
+#[test]
+fn publication_table_spec_includes_row_filter() {
+    let mut table = test_resolved_table("public.accounts");
+    table.where_clause = Some("tenant_id = 42".to_string());
+    assert_eq!(
+        super::PostgresSource::publication_table_spec(&table),
+        "\"public\".\"accounts\" WHERE (tenant_id = 42)"
+    );
+}
+
+#[test]
+fn publication_table_spec_list_joins_tables() {
+    let first = test_resolved_table("public.accounts");
+    let mut second = test_resolved_table("public.users");
+    second.where_clause = Some("deleted_at is null".to_string());
+
+    assert_eq!(
+        super::PostgresSource::publication_table_spec_list(&[first, second]),
+        "\"public\".\"accounts\", \"public\".\"users\" WHERE (deleted_at is null)"
+    );
+}
+
+#[test]
 fn initial_snapshot_table_ids_select_new_tables_under_existing_cdc_lsn() {
     let table_accounts = TableId::new(1);
     let table_messages = TableId::new(2);

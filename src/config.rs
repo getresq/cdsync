@@ -293,6 +293,7 @@ pub struct PostgresConfig {
     pub batch_size: Option<usize>,
     pub cdc: Option<bool>,
     pub publication: Option<String>,
+    pub publication_mode: Option<PostgresPublicationMode>,
     pub schema_changes: Option<SchemaChangePolicy>,
     pub cdc_pipeline_id: Option<u64>,
     pub cdc_batch_size: Option<usize>,
@@ -305,6 +306,12 @@ pub struct PostgresConfig {
 }
 
 impl PostgresConfig {
+    pub fn publication_mode(&self) -> PostgresPublicationMode {
+        self.publication_mode
+            .clone()
+            .unwrap_or(PostgresPublicationMode::Validate)
+    }
+
     pub fn schema_policy(&self) -> SchemaChangePolicy {
         self.schema_changes
             .clone()
@@ -337,6 +344,13 @@ impl PostgresConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresPublicationMode {
+    Validate,
+    Manage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,6 +570,7 @@ connections:
       url: "postgres://user:pass@host:5432/db"
       cdc: true
       publication: "cdsync_publication"
+      publication_mode: validate
       schema_changes: auto
       cdc_pipeline_id: 1
       cdc_batch_size: 10000

@@ -89,6 +89,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         batch_size: Some(200),
         cdc: Some(true),
         publication: Some(publication.clone()),
+        publication_mode: None,
         schema_changes: Some(SchemaChangePolicy::Auto),
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(200),

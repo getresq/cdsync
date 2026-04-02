@@ -143,6 +143,7 @@ fn test_config() -> Config {
                 batch_size: Some(1000),
                 cdc: Some(true),
                 publication: Some("cdsync_pub".to_string()),
+                publication_mode: None,
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: Some(1),
                 cdc_batch_size: Some(1000),

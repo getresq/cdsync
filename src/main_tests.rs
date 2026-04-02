@@ -92,6 +92,7 @@ mod sync_selection_tests {
                 batch_size: Some(100),
                 cdc: Some(false),
                 publication: None,
+                publication_mode: None,
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: None,
                 cdc_batch_size: None,
