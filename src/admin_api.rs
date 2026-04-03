@@ -529,11 +529,12 @@ enum PostgresCdcRuntimeState {
     Following,
     Initializing,
     ContinuityLost,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
 struct PostgresCdcSlotSnapshot {
-    slot_name: String,
+    slot_name: Option<String>,
     active: bool,
     restart_lsn: Option<String>,
     confirmed_flush_lsn: Option<String>,
@@ -1056,9 +1057,15 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
     let connection_state = sync_state.connections.get(&cursor.connection_id).cloned();
     let (current_run, run_tables, live_snapshot) =
         load_current_run_view(&cursor.state, &cursor.connection_id).await?;
-    let cdc_runtime_state =
-        load_postgres_cdc_runtime_state(connection, connection_state.as_ref()).await;
-    let cdc_slot_snapshot = load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await;
+    let cdc_probe = load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await;
+    let cdc_slot_snapshot = match &cdc_probe {
+        Ok(snapshot) => snapshot.clone(),
+        Err(()) => None,
+    };
+    let cdc_runtime_state = match &cdc_probe {
+        Ok(snapshot) => postgres_cdc_runtime_state_from_snapshot(snapshot.as_ref()),
+        Err(()) => Some(PostgresCdcRuntimeState::Unknown),
+    };
     let runtime = derive_connection_runtime(
         connection,
         connection_state.as_ref(),
@@ -1118,7 +1125,9 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
         &cursor.connection_id,
         "connection.cdc",
         ConnectionCdcData {
-            slot_name: cdc_slot_snapshot.as_ref().map(|snapshot| snapshot.slot_name.clone()),
+            slot_name: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.slot_name.clone()),
             slot_active: cdc_slot_snapshot.as_ref().map(|snapshot| snapshot.active),
             current_wal_lsn: cdc_slot_snapshot
                 .as_ref()
@@ -1240,7 +1249,7 @@ fn select_active_tables(tables: &[TableProgress]) -> Vec<TableProgress> {
     tables
         .iter()
         .filter(|table| {
-            table.phase != "healthy"
+            matches!(table.phase, "error" | "blocked")
                 || table.snapshot_chunks_total > 0
                 || table.stats.as_ref().is_some_and(|stats| {
                     stats.rows_read > 0
@@ -1350,12 +1359,12 @@ fn classify_error_reason(error: Option<&str>) -> &'static str {
 async fn load_postgres_cdc_slot_snapshot(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
-) -> Option<PostgresCdcSlotSnapshot> {
+) -> Result<Option<PostgresCdcSlotSnapshot>, ()> {
     let SourceConfig::Postgres(pg) = &connection.source else {
-        return None;
+        return Ok(None);
     };
     if !pg.cdc.unwrap_or(true) {
-        return None;
+        return Ok(None);
     }
 
     let slot_name = state
@@ -1363,11 +1372,24 @@ async fn load_postgres_cdc_slot_snapshot(
         .and_then(|cdc_state| cdc_state.slot_name.clone())
         .or_else(|| {
             crate::sources::postgres::admin_cdc_slot_name(&connection.id, pg.cdc_pipeline_id).ok()
-        })?;
+        });
     let has_last_lsn = state
         .and_then(|state| state.postgres_cdc.as_ref())
         .and_then(|cdc_state| cdc_state.last_lsn.as_ref())
         .is_some();
+
+    let Some(slot_name) = slot_name else {
+        return Ok(Some(PostgresCdcSlotSnapshot {
+            slot_name: None,
+            active: false,
+            restart_lsn: None,
+            confirmed_flush_lsn: None,
+            current_wal_lsn: None,
+            wal_bytes_retained_by_slot: None,
+            wal_bytes_behind_confirmed: None,
+            continuity_lost: false,
+        }));
+    };
 
     let pool = match PgPoolOptions::new()
         .max_connections(1)
@@ -1381,7 +1403,7 @@ async fn load_postgres_cdc_slot_snapshot(
                 error = %err,
                 "failed to inspect postgres CDC slot snapshot"
             );
-            return None;
+            return Err(());
         }
     };
 
@@ -1413,7 +1435,7 @@ async fn load_postgres_cdc_slot_snapshot(
                 error = %err,
                 "failed to query postgres CDC slot snapshot"
             );
-            return None;
+            return Err(());
         }
         Err(_) => {
             warn!(
@@ -1421,13 +1443,13 @@ async fn load_postgres_cdc_slot_snapshot(
                 slot_name = %slot_name,
                 "timed out while inspecting postgres CDC slot snapshot"
             );
-            return None;
+            return Err(());
         }
     };
 
-    match row {
+    Ok(match row {
         Some(row) => Some(PostgresCdcSlotSnapshot {
-            slot_name,
+            slot_name: Some(slot_name),
             active: row.try_get("active").unwrap_or(false),
             restart_lsn: row.try_get("restart_lsn").ok(),
             confirmed_flush_lsn: row.try_get("confirmed_flush_lsn").ok(),
@@ -1437,7 +1459,7 @@ async fn load_postgres_cdc_slot_snapshot(
             continuity_lost: false,
         }),
         None => Some(PostgresCdcSlotSnapshot {
-            slot_name,
+            slot_name: Some(slot_name),
             active: false,
             restart_lsn: None,
             confirmed_flush_lsn: None,
@@ -1446,7 +1468,7 @@ async fn load_postgres_cdc_slot_snapshot(
             wal_bytes_behind_confirmed: None,
             continuity_lost: has_last_lsn,
         }),
-    }
+    })
 }
 
 async fn load_postgres_cdc_runtime_state(
@@ -1460,7 +1482,16 @@ async fn load_postgres_cdc_runtime_state(
         return None;
     }
 
-    let snapshot = load_postgres_cdc_slot_snapshot(connection, state).await?;
+    match load_postgres_cdc_slot_snapshot(connection, state).await {
+        Ok(snapshot) => postgres_cdc_runtime_state_from_snapshot(snapshot.as_ref()),
+        Err(()) => Some(PostgresCdcRuntimeState::Unknown),
+    }
+}
+
+fn postgres_cdc_runtime_state_from_snapshot(
+    snapshot: Option<&PostgresCdcSlotSnapshot>,
+) -> Option<PostgresCdcRuntimeState> {
+    let snapshot = snapshot?;
     if snapshot.active {
         Some(PostgresCdcRuntimeState::Following)
     } else if snapshot.continuity_lost {
@@ -1501,6 +1532,7 @@ fn derive_connection_runtime(
         Some("running") => match cdc_runtime_state {
             Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
             Some(PostgresCdcRuntimeState::ContinuityLost) => ("blocked", "cdc_continuity_lost"),
+            Some(PostgresCdcRuntimeState::Unknown) => ("starting", "cdc_state_unknown"),
             Some(PostgresCdcRuntimeState::Initializing) => ("starting", "cdc_initializing"),
             None => ("syncing", "sync_in_progress"),
         },
@@ -1599,6 +1631,7 @@ fn build_table_progress(
                     Some(PostgresCdcRuntimeState::ContinuityLost) => {
                         ("blocked", "cdc_continuity_lost")
                     }
+                    Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
                     Some(PostgresCdcRuntimeState::Initializing) => ("pending", "cdc_initializing"),
                     None => ("syncing", "sync_in_progress"),
                 },
@@ -2142,5 +2175,93 @@ mod tests {
                 .iter()
                 .all(|table| table.reason_code == "cdc_initializing")
         );
+    }
+
+    #[test]
+    fn derive_connection_runtime_surfaces_unknown_cdc_probe_state() {
+        let connection = test_postgres_cdc_connection();
+        let state = ConnectionState {
+            last_sync_status: Some("running".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = derive_connection_runtime(
+            &connection,
+            Some(&state),
+            None,
+            Some(PostgresCdcRuntimeState::Unknown),
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+            RuntimeMetadata {
+                config_hash: "hash",
+                deploy_revision: Some("deploy"),
+                last_restart_reason: "startup",
+            },
+        );
+
+        assert_eq!(runtime.phase, "starting");
+        assert_eq!(runtime.reason_code, "cdc_state_unknown");
+    }
+
+    #[test]
+    fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
+        let idle = TableProgress {
+            table_name: "public.a_idle".to_string(),
+            checkpoint: None,
+            stats: None,
+            phase: "running",
+            reason_code: "cdc_following",
+            checkpoint_age_seconds: None,
+            lag_seconds: None,
+            snapshot_chunks_total: 0,
+            snapshot_chunks_complete: 0,
+        };
+        let busy = TableProgress {
+            table_name: "public.z_busy".to_string(),
+            checkpoint: None,
+            stats: Some(TableStatsSnapshot {
+                run_id: "run-1".to_string(),
+                connection_id: "app".to_string(),
+                table_name: "public.z_busy".to_string(),
+                rows_read: 1,
+                rows_written: 1,
+                rows_deleted: 0,
+                rows_upserted: 1,
+                extract_ms: 1,
+                load_ms: 1,
+            }),
+            phase: "running",
+            reason_code: "cdc_following",
+            checkpoint_age_seconds: None,
+            lag_seconds: None,
+            snapshot_chunks_total: 0,
+            snapshot_chunks_complete: 0,
+        };
+        let blocked = TableProgress {
+            table_name: "public.m_blocked".to_string(),
+            checkpoint: None,
+            stats: None,
+            phase: "blocked",
+            reason_code: "schema_blocked",
+            checkpoint_age_seconds: None,
+            lag_seconds: None,
+            snapshot_chunks_total: 0,
+            snapshot_chunks_complete: 0,
+        };
+        let snapshotting = TableProgress {
+            table_name: "public.n_snapshot".to_string(),
+            checkpoint: None,
+            stats: None,
+            phase: "snapshotting",
+            reason_code: "snapshot_in_progress",
+            checkpoint_age_seconds: None,
+            lag_seconds: None,
+            snapshot_chunks_total: 4,
+            snapshot_chunks_complete: 2,
+        };
+
+        let selected = select_active_tables(&[idle, busy.clone(), blocked.clone(), snapshotting.clone()]);
+        let names: Vec<_> = selected.iter().map(|table| table.table_name.as_str()).collect();
+
+        assert_eq!(names, vec!["public.z_busy", "public.m_blocked", "public.n_snapshot"]);
     }
 }
