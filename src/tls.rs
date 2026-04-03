@@ -10,9 +10,7 @@ static RUSTLS_PROVIDER: Once = Once::new();
 
 pub fn install_rustls_provider() {
     RUSTLS_PROVIDER.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("installing rustls ring provider");
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 

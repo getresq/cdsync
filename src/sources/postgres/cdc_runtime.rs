@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) struct CdcIdleState {
+    pub(super) follow: bool,
+    pub(super) in_tx: bool,
+    pub(super) pending_events_empty: bool,
+    pub(super) queued_batches_empty: bool,
+    pub(super) pending_table_batches_empty: bool,
+    pub(super) inflight_apply_empty: bool,
+}
+
 impl PostgresSource {
     pub(super) async fn load_etl_table_schema(&self, table_id: TableId) -> Result<EtlTableSchema> {
         let row = sqlx::query(
@@ -101,6 +110,7 @@ impl PostgresSource {
         let mut pending_stats: HashMap<TableId, usize> = HashMap::new();
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
+        let mut last_xlog_activity = Instant::now();
         let mut in_tx = false;
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
         let mut shutdown = shutdown;
@@ -316,6 +326,7 @@ impl PostgresSource {
                     }
                 }
                 ReplicationMessage::XLogData(xlog) => {
+                    last_xlog_activity = Instant::now();
                     let start = etl::types::PgLsn::from(xlog.wal_start());
                     let end = etl::types::PgLsn::from(xlog.wal_end());
                     if end > last_received_lsn {
@@ -621,8 +632,8 @@ impl PostgresSource {
                 _ => {}
             }
 
-            while let Some(result) = inflight_apply.next().now_or_never() {
-                for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+            while let Some(Some(result)) = inflight_apply.next().now_or_never() {
+                for advance in handle_cdc_apply_result(Some(result), &mut watermark_tracker)? {
                     apply_cdc_watermark_advance(
                         advance,
                         &mut CdcWatermarkRuntime {
@@ -659,6 +670,21 @@ impl PostgresSource {
                 (queued_batches.len() + pending_cdc_commit_count(&pending_table_batches)) as u64,
                 watermark_tracker.inflight_commits() as u64,
             );
+
+            if cdc_should_stop_after_idle(
+                &CdcIdleState {
+                    follow,
+                    in_tx,
+                    pending_events_empty: pending_events.is_empty(),
+                    queued_batches_empty: queued_batches.is_empty(),
+                    pending_table_batches_empty: pending_table_batches.is_empty(),
+                    inflight_apply_empty: inflight_apply.is_empty(),
+                },
+                last_xlog_activity,
+                idle_timeout,
+            ) {
+                break;
+            }
         }
 
         dispatch_cdc_batches(
@@ -890,4 +916,18 @@ pub(super) fn cdc_fill_deadline_reached(
     pending_table_batches
         .values()
         .any(|pending| now.duration_since(pending.first_buffered_at) >= apply_max_fill)
+}
+
+pub(super) fn cdc_should_stop_after_idle(
+    state: &CdcIdleState,
+    last_xlog_activity: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    !state.follow
+        && !state.in_tx
+        && state.pending_events_empty
+        && state.queued_batches_empty
+        && state.pending_table_batches_empty
+        && state.inflight_apply_empty
+        && last_xlog_activity.elapsed() >= idle_timeout
 }

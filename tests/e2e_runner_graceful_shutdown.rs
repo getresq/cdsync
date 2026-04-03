@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
-use cdsync::config::StateConfig;
-use cdsync::state::SyncState;
+use cdsync::config::{StateConfig, StatsConfig};
+use cdsync::state::{SyncState, SyncStateStore};
+use cdsync::stats::StatsDb;
 use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -104,6 +105,7 @@ connections:
         ),
     )
     .await?;
+    prepare_runner_state(&pg_url, &state_schema, &stats_schema).await?;
 
     let mut child = runner_process(&config_path, "runner_demo")?;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -229,6 +231,7 @@ connections:
         ),
     )
     .await?;
+    prepare_runner_state(&pg_url, &state_schema, &stats_schema).await?;
 
     let mut child = runner_process(&config_path, "runner_cdc_demo")?;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -268,6 +271,23 @@ fn runner_process(config_path: &PathBuf, connection_id: &str) -> Result<tokio::p
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?)
+}
+
+async fn prepare_runner_state(pg_url: &str, state_schema: &str, stats_schema: &str) -> Result<()> {
+    SyncStateStore::migrate_with_config(&StateConfig {
+        url: pg_url.to_string(),
+        schema: Some(state_schema.to_string()),
+    })
+    .await?;
+    StatsDb::migrate_with_config(
+        &StatsConfig {
+            url: Some(pg_url.to_string()),
+            schema: Some(stats_schema.to_string()),
+        },
+        pg_url,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn terminate_child(pid: u32) -> Result<()> {

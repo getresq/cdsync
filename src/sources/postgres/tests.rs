@@ -144,6 +144,46 @@ fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
 }
 
 #[test]
+fn cdc_should_stop_after_idle_ignores_keepalive_only_idle_time() {
+    assert!(super::cdc_runtime::cdc_should_stop_after_idle(
+        &super::cdc_runtime::CdcIdleState {
+            follow: false,
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: true,
+            pending_table_batches_empty: true,
+            inflight_apply_empty: true,
+        },
+        Instant::now() - Duration::from_secs(2),
+        Duration::from_secs(1),
+    ));
+    assert!(!super::cdc_runtime::cdc_should_stop_after_idle(
+        &super::cdc_runtime::CdcIdleState {
+            follow: true,
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: true,
+            pending_table_batches_empty: true,
+            inflight_apply_empty: true,
+        },
+        Instant::now() - Duration::from_secs(2),
+        Duration::from_secs(1),
+    ));
+    assert!(!super::cdc_runtime::cdc_should_stop_after_idle(
+        &super::cdc_runtime::CdcIdleState {
+            follow: false,
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: false,
+            pending_table_batches_empty: true,
+            inflight_apply_empty: true,
+        },
+        Instant::now() - Duration::from_secs(2),
+        Duration::from_secs(1),
+    ));
+}
+
+#[test]
 fn rejects_multirange_and_builtin_unsupported_types() {
     assert!(pg_type_to_data_type_from_type(&etl::types::Type::INT4MULTI_RANGE).is_err());
     assert!(pg_type_to_data_type_from_type(&etl::types::Type::XID8).is_err());
