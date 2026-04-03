@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -654,11 +656,12 @@ async fn connections(
     let sync_state = state.state_store.load_state().await?;
     let now = Utc::now();
     let mut items = Vec::with_capacity(state.cfg.connections.len());
-    for connection in &state.cfg.connections {
-        let current = sync_state.connections.get(&connection.id);
-        let cdc_runtime_state = load_postgres_cdc_runtime_state(connection, current).await;
+    for (connection, current, cdc_runtime_state) in
+        probe_connection_runtime_states(&state.cfg.connections, &sync_state).await
+    {
+        let current = current.as_ref();
         let runtime = derive_connection_runtime(
-            connection,
+            &connection,
             current,
             None,
             cdc_runtime_state,
@@ -684,6 +687,39 @@ async fn connections(
         });
     }
     Ok(Json(items))
+}
+
+async fn probe_connection_runtime_states(
+    connections: &[ConnectionConfig],
+    sync_state: &SyncState,
+) -> Vec<(
+    ConnectionConfig,
+    Option<ConnectionState>,
+    Option<PostgresCdcRuntimeState>,
+)> {
+    collect_connection_runtime_states(connections, sync_state, |connection, current| async move {
+        load_postgres_cdc_runtime_state(&connection, current.as_ref()).await
+    })
+    .await
+}
+
+async fn collect_connection_runtime_states<T, F, Fut>(
+    connections: &[ConnectionConfig],
+    sync_state: &SyncState,
+    inspect: F,
+) -> Vec<(ConnectionConfig, Option<ConnectionState>, T)>
+where
+    F: Fn(ConnectionConfig, Option<ConnectionState>) -> Fut + Copy,
+    Fut: Future<Output = T>,
+{
+    join_all(connections.iter().cloned().map(|connection| {
+        let current = sync_state.connections.get(&connection.id).cloned();
+        async move {
+            let inspected = inspect(connection.clone(), current.clone()).await;
+            (connection, current, inspected)
+        }
+    }))
+    .await
 }
 
 async fn connection(

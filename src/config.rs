@@ -338,6 +338,9 @@ impl PostgresConfig {
             if publication.is_empty() {
                 anyhow::bail!("postgres.publication is required when CDC is enabled");
             }
+            if self.cdc_pipeline_id.is_none() {
+                anyhow::bail!("postgres.cdc_pipeline_id is required when CDC is enabled");
+            }
             if self.cdc_tls.unwrap_or(false)
                 && self.cdc_tls_ca.is_none()
                 && self.cdc_tls_ca_path.is_none()
@@ -674,6 +677,34 @@ connections:
 "#;
         let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_requires_cdc_pipeline_id_when_cdc_enabled() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@host:5432/db"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: true
+      publication: "cdsync_pub"
+      tables:
+        - name: "public.accounts"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+"#;
+        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let err = cfg.validate().expect_err("missing cdc pipeline id");
+        assert!(
+            err.to_string()
+                .contains("postgres.cdc_pipeline_id is required when CDC is enabled")
+        );
     }
 
     #[test]

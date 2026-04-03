@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::time::{Duration, Instant, sleep};
 
 #[derive(Clone)]
 struct FakeStateBackend {
@@ -220,6 +221,49 @@ fn test_config() -> Config {
             schema: Some("cdsync_stats".to_string()),
         }),
     }
+}
+
+#[tokio::test]
+async fn collect_connection_runtime_states_runs_slot_probes_in_parallel() -> anyhow::Result<()> {
+    async fn inspect_with_delay(
+        connection: ConnectionConfig,
+        current: Option<ConnectionState>,
+    ) -> String {
+        let _ = current;
+        sleep(Duration::from_millis(100)).await;
+        connection.id
+    }
+
+    let mut cfg = test_config();
+    let template = cfg.connections[0].clone();
+    cfg.connections = vec![
+        ConnectionConfig {
+            id: "one".to_string(),
+            ..template.clone()
+        },
+        ConnectionConfig {
+            id: "two".to_string(),
+            ..template.clone()
+        },
+        ConnectionConfig {
+            id: "three".to_string(),
+            ..template
+        },
+    ];
+    let sync_state = SyncState {
+        connections: HashMap::new(),
+        updated_at: None,
+    };
+
+    let start = Instant::now();
+    let results =
+        super::collect_connection_runtime_states(&cfg.connections, &sync_state, inspect_with_delay)
+            .await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(results.len(), 3);
+    assert!(elapsed < Duration::from_millis(220));
+    Ok(())
 }
 
 fn auth_header(scopes: &[&str]) -> String {
