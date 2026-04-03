@@ -74,7 +74,73 @@ pub(super) fn normalize_filter(value: &str) -> String {
         }
     }
 
-    normalized
+    strip_wrapping_parentheses(&normalized)
+}
+
+fn strip_wrapping_parentheses(value: &str) -> String {
+    let mut current = value;
+    while let Some(stripped) = strip_one_wrapping_parentheses(current) {
+        current = stripped;
+    }
+    current.to_string()
+}
+
+fn strip_one_wrapping_parentheses(value: &str) -> Option<&str> {
+    if !value.starts_with('(') || !value.ends_with(')') {
+        return None;
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Normal,
+        SingleQuoted,
+        DoubleQuoted,
+    }
+
+    let mut mode = Mode::Normal;
+    let mut depth = 0usize;
+    let bytes = value.as_bytes();
+    let last_index = bytes.len().checked_sub(1)?;
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let ch = bytes[idx] as char;
+        match mode {
+            Mode::Normal => match ch {
+                '\'' => mode = Mode::SingleQuoted,
+                '"' => mode = Mode::DoubleQuoted,
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 && idx != last_index {
+                        return None;
+                    }
+                }
+                _ => {}
+            },
+            Mode::SingleQuoted => {
+                if ch == '\'' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] as char == '\'' {
+                        idx += 1;
+                    } else {
+                        mode = Mode::Normal;
+                    }
+                }
+            }
+            Mode::DoubleQuoted => {
+                if ch == '"' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] as char == '"' {
+                        idx += 1;
+                    } else {
+                        mode = Mode::Normal;
+                    }
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    (depth == 0).then_some(&value[1..last_index])
 }
 
 pub(super) fn schema_fingerprint(schema: &TableSchema) -> String {
@@ -188,6 +254,15 @@ mod tests {
         let lhs = "tenant_id = 1 AND deleted_at IS NULL";
         let rhs = "tenant_id=1 and   deleted_at   is null";
         assert_eq!(normalize_filter(lhs), normalize_filter(rhs));
+    }
+
+    #[test]
+    fn normalize_filter_ignores_wrapping_parentheses() {
+        let lhs = "tenant_id = 1";
+        let rhs = "(tenant_id = 1)";
+        let nested = "(((tenant_id = 1)))";
+        assert_eq!(normalize_filter(lhs), normalize_filter(rhs));
+        assert_eq!(normalize_filter(lhs), normalize_filter(nested));
     }
 
     #[test]

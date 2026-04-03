@@ -712,7 +712,8 @@ where
     F: Fn(ConnectionConfig, Option<ConnectionState>) -> Fut + Copy,
     Fut: Future<Output = T>,
 {
-    join_all(connections.iter().cloned().map(|connection| {
+    join_all(connections.iter().map(|connection| {
+        let connection = connection.clone();
         let current = sync_state.connections.get(&connection.id).cloned();
         async move {
             let inspected = inspect(connection.clone(), current.clone()).await;

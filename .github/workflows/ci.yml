@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust dependencies
@@ -38,6 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust dependencies
@@ -59,6 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust dependencies
@@ -80,6 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust dependencies
