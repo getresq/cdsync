@@ -7,7 +7,7 @@ use polars::io::parquet::write::{ParquetCompression, ParquetWriter};
 use polars::prelude::{AnyValue, DataFrame, NamedFrom, Series};
 use token_source::TokenSource;
 use tokio::task;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use gcloud_bigquery::http::job::get::GetJobRequest;
@@ -59,6 +59,12 @@ impl BigQueryDestination {
             PARQUET_FILE_EXTENSION,
         );
         let object_uri = format!("gs://{}/{}", bucket, object_name);
+        tracing::info!(
+            table = table_id,
+            rows = frame.height(),
+            object_uri = %object_uri,
+            "starting batch-load append via GCS object upload"
+        );
         let body = parquet_payload(frame, &schema).await?;
         self.upload_batch_load_object(
             token_source,
@@ -71,6 +77,12 @@ impl BigQueryDestination {
         .with_context(|| format!("uploading batch load object {}", object_uri))?;
 
         self.run_load_job(table_id, &schema, &object_uri).await?;
+        tracing::info!(
+            table = table_id,
+            rows = frame.height(),
+            object_uri = %object_uri,
+            "batch-load append completed"
+        );
         Ok(true)
     }
 
@@ -82,10 +94,19 @@ impl BigQueryDestination {
         content_type: &str,
         body: Vec<u8>,
     ) -> Result<()> {
-        let token = token_source
-            .token()
-            .await
-            .map_err(|err| anyhow::anyhow!("fetching GCS access token failed: {}", err))?;
+        let token = match timeout(BIGQUERY_REQUEST_TIMEOUT, token_source.token()).await {
+            Ok(Ok(token)) => token,
+            Ok(Err(err)) => {
+                return Err(anyhow::anyhow!("fetching GCS access token failed: {}", err));
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "fetching GCS access token for {} timed out after {}s",
+                    object_name,
+                    BIGQUERY_REQUEST_TIMEOUT.as_secs()
+                );
+            }
+        };
         let url = format!(
             "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
             bucket,
@@ -142,12 +163,20 @@ impl BigQueryDestination {
         )
         .await?;
 
-        self.wait_for_job_completion(&created).await
+        tracing::info!(
+            table = table_id,
+            source_uri = source_uri,
+            job_id = created.job_reference.job_id,
+            "created BigQuery load job"
+        );
+        self.wait_for_job_completion(table_id, &created).await
     }
 
-    async fn wait_for_job_completion(&self, job: &Job) -> Result<()> {
+    async fn wait_for_job_completion(&self, table_id: &str, job: &Job) -> Result<()> {
         let job_id = &job.job_reference.job_id;
         let location = job.job_reference.location.clone();
+        let started_at = std::time::Instant::now();
+        let mut last_log_at = started_at;
         loop {
             let current = BigQueryDestination::await_with_timeout(
                 format!("fetching BigQuery job {}", job_id),
@@ -162,6 +191,17 @@ impl BigQueryDestination {
             )
             .await?;
 
+            if last_log_at.elapsed() >= BATCH_LOAD_JOB_PROGRESS_LOG_INTERVAL {
+                tracing::info!(
+                    table = table_id,
+                    job_id = job_id,
+                    state = ?current.status.state,
+                    elapsed_secs = started_at.elapsed().as_secs(),
+                    "waiting for BigQuery load job completion"
+                );
+                last_log_at = std::time::Instant::now();
+            }
+
             if current.status.state == JobState::Done {
                 if let Some(error_result) = current.status.error_result {
                     anyhow::bail!("BigQuery load job {} failed: {:?}", job_id, error_result);
@@ -171,7 +211,22 @@ impl BigQueryDestination {
                 {
                     anyhow::bail!("BigQuery load job {} reported errors: {:?}", job_id, errors);
                 }
+                tracing::info!(
+                    table = table_id,
+                    job_id = job_id,
+                    elapsed_secs = started_at.elapsed().as_secs(),
+                    "BigQuery load job completed"
+                );
                 return Ok(());
+            }
+
+            if started_at.elapsed() >= BATCH_LOAD_JOB_HARD_TIMEOUT {
+                anyhow::bail!(
+                    "BigQuery load job {} for {} exceeded hard timeout of {}s",
+                    job_id,
+                    table_id,
+                    BATCH_LOAD_JOB_HARD_TIMEOUT.as_secs()
+                );
             }
 
             sleep(Duration::from_secs(1)).await;
@@ -182,6 +237,8 @@ impl BigQueryDestination {
 const PARQUET_FILE_EXTENSION: &str = "parquet";
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 const BATCH_LOAD_PARQUET_BLOCKING_ROWS: usize = 1024;
+const BATCH_LOAD_JOB_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const BATCH_LOAD_JOB_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
 
 async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
     if frame.height() < BATCH_LOAD_PARQUET_BLOCKING_ROWS {
