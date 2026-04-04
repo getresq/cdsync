@@ -13,6 +13,14 @@ const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
+pub(super) fn relation_change_requires_destination_ensure(
+    prev_snapshot_exists: bool,
+    table_known: bool,
+    diff: Option<&SchemaDiff>,
+) -> bool {
+    !prev_snapshot_exists || !table_known || diff.is_some_and(|diff| !diff.is_empty())
+}
+
 impl PostgresSource {
     pub(super) async fn load_etl_table_schema(&self, table_id: TableId) -> Result<EtlTableSchema> {
         let row = sqlx::query(
@@ -995,11 +1003,11 @@ impl PostgresSource {
             &new_hash,
             diff.as_ref().unwrap_or(&default_diff),
         );
-        if let Some(diff) = diff
+        if let Some(ref diff) = diff
             && !diff.is_empty()
         {
             if runtime.schema_diff_enabled {
-                log_schema_diff(&table_cfg.name, &diff);
+                log_schema_diff(&table_cfg.name, diff);
             }
             if primary_key_changed_detected {
                 warn!(
@@ -1079,7 +1087,13 @@ impl PostgresSource {
         }
 
         let snapshot = schema_snapshot_from_schema(&info.schema);
-        runtime.dest.ensure_table_schema(&info.schema).await?;
+        if relation_change_requires_destination_ensure(
+            prev_snapshot.is_some(),
+            runtime.table_info_map.contains_key(&table_id),
+            diff.as_ref(),
+        ) {
+            runtime.dest.ensure_table_schema(&info.schema).await?;
+        }
         runtime.dest.update_table_info(info.clone()).await?;
         runtime.table_info_map.insert(table_id, info);
         runtime.etl_schemas.insert(table_id, etl_schema);

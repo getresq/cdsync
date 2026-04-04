@@ -372,7 +372,15 @@ impl BigQueryDestination {
     ) -> Result<()> {
         let ensure_started_at = std::time::Instant::now();
         info!(table = table_id, with_partition, "ensuring BigQuery table");
+        info!(
+            table = table_id,
+            "ensuring BigQuery dataset before table ensure"
+        );
         self.ensure_dataset().await?;
+        info!(
+            table = table_id,
+            "BigQuery dataset ensured before table ensure"
+        );
         let schema = with_metadata_schema(schema, &self.metadata);
         let desired_fields = bq_fields_from_schema(&schema.columns);
         let bq_schema = BqTableSchema {
@@ -431,6 +439,7 @@ impl BigQueryDestination {
             anyhow::bail!("emulator table create failed: {}", response.status());
         }
 
+        info!(table = table_id, "fetching BigQuery table metadata");
         match Self::await_bq_timeout(
             format!("fetching BigQuery table {}", table_id),
             BIGQUERY_REQUEST_TIMEOUT,
@@ -441,6 +450,7 @@ impl BigQueryDestination {
         .await
         {
             Ok(mut table) => {
+                info!(table = table_id, "fetched BigQuery table metadata");
                 let existing_fields = table
                     .schema
                     .as_ref()
@@ -462,12 +472,14 @@ impl BigQueryDestination {
                     table.schema = Some(BqTableSchema {
                         fields: updated_fields,
                     });
+                    info!(table = table_id, "patching BigQuery table schema");
                     Self::await_bq_timeout(
                         format!("patching BigQuery table {}", table_id),
                         BIGQUERY_REQUEST_TIMEOUT,
                         self.client.table().patch(&table),
                     )
                     .await?;
+                    info!(table = table_id, "patched BigQuery table schema");
                 }
                 info!(
                     table = table_id,
@@ -498,12 +510,14 @@ impl BigQueryDestination {
                     schema: Some(bq_schema),
                     ..Default::default()
                 };
+                info!(table = table_id, "creating BigQuery table");
                 Self::await_bq_timeout(
                     format!("creating BigQuery table {}", table_id),
                     BIGQUERY_REQUEST_TIMEOUT,
                     self.client.table().create(&table),
                 )
                 .await?;
+                info!(table = table_id, "created BigQuery table");
                 info!(
                     table = table_id,
                     ensure_ms = ensure_started_at.elapsed().as_millis() as u64,

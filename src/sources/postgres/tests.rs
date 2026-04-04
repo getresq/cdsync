@@ -545,6 +545,30 @@ fn primary_key_changed_ignores_schema_hash_when_explicit_primary_key_matches() {
 }
 
 #[test]
+fn relation_change_requires_destination_ensure_for_new_or_changed_tables() {
+    assert!(super::cdc_runtime::relation_change_requires_destination_ensure(false, true, None));
+    assert!(super::cdc_runtime::relation_change_requires_destination_ensure(true, false, None));
+
+    let diff = SchemaDiff {
+        added: vec!["extra".to_string()],
+        ..Default::default()
+    };
+    assert!(
+        super::cdc_runtime::relation_change_requires_destination_ensure(true, true, Some(&diff))
+    );
+}
+
+#[test]
+fn relation_change_skips_destination_ensure_when_schema_is_unchanged() {
+    assert!(!super::cdc_runtime::relation_change_requires_destination_ensure(true, true, None));
+
+    let empty = SchemaDiff::default();
+    assert!(
+        !super::cdc_runtime::relation_change_requires_destination_ensure(true, true, Some(&empty))
+    );
+}
+
+#[test]
 fn snapshot_progress_logging_uses_ten_batch_interval() {
     assert!(!should_log_snapshot_progress(0));
     assert!(!should_log_snapshot_progress(9));
