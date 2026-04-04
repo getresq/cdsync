@@ -54,9 +54,9 @@ echo "✅ Database '${DB_NAME}' is ready"
 # Check if TPC-C data already exists
 echo "🔍 Checking if TPC-C data already exists..."
 TPCC_EXISTS=$(PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST}" -U "${DB_USER}" -p "${DB_PORT}" -d "${DB_NAME}" -tAc "
-  select count(*) 
-  from pg_catalog.pg_tables 
-  where schemaname = 'public' 
+  select count(*)
+  from pg_catalog.pg_tables
+  where schemaname = 'public'
     and tablename in ('customer', 'district', 'item', 'new_order', 'order_line', 'orders', 'stock', 'warehouse');
 " 2>/dev/null || echo "0")
 
@@ -65,7 +65,7 @@ if [[ "${TPCC_EXISTS}" -eq 9 ]]; then
   echo "💡 To regenerate data, drop the tables first or use a different database"
 else
   echo "📦 TPC-C tables not found, proceeding with data generation..."
-  
+
   # Run the go-tpc command
   go-tpc tpcc \
     --warehouses "${WAREHOUSES}" \

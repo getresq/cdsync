@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the pipeline.
     let mut pipeline = Pipeline::new(config, store, destination);
     pipeline.start().await?;
-  
+
     // Wait for the pipeline indefinitely.
     pipeline.wait().await?;
 

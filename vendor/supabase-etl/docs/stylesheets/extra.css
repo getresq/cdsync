@@ -1,12 +1,12 @@
 /* Custom Supabase color palette */
 :root {
     --tab-size-preference: 4;
-    
+
     /* Custom primary color: #11181c */
     --md-primary-fg-color: #11181c;
     --md-primary-fg-color--light: #11181c;
     --md-primary-fg-color--dark: #0a0e10;
-    
+
     /* Custom accent color: #34b27b */
     --md-accent-fg-color: #34b27b;
     --md-accent-fg-color--transparent: rgba(52, 178, 123, 0.1);

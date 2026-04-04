@@ -32,7 +32,7 @@ DB_HOST="${POSTGRES_HOST:=localhost}"
 if [[ -z "${SKIP_DOCKER}" ]]
 then
   echo "🐳 Starting all services with Docker Compose..."
-  
+
   # Export environment variables for docker-compose
   export POSTGRES_USER="${DB_USER}"
   export POSTGRES_PASSWORD="${DB_PASSWORD}"
@@ -59,7 +59,7 @@ fi
 
 # Wait for Postgres to be ready
 echo "⏳ Waiting for Postgres to be ready..."
-until docker-compose -f ./scripts/docker-compose.yaml exec -T source-postgres pg_isready -U postgres > /dev/null 2>&1; do 
+until docker-compose -f ./scripts/docker-compose.yaml exec -T source-postgres pg_isready -U postgres > /dev/null 2>&1; do
   echo "Waiting for Postgres..."
   sleep 1
 done

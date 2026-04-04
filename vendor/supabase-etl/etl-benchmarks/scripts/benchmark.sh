@@ -29,7 +29,7 @@ set -eo pipefail
 #     LOG_TARGET (terminal or file) - Where to send logs (default: terminal)
 #     DRY_RUN (true/false) - Show commands without executing them
 #     PREPARE_TPCC (true/false) - Automatically run prepare_tpcc.sh if tables don't exist (default: true)
-#   
+#
 #   BigQuery Configuration (required when DESTINATION=big-query):
 #     BQ_PROJECT_ID - Google Cloud project ID
 #     BQ_DATASET_ID - BigQuery dataset ID

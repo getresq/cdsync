@@ -18,7 +18,7 @@ pub async fn store_table_mapping(
         insert into etl.table_mappings (pipeline_id, source_table_id, destination_table_id)
         values ($1, $2, $3)
         on conflict (pipeline_id, source_table_id)
-        do update set 
+        do update set
             destination_table_id = excluded.destination_table_id,
             updated_at = now()
         "#,
