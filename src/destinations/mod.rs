@@ -24,6 +24,10 @@ pub trait Destination: Send + Sync {
         mode: WriteMode,
         primary_key: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn with_metadata_schema(schema: &TableSchema, metadata: &MetadataColumns) -> TableSchema {

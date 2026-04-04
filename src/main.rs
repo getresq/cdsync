@@ -16,6 +16,7 @@ mod tls;
 mod types;
 
 use crate::config::{Config, DestinationConfig, SourceConfig};
+use crate::destinations::Destination;
 use crate::destinations::bigquery::BigQueryDestination;
 use crate::runner::{ShutdownController, ShutdownSignal, schedule_interval};
 use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
@@ -572,12 +573,12 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
     };
     dest.validate().await?;
 
-    match &connection.source {
+    let result = match &connection.source {
         SourceConfig::Postgres(pg) => {
             let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
             let tables = source.resolve_tables().await?;
             if follow && !source.cdc_enabled() {
-                anyhow::bail!("--follow requires postgres.cdc=true");
+                return Err(anyhow::anyhow!("--follow requires postgres.cdc=true"));
             }
             if source.cdc_enabled() {
                 info!(
@@ -642,6 +643,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                         }
                     }
                 }
+                Ok(())
             } else {
                 if max_concurrency > source.pool_max_connections() as usize {
                     warn!(
@@ -651,7 +653,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                     );
                 }
                 let source = Arc::new(source);
-                let dest = Arc::new(dest);
+                let dest = Arc::new(dest.clone());
                 let semaphore = Arc::new(Semaphore::new(max_concurrency));
                 let mut tasks = FuturesUnordered::new();
 
@@ -766,16 +768,19 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                 if let Some(err) = first_error {
                     return Err(err);
                 }
+                Ok(())
             }
         }
         SourceConfig::Salesforce(sf) => {
             if follow {
-                anyhow::bail!("--follow is only supported for postgres CDC connections");
+                return Err(anyhow::anyhow!(
+                    "--follow is only supported for postgres CDC connections"
+                ));
             }
             let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
             let objects = source.resolve_objects().await?;
             let source = Arc::new(source);
-            let dest = Arc::new(dest);
+            let dest = Arc::new(dest.clone());
             let semaphore = Arc::new(Semaphore::new(max_concurrency));
             let mut tasks = FuturesUnordered::new();
 
@@ -892,10 +897,16 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
             if let Some(err) = first_error {
                 return Err(err);
             }
+            Ok(())
         }
-    }
+    };
 
-    Ok(())
+    let shutdown_result = dest.shutdown().await;
+    match (result, shutdown_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn connection_run_mode(connection: &crate::config::ConnectionConfig) -> &'static str {
@@ -1195,7 +1206,7 @@ async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<
     shutdown_controller.shutdown();
     signal_task.abort();
     if let Some(task) = admin_task {
-        let _ = task.await;
+        let _ = task.join();
     }
     result
 }

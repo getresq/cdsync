@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::watch;
+use tokio::time::{Duration, Instant, sleep, timeout};
 
 #[derive(Clone)]
 struct FakeStateBackend {
     state: SyncState,
     ping_error: Option<String>,
+    load_delay: Option<Duration>,
 }
 
 #[async_trait]
@@ -35,6 +37,9 @@ impl AdminStateBackend for FakeStateBackend {
     }
 
     async fn load_state(&self) -> anyhow::Result<SyncState> {
+        if let Some(delay) = self.load_delay {
+            sleep(delay).await;
+        }
         Ok(self.state.clone())
     }
 }
@@ -224,47 +229,27 @@ fn test_config() -> Config {
     }
 }
 
-#[tokio::test]
-async fn collect_connection_runtime_states_runs_slot_probes_in_parallel() -> anyhow::Result<()> {
-    async fn inspect_with_delay(
-        connection: ConnectionConfig,
-        current: Option<ConnectionState>,
-    ) -> String {
-        let _ = current;
-        sleep(Duration::from_millis(100)).await;
-        connection.id
+fn test_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
+    let mut cache = HashMap::new();
+    for connection in &cfg.connections {
+        if !super::is_postgres_cdc_connection(connection) {
+            continue;
+        }
+        let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Snapshot(Some(
+            PostgresCdcSlotSnapshot {
+                slot_name: Some("slot_app".to_string()),
+                active: true,
+                restart_lsn: Some("0/16B6C40".to_string()),
+                confirmed_flush_lsn: Some("0/16B6C50".to_string()),
+                current_wal_lsn: Some("0/16B6C60".to_string()),
+                wal_bytes_retained_by_slot: Some(16),
+                wal_bytes_behind_confirmed: Some(16),
+                continuity_lost: false,
+            },
+        )));
+        cache.insert(connection.id.clone(), tx);
     }
-
-    let mut cfg = test_config();
-    let template = cfg.connections[0].clone();
-    cfg.connections = vec![
-        ConnectionConfig {
-            id: "one".to_string(),
-            ..template.clone()
-        },
-        ConnectionConfig {
-            id: "two".to_string(),
-            ..template.clone()
-        },
-        ConnectionConfig {
-            id: "three".to_string(),
-            ..template
-        },
-    ];
-    let sync_state = SyncState {
-        connections: HashMap::new(),
-        updated_at: None,
-    };
-
-    let start = Instant::now();
-    let results =
-        super::collect_connection_runtime_states(&cfg.connections, &sync_state, inspect_with_delay)
-            .await;
-    let elapsed = start.elapsed();
-
-    assert_eq!(results.len(), 3);
-    assert!(elapsed < Duration::from_millis(220));
-    Ok(())
+    Arc::new(cache)
 }
 
 fn auth_header(scopes: &[&str]) -> String {
@@ -374,6 +359,98 @@ async fn spawn_test_server(
     Ok((format!("http://{}", addr), handle))
 }
 
+#[tokio::test]
+async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown() {
+    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Snapshot(Some(
+        PostgresCdcSlotSnapshot {
+            slot_name: Some("slot_app".to_string()),
+            active: true,
+            restart_lsn: Some("0/16B6C40".to_string()),
+            confirmed_flush_lsn: Some("0/16B6C50".to_string()),
+            current_wal_lsn: Some("0/16B6C60".to_string()),
+            wal_bytes_retained_by_slot: Some(16),
+            wal_bytes_behind_confirmed: Some(16),
+            continuity_lost: false,
+        },
+    )));
+
+    super::publish_cached_postgres_cdc_slot_state(&tx, CachedPostgresCdcSlotState::Unknown);
+
+    assert!(matches!(&*tx.borrow(), CachedPostgresCdcSlotState::Unknown));
+}
+
+#[tokio::test]
+async fn spawn_admin_server_thread_surfaces_bind_failures_before_returning() -> anyhow::Result<()> {
+    let state = test_admin_state(
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: None,
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let (_shutdown_controller, shutdown_signal) = crate::runner::ShutdownController::new();
+
+    let (handle, ready_rx) = super::spawn_admin_server_thread(state, addr, shutdown_signal)?;
+    let err = ready_rx
+        .await
+        .expect("startup result")
+        .expect_err("expected bind failure");
+    assert!(
+        err.to_string().contains("Address already in use")
+            || err.to_string().contains("address in use")
+    );
+
+    let _ = handle.join();
+    drop(listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_admin_server_thread_does_not_wait_for_initial_slot_samples() -> anyhow::Result<()> {
+    let mut cfg = test_config();
+    cfg.connections = vec![
+        ConnectionConfig {
+            id: "app1".to_string(),
+            ..cfg.connections[0].clone()
+        },
+        ConnectionConfig {
+            id: "app2".to_string(),
+            ..cfg.connections[0].clone()
+        },
+    ];
+    let state = test_admin_state_with_config(
+        cfg,
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: Some(Duration::from_millis(300)),
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+
+    let (shutdown_controller, shutdown_signal) = crate::runner::ShutdownController::new();
+    let start = Instant::now();
+    let (handle, ready_rx) = super::spawn_admin_server_thread(state, addr, shutdown_signal)?;
+    ready_rx.await.expect("startup result")?;
+    let elapsed = start.elapsed();
+
+    shutdown_controller.shutdown();
+    let _ = handle.join();
+
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "startup took {:?}",
+        elapsed
+    );
+    Ok(())
+}
+
 fn test_admin_state(
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
@@ -386,6 +463,7 @@ fn test_admin_state_with_config(
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
 ) -> AdminApiState {
+    let cdc_slot_sampler_cache = test_cdc_slot_sampler_cache(&cfg);
     let auth_verifier = Arc::new(
         AdminApiServiceJwtVerifier::from_config(
             cfg.admin_api
@@ -399,6 +477,7 @@ fn test_admin_state_with_config(
         cfg: Arc::new(cfg),
         state_store,
         stats_db,
+        cdc_slot_sampler_cache,
         auth_verifier,
         started_at: Utc.with_ymd_and_hms(2026, 4, 1, 9, 59, 0).unwrap(),
         mode: "run".to_string(),
@@ -433,6 +512,7 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
         Arc::new(FakeStateBackend {
             state: sync_state,
             ping_error: None,
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -457,6 +537,7 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -493,11 +574,55 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()> {
+    let state = test_admin_state(
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: None,
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .get(format!("{base_url}/v1/stream?connection=app"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut bytes_stream = response.bytes_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut body = String::new();
+    while !body.contains("event: connection.cdc") && tokio::time::Instant::now() < deadline {
+        let chunk = timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            bytes_stream.next(),
+        )
+        .await?
+        .context("missing SSE chunk")??;
+        body.push_str(std::str::from_utf8(&chunk).expect("utf8 chunk"));
+    }
+    assert!(body.contains("event: connection.cdc"));
+    assert!(body.contains("\"slot_active\":true"));
+    assert!(body.contains("\"confirmed_flush_lsn\":\"0/16B6C50\""));
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
     let state = test_admin_state(
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -561,6 +686,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             runs,
@@ -674,6 +800,7 @@ async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Resul
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
+            load_delay: None,
         }),
         None,
     );
@@ -701,6 +828,7 @@ async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()>
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -729,6 +857,7 @@ async fn admin_api_accepts_array_audience_tokens() -> anyhow::Result<()> {
         Arc::new(FakeStateBackend {
             ping_error: None,
             state: test_state(),
+            load_delay: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             ping_error: None,

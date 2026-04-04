@@ -179,7 +179,7 @@ impl SyncStateStore {
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
-        let _: i64 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
+        let _: i32 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
         Ok(())
     }
 

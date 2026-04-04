@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 use url::Url;
@@ -49,6 +49,7 @@ pub struct BigQueryDestination {
     dry_run: bool,
     metadata: MetadataColumns,
     storage_writers: Arc<Mutex<HashMap<String, Arc<StorageWriteTableWriter>>>>,
+    cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,7 +61,6 @@ pub struct DestinationTableSummary {
 
 const INSERT_ALL_BLOCKING_ROWS: usize = 512;
 pub(super) const BIGQUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-pub(super) const BIGQUERY_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 impl BigQueryDestination {
     pub async fn new(
@@ -148,6 +148,7 @@ impl BigQueryDestination {
             dry_run,
             metadata,
             storage_writers: Arc::new(Mutex::new(HashMap::new())),
+            cleanup_tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -693,13 +694,13 @@ impl BigQueryDestination {
         }
     }
 
-    fn spawn_drop_table_if_exists(&self, table: String) {
+    async fn spawn_drop_table_if_exists(&self, table: String) {
         if self.dry_run {
             return;
         }
 
         let dest = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(err) = dest.drop_table_if_exists(&table).await {
                 warn!(
                     table = %table,
@@ -708,7 +709,27 @@ impl BigQueryDestination {
                 );
             }
         });
+        self.cleanup_tasks.lock().await.push(handle);
     }
+
+    async fn drain_cleanup_tasks(&self) -> Result<()> {
+        drain_cleanup_task_handles(&self.cleanup_tasks).await
+    }
+}
+
+async fn drain_cleanup_task_handles(cleanup_tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>) -> Result<()> {
+    let handles = {
+        let mut guard = cleanup_tasks.lock().await;
+        std::mem::take(&mut *guard)
+    };
+
+    for handle in handles {
+        handle
+            .await
+            .map_err(|err| anyhow::anyhow!("cleanup task join failed: {}", err))?;
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -786,7 +807,7 @@ impl Destination for BigQueryDestination {
                         self.merge_staging(table, &staging, schema, pk).await
                     }
                     .await;
-                    self.spawn_drop_table_if_exists(staging);
+                    self.spawn_drop_table_if_exists(staging).await;
                     result?;
                 } else {
                     warn!("no primary key for {table}; falling back to append");
@@ -795,6 +816,10 @@ impl Destination for BigQueryDestination {
             }
         }
         Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.drain_cleanup_tasks().await
     }
 }
 
@@ -815,10 +840,17 @@ fn upsert_staging_table_id(table: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, upsert_staging_table_id};
+    use super::{
+        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, drain_cleanup_task_handles,
+        upsert_staging_table_id,
+    };
     use gcloud_bigquery::http::error::Error as BqError;
     use std::future::pending;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::sync::Mutex;
+    use tokio::task::JoinHandle;
 
     #[test]
     fn upsert_staging_table_id_is_unique_per_write() {
@@ -866,5 +898,23 @@ mod tests {
     #[test]
     fn request_timeout_is_longer_than_zero() {
         assert!(BIGQUERY_REQUEST_TIMEOUT > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn drain_cleanup_task_handles_waits_for_spawned_work() {
+        let cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = Arc::clone(&finished);
+
+        cleanup_tasks.lock().await.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            finished_clone.store(true, Ordering::SeqCst);
+        }));
+
+        drain_cleanup_task_handles(&cleanup_tasks)
+            .await
+            .expect("cleanup tasks drained");
+
+        assert!(finished.load(Ordering::SeqCst));
     }
 }

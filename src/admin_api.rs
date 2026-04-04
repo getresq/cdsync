@@ -23,7 +23,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
 use futures::stream::{self, Stream};
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -34,12 +33,14 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, timeout};
 use tracing::warn;
 use url::Url;
@@ -47,12 +48,14 @@ use url::Url;
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const STREAM_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const STREAM_ACTIVE_TABLE_LIMIT: usize = 25;
+const CDC_SLOT_SAMPLER_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct AdminApiState {
     cfg: Arc<Config>,
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
+    cdc_slot_sampler_cache: CdcSlotSamplerCache,
     auth_verifier: Arc<AdminApiServiceJwtVerifier>,
     started_at: DateTime<Utc>,
     mode: String,
@@ -535,6 +538,12 @@ enum PostgresCdcRuntimeState {
 }
 
 #[derive(Debug, Clone)]
+enum CachedPostgresCdcSlotState {
+    Snapshot(Option<PostgresCdcSlotSnapshot>),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
 struct PostgresCdcSlotSnapshot {
     slot_name: Option<String>,
     active: bool,
@@ -544,6 +553,69 @@ struct PostgresCdcSlotSnapshot {
     wal_bytes_retained_by_slot: Option<i64>,
     wal_bytes_behind_confirmed: Option<i64>,
     continuity_lost: bool,
+}
+
+type CdcSlotSamplerCache = Arc<HashMap<String, watch::Sender<CachedPostgresCdcSlotState>>>;
+
+pub struct AdminApiHandle {
+    thread: thread::JoinHandle<anyhow::Result<()>>,
+}
+
+impl AdminApiHandle {
+    pub fn join(self) -> anyhow::Result<()> {
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("admin api thread panicked"))?
+    }
+}
+
+fn spawn_admin_server_thread(
+    state: AdminApiState,
+    bind: SocketAddr,
+    shutdown: ShutdownSignal,
+) -> anyhow::Result<(AdminApiHandle, oneshot::Receiver<anyhow::Result<()>>)> {
+    let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<()>>();
+
+    let handle = thread::Builder::new()
+        .name("cdsync-admin".to_string())
+        .spawn(move || -> anyhow::Result<()> {
+            let runtime = TokioRuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building admin API runtime")?;
+            runtime.block_on(async move {
+                let listener = match TcpListener::bind(bind).await {
+                    Ok(listener) => {
+                        let _ = ready_tx.send(Ok(()));
+                        listener
+                    }
+                    Err(err) => {
+                        let err = anyhow::Error::from(err);
+                        let _ = ready_tx.send(Err(anyhow::anyhow!(err.to_string())));
+                        return Err(err);
+                    }
+                };
+
+                spawn_cdc_slot_sampler_tasks(
+                    state.cfg.clone(),
+                    state.state_store.clone(),
+                    state.cdc_slot_sampler_cache.clone(),
+                    shutdown.clone(),
+                );
+
+                let app = router(state);
+                let mut shutdown = shutdown;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown.changed().await;
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .context("spawning admin API thread")?;
+
+    Ok((AdminApiHandle { thread: handle }, ready_rx))
 }
 
 #[derive(Serialize)]
@@ -618,13 +690,136 @@ fn config_hash(cfg: &Config) -> anyhow::Result<String> {
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn is_postgres_cdc_connection(connection: &ConnectionConfig) -> bool {
+    matches!(
+        &connection.source,
+        SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)
+    )
+}
+
+fn build_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
+    let mut cache = HashMap::new();
+    for connection in &cfg.connections {
+        if is_postgres_cdc_connection(connection) {
+            let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Unknown);
+            cache.insert(connection.id.clone(), tx);
+        }
+    }
+    Arc::new(cache)
+}
+
+async fn sample_cached_postgres_cdc_slot_state(
+    connection: &ConnectionConfig,
+    state_store: &Arc<dyn AdminStateBackend>,
+) -> CachedPostgresCdcSlotState {
+    let sync_state = match state_store.load_state().await {
+        Ok(sync_state) => sync_state,
+        Err(err) => {
+            warn!(
+                connection = %connection.id,
+                error = %err,
+                "failed to load state for postgres CDC slot sampler"
+            );
+            return CachedPostgresCdcSlotState::Unknown;
+        }
+    };
+    let connection_state = sync_state.connections.get(&connection.id);
+    match load_postgres_cdc_slot_snapshot(connection, connection_state).await {
+        Ok(snapshot) => CachedPostgresCdcSlotState::Snapshot(snapshot),
+        Err(()) => CachedPostgresCdcSlotState::Unknown,
+    }
+}
+
+fn publish_cached_postgres_cdc_slot_state(
+    tx: &watch::Sender<CachedPostgresCdcSlotState>,
+    sample: CachedPostgresCdcSlotState,
+) {
+    tx.send_replace(sample);
+}
+
+fn spawn_cdc_slot_sampler_tasks(
+    cfg: Arc<Config>,
+    state_store: Arc<dyn AdminStateBackend>,
+    cache: CdcSlotSamplerCache,
+    shutdown: ShutdownSignal,
+) {
+    for connection in &cfg.connections {
+        if !is_postgres_cdc_connection(connection) {
+            continue;
+        }
+        let Some(tx) = cache.get(&connection.id).cloned() else {
+            continue;
+        };
+
+        let connection = connection.clone();
+        let state_store = state_store.clone();
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let initial = sample_cached_postgres_cdc_slot_state(&connection, &state_store).await;
+            publish_cached_postgres_cdc_slot_state(&tx, initial);
+            let mut interval = tokio::time::interval(CDC_SLOT_SAMPLER_INTERVAL);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let sample = sample_cached_postgres_cdc_slot_state(&connection, &state_store).await;
+                        publish_cached_postgres_cdc_slot_state(&tx, sample);
+                    }
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn cached_postgres_cdc_slot_state(
+    state: &AdminApiState,
+    connection: &ConnectionConfig,
+) -> Option<CachedPostgresCdcSlotState> {
+    if !is_postgres_cdc_connection(connection) {
+        return None;
+    }
+    state
+        .cdc_slot_sampler_cache
+        .get(&connection.id)
+        .map(|sender| sender.borrow().clone())
+        .or(Some(CachedPostgresCdcSlotState::Unknown))
+}
+
+fn cached_postgres_cdc_slot_snapshot(
+    state: &AdminApiState,
+    connection: &ConnectionConfig,
+) -> Result<Option<PostgresCdcSlotSnapshot>, ()> {
+    match cached_postgres_cdc_slot_state(state, connection) {
+        Some(CachedPostgresCdcSlotState::Snapshot(snapshot)) => Ok(snapshot),
+        Some(CachedPostgresCdcSlotState::Unknown) => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn cached_postgres_cdc_runtime_state(
+    state: &AdminApiState,
+    connection: &ConnectionConfig,
+) -> Option<PostgresCdcRuntimeState> {
+    match cached_postgres_cdc_slot_state(state, connection) {
+        Some(CachedPostgresCdcSlotState::Snapshot(snapshot)) => {
+            postgres_cdc_runtime_state_from_snapshot(snapshot.as_ref())
+        }
+        Some(CachedPostgresCdcSlotState::Unknown) => Some(PostgresCdcRuntimeState::Unknown),
+        None => None,
+    }
+}
+
 pub async fn spawn_admin_api(
     cfg: &Config,
     connection_id: &str,
     managed_connection_count: usize,
     mode: &str,
     shutdown: ShutdownSignal,
-) -> anyhow::Result<Option<JoinHandle<anyhow::Result<()>>>> {
+) -> anyhow::Result<Option<AdminApiHandle>> {
     let Some(admin_cfg) = cfg.admin_api.as_ref() else {
         return Ok(None);
     };
@@ -651,11 +846,13 @@ pub async fn spawn_admin_api(
     } else {
         None
     };
+    let cdc_slot_sampler_cache = build_cdc_slot_sampler_cache(cfg);
 
     let state = AdminApiState {
         cfg: Arc::new(cfg.clone()),
         state_store,
         stats_db,
+        cdc_slot_sampler_cache,
         auth_verifier,
         started_at: Utc::now(),
         mode: mode.to_string(),
@@ -671,19 +868,10 @@ pub async fn spawn_admin_api(
             .unwrap_or_else(|| "startup".to_string()),
     };
 
-    let app = router(state);
-
-    let listener = TcpListener::bind(bind).await?;
-    let mut shutdown = shutdown;
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.changed().await;
-            })
-            .await
-            .map_err(anyhow::Error::from)
-    });
-
+    let (handle, ready_rx) = spawn_admin_server_thread(state, bind, shutdown)?;
+    ready_rx
+        .await
+        .context("admin API startup signal channel closed")??;
     Ok(Some(handle))
 }
 
@@ -748,13 +936,13 @@ async fn connections(
     let sync_state = state.state_store.load_state().await?;
     let now = Utc::now();
     let mut items = Vec::with_capacity(state.cfg.connections.len());
-    for (connection, current, cdc_runtime_state) in
-        probe_connection_runtime_states(&state.cfg.connections, &sync_state).await
-    {
-        let current = current.as_ref();
+    for connection in &state.cfg.connections {
+        let current = sync_state.connections.get(&connection.id).cloned();
+        let cdc_runtime_state = cached_postgres_cdc_runtime_state(&state, connection);
+        let current_ref = current.as_ref();
         let runtime = derive_connection_runtime(
-            &connection,
-            current,
+            connection,
+            current_ref,
             None,
             cdc_runtime_state,
             now,
@@ -769,50 +957,16 @@ async fn connections(
             enabled: connection.enabled(),
             source_kind: source_kind(&connection.source),
             destination_kind: destination_kind(&connection.destination),
-            last_sync_started_at: current.and_then(|c| c.last_sync_started_at),
-            last_sync_finished_at: current.and_then(|c| c.last_sync_finished_at),
-            last_sync_status: current.and_then(|c| c.last_sync_status.clone()),
-            last_error: current.and_then(|c| c.last_error.clone()),
+            last_sync_started_at: current_ref.and_then(|c| c.last_sync_started_at),
+            last_sync_finished_at: current_ref.and_then(|c| c.last_sync_finished_at),
+            last_sync_status: current_ref.and_then(|c| c.last_sync_status.clone()),
+            last_error: current_ref.and_then(|c| c.last_error.clone()),
             phase: runtime.phase,
             reason_code: runtime.reason_code,
             max_checkpoint_age_seconds: runtime.max_checkpoint_age_seconds,
         });
     }
     Ok(Json(items))
-}
-
-async fn probe_connection_runtime_states(
-    connections: &[ConnectionConfig],
-    sync_state: &SyncState,
-) -> Vec<(
-    ConnectionConfig,
-    Option<ConnectionState>,
-    Option<PostgresCdcRuntimeState>,
-)> {
-    collect_connection_runtime_states(connections, sync_state, |connection, current| async move {
-        load_postgres_cdc_runtime_state(&connection, current.as_ref()).await
-    })
-    .await
-}
-
-async fn collect_connection_runtime_states<T, F, Fut>(
-    connections: &[ConnectionConfig],
-    sync_state: &SyncState,
-    inspect: F,
-) -> Vec<(ConnectionConfig, Option<ConnectionState>, T)>
-where
-    F: Fn(ConnectionConfig, Option<ConnectionState>) -> Fut + Copy,
-    Fut: Future<Output = T>,
-{
-    join_all(connections.iter().map(|connection| {
-        let connection = connection.clone();
-        let current = sync_state.connections.get(&connection.id).cloned();
-        async move {
-            let inspected = inspect(connection.clone(), current.clone()).await;
-            (connection, current, inspected)
-        }
-    }))
-    .await
 }
 
 async fn connection(
@@ -868,9 +1022,7 @@ async fn connection_runtime(
         .iter()
         .find(|connection| connection.id == connection_id)
         .context("connection not found")?;
-    let cdc_runtime_state =
-        load_postgres_cdc_runtime_state(connection, sync_state.connections.get(&connection_id))
-            .await;
+    let cdc_runtime_state = cached_postgres_cdc_runtime_state(&state, connection);
     let runtime = derive_connection_runtime(
         connection,
         sync_state.connections.get(&connection_id),
@@ -910,8 +1062,7 @@ async fn progress(
         (None, Vec::new())
     };
     let now = Utc::now();
-    let cdc_runtime_state =
-        load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
+    let cdc_runtime_state = cached_postgres_cdc_runtime_state(&state, config);
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
@@ -1022,8 +1173,7 @@ async fn connection_tables(
     } else {
         Vec::new()
     };
-    let cdc_runtime_state =
-        load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
+    let cdc_runtime_state = cached_postgres_cdc_runtime_state(&state, config);
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
@@ -1059,7 +1209,7 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
     let connection_state = sync_state.connections.get(&cursor.connection_id).cloned();
     let (current_run, run_tables, live_snapshot) =
         load_current_run_view(&cursor.state, &cursor.connection_id).await?;
-    let cdc_probe = load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await;
+    let cdc_probe = cached_postgres_cdc_slot_snapshot(&cursor.state, connection);
     let cdc_slot_snapshot = match &cdc_probe {
         Ok(snapshot) => snapshot.clone(),
         Err(()) => None,
@@ -1475,23 +1625,6 @@ async fn load_postgres_cdc_slot_snapshot(
             continuity_lost: has_last_lsn,
         }),
     })
-}
-
-async fn load_postgres_cdc_runtime_state(
-    connection: &ConnectionConfig,
-    state: Option<&ConnectionState>,
-) -> Option<PostgresCdcRuntimeState> {
-    let SourceConfig::Postgres(pg) = &connection.source else {
-        return None;
-    };
-    if !pg.cdc.unwrap_or(true) {
-        return None;
-    }
-
-    match load_postgres_cdc_slot_snapshot(connection, state).await {
-        Ok(snapshot) => postgres_cdc_runtime_state_from_snapshot(snapshot.as_ref()),
-        Err(()) => Some(PostgresCdcRuntimeState::Unknown),
-    }
 }
 
 fn postgres_cdc_runtime_state_from_snapshot(

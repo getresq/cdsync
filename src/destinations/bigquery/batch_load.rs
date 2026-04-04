@@ -1,6 +1,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use polars::io::parquet::write::{ParquetCompression, ParquetWriter};
@@ -19,8 +19,8 @@ use gcloud_bigquery::http::table::{
     ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
 };
 
+use super::BIGQUERY_REQUEST_TIMEOUT;
 use super::BigQueryDestination;
-use super::{BIGQUERY_JOB_TIMEOUT, BIGQUERY_REQUEST_TIMEOUT};
 use crate::destinations::bigquery::values::{
     anyvalue_to_bool, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
     anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
@@ -148,7 +148,6 @@ impl BigQueryDestination {
     async fn wait_for_job_completion(&self, job: &Job) -> Result<()> {
         let job_id = &job.job_reference.job_id;
         let location = job.job_reference.location.clone();
-        let started_at = Instant::now();
         loop {
             let current = BigQueryDestination::await_with_timeout(
                 format!("fetching BigQuery job {}", job_id),
@@ -173,14 +172,6 @@ impl BigQueryDestination {
                     anyhow::bail!("BigQuery load job {} reported errors: {:?}", job_id, errors);
                 }
                 return Ok(());
-            }
-
-            if started_at.elapsed() >= BIGQUERY_JOB_TIMEOUT {
-                anyhow::bail!(
-                    "BigQuery load job {} did not finish within {}s",
-                    job_id,
-                    BIGQUERY_JOB_TIMEOUT.as_secs()
-                );
             }
 
             sleep(Duration::from_secs(1)).await;
