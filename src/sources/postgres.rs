@@ -46,6 +46,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client as TokioPgClient, NoTls, Row as TokioPgRow, SimpleQueryMessage};
@@ -69,6 +70,22 @@ use self::schema::*;
 use self::table_selection::*;
 
 type CdcApplyFuture = Pin<Box<dyn Future<Output = Result<CdcApplyFragmentAck>> + Send>>;
+type CdcDispatchFuture = Pin<Box<dyn Future<Output = Result<CdcDispatchResult>> + Send>>;
+
+enum CdcDispatchResult {
+    Immediate(CdcApplyFragmentAck),
+    Deferred(CdcDeferredApplyAck),
+}
+
+struct CdcDeferredApplyAck {
+    released_table: Option<TableId>,
+    completion: CdcApplyFuture,
+}
+
+pub(crate) enum CdcTableApplyExecution {
+    Immediate,
+    Deferred(oneshot::Receiver<etl::error::EtlResult<()>>),
+}
 
 pub(crate) fn admin_cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>) -> Result<String> {
     cdc_sync::cdc_slot_name(connection_id, pipeline_id)

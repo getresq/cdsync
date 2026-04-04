@@ -21,7 +21,7 @@ use gcloud_bigquery::http::table::{
 use gcloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row};
 use polars::prelude::DataFrame;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -60,10 +60,34 @@ pub struct DestinationTableSummary {
     pub deleted_rows: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CdcBatchLoadJobStep {
+    pub(crate) staging_table: String,
+    pub(crate) object_uri: String,
+    pub(crate) row_count: usize,
+    pub(crate) upserted_count: usize,
+    pub(crate) deleted_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CdcBatchLoadJobPayload {
+    pub(crate) job_id: String,
+    pub(crate) source_table: String,
+    pub(crate) target_table: String,
+    pub(crate) schema: TableSchema,
+    pub(crate) primary_key: String,
+    pub(crate) truncate: bool,
+    pub(crate) steps: Vec<CdcBatchLoadJobStep>,
+}
+
 const INSERT_ALL_BLOCKING_ROWS: usize = 512;
 pub(super) const BIGQUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl BigQueryDestination {
+    pub(crate) fn cdc_batch_load_queue_enabled(&self) -> bool {
+        self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none()
+    }
+
     pub async fn new(
         mut config: BigQueryConfig,
         dry_run: bool,
@@ -651,6 +675,99 @@ impl BigQueryDestination {
         Ok(())
     }
 
+    pub(crate) async fn upload_cdc_batch_load_artifact(
+        &self,
+        staging_table: &str,
+        schema: &TableSchema,
+        frame: &DataFrame,
+    ) -> Result<String> {
+        if !self.cdc_batch_load_queue_enabled() {
+            anyhow::bail!("CDC batch-load queue requires batch_load_bucket");
+        }
+        let bucket = self
+            .config
+            .batch_load_bucket
+            .as_deref()
+            .context("missing batch_load_bucket")?;
+        let token_source = self
+            .gcs_token_source
+            .as_ref()
+            .context("missing GCS token source for CDC batch-load queue")?;
+
+        let schema = with_metadata_schema(schema, &self.metadata);
+        let object_name = batch_load::batch_load_object_name(
+            self.config.batch_load_prefix.as_deref(),
+            staging_table,
+            batch_load::PARQUET_FILE_EXTENSION,
+        );
+        let object_uri = format!("gs://{}/{}", bucket, object_name);
+        let body = batch_load::parquet_payload(frame, &schema).await?;
+        self.upload_batch_load_object(
+            token_source,
+            bucket,
+            &object_name,
+            batch_load::PARQUET_CONTENT_TYPE,
+            body,
+        )
+        .await
+        .with_context(|| format!("uploading CDC batch load object {}", object_uri))?;
+        Ok(object_uri)
+    }
+
+    pub(crate) async fn process_cdc_batch_load_job(
+        &self,
+        payload: &CdcBatchLoadJobPayload,
+    ) -> Result<()> {
+        self.ensure_table(&payload.schema).await?;
+        if payload.truncate {
+            self.truncate_table(&payload.target_table).await?;
+        }
+        for step in &payload.steps {
+            info!(
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count,
+                "ensuring staging table for queued BigQuery merge"
+            );
+            self.ensure_table_internal(&payload.schema, &step.staging_table, false)
+                .await?;
+            info!(
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count,
+                "queued staging table ensured for BigQuery merge"
+            );
+            self.run_load_job(
+                &step.staging_table,
+                &with_metadata_schema(&payload.schema, &self.metadata),
+                &step.object_uri,
+            )
+            .await?;
+            info!(
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count,
+                "starting queued BigQuery merge from staging table"
+            );
+            self.merge_staging(
+                &payload.target_table,
+                &step.staging_table,
+                &payload.schema,
+                &payload.primary_key,
+            )
+            .await?;
+            info!(
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count,
+                "completed queued BigQuery merge from staging table"
+            );
+            self.spawn_drop_table_if_exists(step.staging_table.clone())
+                .await;
+        }
+        Ok(())
+    }
+
     async fn merge_staging(
         &self,
         target: &str,
@@ -927,7 +1044,7 @@ async fn insert_all_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
         .map_err(|err| anyhow::anyhow!("failed to join insertAll row conversion task: {}", err))?
 }
 
-fn upsert_staging_table_id(table: &str) -> String {
+pub(crate) fn upsert_staging_table_id(table: &str) -> String {
     format!("{table}_staging_{}", Uuid::new_v4().simple())
 }
 

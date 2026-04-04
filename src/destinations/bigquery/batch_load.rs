@@ -86,7 +86,7 @@ impl BigQueryDestination {
         Ok(true)
     }
 
-    async fn upload_batch_load_object(
+    pub(super) async fn upload_batch_load_object(
         &self,
         token_source: &Arc<dyn TokenSource>,
         bucket: &str,
@@ -138,7 +138,7 @@ impl BigQueryDestination {
         Ok(())
     }
 
-    async fn run_load_job(
+    pub(super) async fn run_load_job(
         &self,
         table_id: &str,
         schema: &TableSchema,
@@ -234,13 +234,13 @@ impl BigQueryDestination {
     }
 }
 
-const PARQUET_FILE_EXTENSION: &str = "parquet";
-const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
+pub(super) const PARQUET_FILE_EXTENSION: &str = "parquet";
+pub(super) const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 const BATCH_LOAD_PARQUET_BLOCKING_ROWS: usize = 1024;
 const BATCH_LOAD_JOB_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const BATCH_LOAD_JOB_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
 
-async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
+pub(super) async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
     if frame.height() < BATCH_LOAD_PARQUET_BLOCKING_ROWS {
         return dataframe_to_parquet_bytes(frame, schema);
     }
@@ -294,7 +294,11 @@ fn build_load_job(
     }
 }
 
-fn batch_load_object_name(prefix: Option<&str>, table_id: &str, extension: &str) -> String {
+pub(super) fn batch_load_object_name(
+    prefix: Option<&str>,
+    table_id: &str,
+    extension: &str,
+) -> String {
     let base = format!(
         "{}_{}.{}",
         table_id.replace('.', "_"),

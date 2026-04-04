@@ -1,5 +1,8 @@
-use crate::destinations::bigquery::BigQueryDestination;
+use crate::destinations::bigquery::{
+    BigQueryDestination, CdcBatchLoadJobPayload, CdcBatchLoadJobStep,
+};
 use crate::destinations::{Destination as CdsDestination, WriteMode};
+use crate::state::{CdcBatchLoadJobRecord, CdcBatchLoadJobStatus, StateHandle};
 use crate::stats::StatsHandle;
 use crate::types::{DataType, MetadataColumns, TableSchema};
 use anyhow::Result;
@@ -16,11 +19,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
 use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use tokio::task;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct EtlBigQueryDestination {
@@ -28,6 +33,7 @@ pub struct EtlBigQueryDestination {
     tables: Arc<RwLock<HashMap<TableId, CdcTableInfo>>>,
     stats: Option<StatsHandle>,
     apply_concurrency: usize,
+    cdc_batch_load_manager: Option<Arc<CdcBatchLoadManager>>,
 }
 
 #[derive(Clone)]
@@ -61,6 +67,26 @@ struct CdcCommitTableWork {
     rows: Vec<TableRow>,
     delete_rows: Vec<TableRow>,
     truncate: bool,
+}
+
+struct CdcQueuedBatchLoadJob {
+    record: CdcBatchLoadJobRecord,
+    payload: CdcBatchLoadJobPayload,
+}
+
+#[derive(Default)]
+struct CdcBatchLoadSchedulerState {
+    active_tables: HashSet<String>,
+    queued_by_table: HashMap<String, VecDeque<CdcQueuedBatchLoadJob>>,
+}
+
+#[derive(Clone)]
+struct CdcBatchLoadManager {
+    inner: BigQueryDestination,
+    stats: Option<StatsHandle>,
+    state_handle: StateHandle,
+    scheduler: Arc<Mutex<CdcBatchLoadSchedulerState>>,
+    waiters: Arc<Mutex<HashMap<String, oneshot::Sender<EtlResult<()>>>>>,
 }
 
 enum PendingTableRowAction {
@@ -121,18 +147,31 @@ impl CdcTableInfo {
 }
 
 impl EtlBigQueryDestination {
-    pub fn new(
+    pub async fn new(
         inner: BigQueryDestination,
         tables: HashMap<TableId, CdcTableInfo>,
         stats: Option<StatsHandle>,
         apply_concurrency: usize,
-    ) -> Self {
-        Self {
+        state_handle: Option<StateHandle>,
+    ) -> Result<Self> {
+        let cdc_batch_load_manager = if inner.cdc_batch_load_queue_enabled() {
+            if let Some(state_handle) = state_handle {
+                Some(Arc::new(
+                    CdcBatchLoadManager::new(inner.clone(), stats.clone(), state_handle).await?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Self {
             inner,
             tables: Arc::new(RwLock::new(tables)),
             stats,
             apply_concurrency: apply_concurrency.max(1),
-        }
+            cdc_batch_load_manager,
+        })
     }
 
     async fn get_table(&self, table_id: TableId) -> EtlResult<CdcTableInfo> {
@@ -358,6 +397,302 @@ impl EtlBigQueryDestination {
         let synced_at = Utc::now();
         self.apply_table_work(&info, work, synced_at, synced_at)
             .await
+    }
+
+    pub(crate) async fn dispatch_table_events(
+        &self,
+        table_id: TableId,
+        events: Vec<Event>,
+        first_sequence: u64,
+    ) -> EtlResult<crate::sources::postgres::CdcTableApplyExecution> {
+        let info = self.get_table(table_id).await?;
+        let work = compact_table_events(&info, table_id, events)?;
+        let synced_at = Utc::now();
+        let delete_synced_at = synced_at;
+
+        if let Some(manager) = &self.cdc_batch_load_manager {
+            let payload = self
+                .prepare_cdc_batch_load_job(&info, work, synced_at, delete_synced_at)
+                .await?;
+            let rx = manager.enqueue(first_sequence, payload).await?;
+            return Ok(crate::sources::postgres::CdcTableApplyExecution::Deferred(
+                rx,
+            ));
+        }
+
+        self.apply_table_work(&info, work, synced_at, delete_synced_at)
+            .await?;
+        Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate)
+    }
+}
+
+impl EtlBigQueryDestination {
+    async fn prepare_cdc_batch_load_job(
+        &self,
+        info: &CdcTableInfo,
+        work: CdcCommitTableWork,
+        synced_at: DateTime<Utc>,
+        delete_synced_at: DateTime<Utc>,
+    ) -> EtlResult<CdcBatchLoadJobPayload> {
+        let mut steps = Vec::new();
+
+        if !work.rows.is_empty() {
+            let row_count = work.rows.len();
+            let frame = build_cdc_frame(info.clone(), work.rows, synced_at, None).await?;
+            let staging_table = super::bigquery::upsert_staging_table_id(&info.dest_name);
+            let object_uri = self
+                .inner
+                .upload_cdc_batch_load_artifact(&staging_table, &info.schema, &frame)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to upload CDC batch-load artifact",
+                        err.to_string()
+                    )
+                })?;
+            steps.push(CdcBatchLoadJobStep {
+                staging_table,
+                object_uri,
+                row_count,
+                upserted_count: row_count,
+                deleted_count: 0,
+            });
+        }
+
+        if !work.delete_rows.is_empty() {
+            let row_count = work.delete_rows.len();
+            let frame = build_cdc_frame(
+                info.clone(),
+                work.delete_rows,
+                delete_synced_at,
+                Some(delete_synced_at),
+            )
+            .await?;
+            let staging_table = super::bigquery::upsert_staging_table_id(&info.dest_name);
+            let object_uri = self
+                .inner
+                .upload_cdc_batch_load_artifact(&staging_table, &info.schema, &frame)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to upload CDC delete batch-load artifact",
+                        err.to_string()
+                    )
+                })?;
+            steps.push(CdcBatchLoadJobStep {
+                staging_table,
+                object_uri,
+                row_count,
+                upserted_count: row_count,
+                deleted_count: row_count,
+            });
+        }
+
+        Ok(CdcBatchLoadJobPayload {
+            job_id: Uuid::new_v4().to_string(),
+            source_table: info.source_name.clone(),
+            target_table: info.dest_name.clone(),
+            schema: info.schema.clone(),
+            primary_key: info.primary_key.clone(),
+            truncate: work.truncate,
+            steps,
+        })
+    }
+}
+
+impl CdcBatchLoadManager {
+    async fn new(
+        inner: BigQueryDestination,
+        stats: Option<StatsHandle>,
+        state_handle: StateHandle,
+    ) -> Result<Self> {
+        let manager = Self {
+            inner,
+            stats,
+            state_handle,
+            scheduler: Arc::new(Mutex::new(CdcBatchLoadSchedulerState::default())),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+        };
+        manager.restore_pending_jobs().await?;
+        Ok(manager)
+    }
+
+    async fn restore_pending_jobs(&self) -> Result<()> {
+        for record in self
+            .state_handle
+            .load_cdc_batch_load_jobs(&[
+                CdcBatchLoadJobStatus::Pending,
+                CdcBatchLoadJobStatus::Running,
+            ])
+            .await?
+        {
+            let payload: CdcBatchLoadJobPayload = serde_json::from_str(&record.payload_json)?;
+            self.enqueue_loaded_job(CdcQueuedBatchLoadJob { record, payload })
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn enqueue(
+        &self,
+        first_sequence: u64,
+        payload: CdcBatchLoadJobPayload,
+    ) -> EtlResult<oneshot::Receiver<EtlResult<()>>> {
+        let now = Utc::now().timestamp_millis();
+        let record = CdcBatchLoadJobRecord {
+            job_id: payload.job_id.clone(),
+            table_key: payload.target_table.clone(),
+            first_sequence,
+            status: CdcBatchLoadJobStatus::Pending,
+            payload_json: serde_json::to_string(&payload).map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to serialize CDC batch-load job payload",
+                    err.to_string()
+                )
+            })?,
+            attempt_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.state_handle
+            .enqueue_cdc_batch_load_job(&record)
+            .await
+            .map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to persist CDC batch-load job",
+                    err.to_string()
+                )
+            })?;
+
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().await.insert(record.job_id.clone(), tx);
+        self.enqueue_loaded_job(CdcQueuedBatchLoadJob { record, payload })
+            .await;
+        Ok(rx)
+    }
+
+    async fn enqueue_loaded_job(&self, job: CdcQueuedBatchLoadJob) {
+        let table_key = job.record.table_key.clone();
+        let maybe_start = {
+            let mut scheduler = self.scheduler.lock().await;
+            let should_start = !scheduler.active_tables.contains(&table_key);
+            scheduler
+                .queued_by_table
+                .entry(table_key.clone())
+                .or_insert_with(VecDeque::new)
+                .push_back(job);
+            if should_start {
+                scheduler.active_tables.insert(table_key.clone());
+                scheduler
+                    .queued_by_table
+                    .get_mut(&table_key)
+                    .and_then(|queue| queue.pop_front())
+            } else {
+                None
+            }
+        };
+        if let Some(job) = maybe_start {
+            self.spawn_job(job);
+        }
+    }
+
+    fn spawn_job(&self, job: CdcQueuedBatchLoadJob) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.run_job(job).await;
+        });
+    }
+
+    async fn run_job(&self, job: CdcQueuedBatchLoadJob) {
+        let job_id = job.record.job_id.clone();
+        let table_key = job.record.table_key.clone();
+        let started_at = Instant::now();
+        let running_mark = self
+            .state_handle
+            .mark_cdc_batch_load_job_running(&job_id)
+            .await;
+        let result = if let Err(err) = running_mark {
+            Err(etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to mark CDC batch-load job running",
+                err.to_string()
+            ))
+        } else {
+            self.inner
+                .process_cdc_batch_load_job(&job.payload)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to process CDC batch-load job",
+                        err.to_string()
+                    )
+                })
+        };
+
+        match &result {
+            Ok(()) => {
+                if let Some(stats) = &self.stats {
+                    let row_count = job.payload.steps.iter().map(|step| step.row_count).sum();
+                    let upserted = job
+                        .payload
+                        .steps
+                        .iter()
+                        .map(|step| step.upserted_count)
+                        .sum();
+                    let deleted = job
+                        .payload
+                        .steps
+                        .iter()
+                        .map(|step| step.deleted_count)
+                        .sum();
+                    stats
+                        .record_load(
+                            &job.payload.source_table,
+                            row_count,
+                            upserted,
+                            deleted,
+                            started_at.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                }
+                let _ = self
+                    .state_handle
+                    .mark_cdc_batch_load_job_succeeded(&job_id)
+                    .await;
+            }
+            Err(err) => {
+                let _ = self
+                    .state_handle
+                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string())
+                    .await;
+            }
+        }
+
+        if let Some(waiter) = self.waiters.lock().await.remove(&job_id) {
+            let _ = waiter.send(result);
+        }
+
+        let next_job = {
+            let mut scheduler = self.scheduler.lock().await;
+            let next = scheduler
+                .queued_by_table
+                .get_mut(&table_key)
+                .and_then(|queue| queue.pop_front());
+            if next.is_none() {
+                scheduler.active_tables.remove(&table_key);
+                scheduler.queued_by_table.remove(&table_key);
+            }
+            next
+        };
+        if let Some(next_job) = next_job {
+            self.spawn_job(next_job);
+        }
     }
 }
 

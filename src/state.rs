@@ -32,6 +32,48 @@ pub struct PostgresCdcState {
     pub slot_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CdcBatchLoadJobStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl CdcBatchLoadJobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("unknown CDC batch load job status {}", other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdcBatchLoadJobRecord {
+    pub job_id: String,
+    pub table_key: String,
+    pub first_sequence: u64,
+    pub status: CdcBatchLoadJobStatus,
+    pub payload_json: String,
+    pub attempt_count: i32,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConnectionState {
     #[serde(default)]
@@ -408,6 +450,163 @@ impl SyncStateStore {
         Ok(checkpoints)
     }
 
+    pub async fn enqueue_cdc_batch_load_job(
+        &self,
+        connection_id: &str,
+        job: &CdcBatchLoadJobRecord,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            r#"
+            insert into {} (
+                connection_id,
+                job_id,
+                table_key,
+                first_sequence,
+                status,
+                payload_json,
+                attempt_count,
+                last_error,
+                created_at,
+                updated_at
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            on conflict(job_id) do update set
+                table_key = excluded.table_key,
+                first_sequence = excluded.first_sequence,
+                status = excluded.status,
+                payload_json = excluded.payload_json,
+                attempt_count = excluded.attempt_count,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(&job.job_id)
+        .bind(&job.table_key)
+        .bind(job.first_sequence as i64)
+        .bind(job.status.as_str())
+        .bind(&job.payload_json)
+        .bind(job.attempt_count)
+        .bind(job.last_error.clone())
+        .bind(job.created_at)
+        .bind(job.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_cdc_batch_load_jobs(
+        &self,
+        connection_id: &str,
+        statuses: &[CdcBatchLoadJobStatus],
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        let status_values: Vec<&str> = statuses.iter().map(|status| status.as_str()).collect();
+        let rows = sqlx::query(&format!(
+            r#"
+            select job_id, table_key, first_sequence, status, payload_json, attempt_count, last_error, created_at, updated_at
+            from {}
+            where connection_id = $1
+              and status = any($2)
+            order by first_sequence asc, created_at asc
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(&status_values)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(CdcBatchLoadJobRecord {
+                    job_id: row.try_get("job_id")?,
+                    table_key: row.try_get("table_key")?,
+                    first_sequence: row.try_get::<i64, _>("first_sequence")? as u64,
+                    status: CdcBatchLoadJobStatus::from_str(row.try_get("status")?)?,
+                    payload_json: row.try_get("payload_json")?,
+                    attempt_count: row.try_get("attempt_count")?,
+                    last_error: row.try_get("last_error")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn mark_cdc_batch_load_job_running(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                attempt_count = attempt_count + 1,
+                updated_at = $4
+            where connection_id = $1 and job_id = $2
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcBatchLoadJobStatus::Running.as_str())
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_cdc_batch_load_job_succeeded(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                last_error = null,
+                updated_at = $4
+            where connection_id = $1 and job_id = $2
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcBatchLoadJobStatus::Succeeded.as_str())
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_cdc_batch_load_job_failed(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                last_error = $4,
+                updated_at = $5
+            where connection_id = $1 and job_id = $2
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind(error)
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn acquire_connection_lock(
         &self,
         connection_id: &str,
@@ -450,6 +649,7 @@ impl SyncStateStore {
         ensure_table_exists(&mut conn, &self.schema, "connection_state").await?;
         ensure_table_exists(&mut conn, &self.schema, "table_checkpoints").await?;
         ensure_table_exists(&mut conn, &self.schema, "connection_locks").await?;
+        ensure_table_exists(&mut conn, &self.schema, "cdc_batch_load_jobs").await?;
         Ok(())
     }
 
@@ -578,6 +778,46 @@ impl StateHandle {
     ) -> anyhow::Result<()> {
         self.store
             .save_postgres_cdc_state(&self.connection_id, cdc_state)
+            .await
+    }
+
+    pub async fn enqueue_cdc_batch_load_job(
+        &self,
+        job: &CdcBatchLoadJobRecord,
+    ) -> anyhow::Result<()> {
+        self.store
+            .enqueue_cdc_batch_load_job(&self.connection_id, job)
+            .await
+    }
+
+    pub async fn load_cdc_batch_load_jobs(
+        &self,
+        statuses: &[CdcBatchLoadJobStatus],
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        self.store
+            .load_cdc_batch_load_jobs(&self.connection_id, statuses)
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_job_running(&self, job_id: &str) -> anyhow::Result<()> {
+        self.store
+            .mark_cdc_batch_load_job_running(&self.connection_id, job_id)
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_job_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
+        self.store
+            .mark_cdc_batch_load_job_succeeded(&self.connection_id, job_id)
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_job_failed(
+        &self,
+        job_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.store
+            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error)
             .await
     }
 

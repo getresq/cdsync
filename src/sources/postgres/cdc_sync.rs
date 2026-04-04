@@ -368,7 +368,9 @@ impl PostgresSource {
             table_info_map.clone(),
             stats.clone(),
             cdc_apply_concurrency,
-        );
+            state_handle.clone(),
+        )
+        .await?;
 
         let slot_name = cdc_slot_name(
             state_handle

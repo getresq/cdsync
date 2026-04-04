@@ -180,7 +180,7 @@ pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableAp
 pub(super) fn dispatch_cdc_batches(
     queued_batches: &mut VecDeque<CommittedCdcBatch>,
     pending_table_batches: &mut HashMap<TableId, PendingTableApplyBatch>,
-    inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
+    inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
     watermark_tracker: &mut CdcWatermarkTracker,
     dest: &EtlBigQueryDestination,
     coordination: &mut CdcApplyCoordination<'_>,
@@ -212,11 +212,11 @@ pub(super) fn dispatch_cdc_batches(
 
         if batch.table_batches.is_empty() {
             let sequences = vec![batch.sequence];
-            inflight_apply.push(Box::pin(async move {
-                Ok(CdcApplyFragmentAck {
+            inflight_dispatch.push(Box::pin(async move {
+                Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
                     sequences,
                     released_table: None,
-                })
+                }))
             }));
             continue;
         }
@@ -253,7 +253,7 @@ pub(super) fn dispatch_cdc_batches(
     ready_tables.sort_by_key(|(sequence, _)| *sequence);
 
     for (_, table_id) in ready_tables {
-        if inflight_apply.len() >= config.max_active_applies {
+        if inflight_dispatch.len() >= config.max_active_applies {
             break;
         }
         if coordination.active_table_applies.contains(&table_id) {
@@ -277,11 +277,11 @@ pub(super) fn dispatch_cdc_batches(
             table_id = table_id.into_inner(),
             sequence_count,
             event_count,
-            inflight_apply = inflight_apply.len(),
+            inflight_dispatch = inflight_dispatch.len(),
             force_flush = config.force_flush,
             "cdc table batch dispatched"
         );
-        inflight_apply.push(Box::pin(async move {
+        inflight_dispatch.push(Box::pin(async move {
             info!(
                 table_id = table_id.into_inner(),
                 sequence_count, event_count, "waiting to acquire cdc table apply lock"
@@ -291,25 +291,73 @@ pub(super) fn dispatch_cdc_batches(
                 table_id = table_id.into_inner(),
                 sequence_count, event_count, "acquired cdc table apply lock"
             );
-            apply_dest
-                .write_table_events(table_id, events)
+            match apply_dest
+                .dispatch_table_events(table_id, events, sequences[0])
                 .await
                 .map_err(|err| {
                     anyhow::anyhow!(
-                        "applying CDC table batch for {} failed: {}",
+                        "dispatching CDC table batch for {} failed: {}",
                         table_id.into_inner(),
                         err
                     )
-                })?;
-            info!(
-                table_id = table_id.into_inner(),
-                sequence_count, event_count, "cdc table batch apply completed"
-            );
-            Ok(CdcApplyFragmentAck {
-                sequences,
-                released_table: Some(table_id),
-            })
+                })? {
+                CdcTableApplyExecution::Immediate => {
+                    info!(
+                        table_id = table_id.into_inner(),
+                        sequence_count, event_count, "cdc table batch apply completed"
+                    );
+                    Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
+                        sequences,
+                        released_table: Some(table_id),
+                    }))
+                }
+                CdcTableApplyExecution::Deferred(receiver) => {
+                    let completion = Box::pin(async move {
+                        receiver.await.map_err(|_| {
+                            anyhow::anyhow!(
+                                "CDC batch-load completion channel closed for {}",
+                                table_id.into_inner()
+                            )
+                        })??;
+                        info!(
+                            table_id = table_id.into_inner(),
+                            sequence_count, event_count, "cdc table batch apply completed"
+                        );
+                        Ok(CdcApplyFragmentAck {
+                            sequences,
+                            released_table: None,
+                        })
+                    });
+                    Ok(CdcDispatchResult::Deferred(CdcDeferredApplyAck {
+                        released_table: Some(table_id),
+                        completion,
+                    }))
+                }
+            }
         }));
+    }
+}
+
+pub(super) fn handle_cdc_dispatch_result(
+    result: Option<Result<CdcDispatchResult>>,
+    watermark_tracker: &mut CdcWatermarkTracker,
+    inflight_completion: &mut FuturesUnordered<CdcApplyFuture>,
+    active_table_applies: &mut HashSet<TableId>,
+) -> Result<Vec<CdcWatermarkAdvance>> {
+    let Some(result) = result else {
+        return Ok(Vec::new());
+    };
+    match result? {
+        CdcDispatchResult::Immediate(ack) => {
+            handle_cdc_apply_result(Some(Ok(ack)), watermark_tracker, active_table_applies)
+        }
+        CdcDispatchResult::Deferred(deferred) => {
+            if let Some(table_id) = deferred.released_table {
+                active_table_applies.remove(&table_id);
+            }
+            inflight_completion.push(deferred.completion);
+            Ok(Vec::new())
+        }
     }
 }
 
