@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use tokio::task;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -612,6 +612,14 @@ impl CdcBatchLoadManager {
         let job_id = job.record.job_id.clone();
         let table_key = job.record.table_key.clone();
         let started_at = Instant::now();
+        let span = info_span!(
+            "cdc_batch_load_job",
+            job_id = %job_id,
+            table = %table_key,
+            first_sequence = job.record.first_sequence,
+            step_count = job.payload.steps.len()
+        );
+        let _span = span.enter();
         let running_mark = self
             .state_handle
             .mark_cdc_batch_load_job_running(&job_id)
@@ -637,6 +645,12 @@ impl CdcBatchLoadManager {
 
         match &result {
             Ok(()) => {
+                info!(
+                    job_id = %job_id,
+                    table = %table_key,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "queued CDC batch-load job succeeded"
+                );
                 if let Some(stats) = &self.stats {
                     let row_count = job.payload.steps.iter().map(|step| step.row_count).sum();
                     let upserted = job
@@ -667,6 +681,13 @@ impl CdcBatchLoadManager {
                     .await;
             }
             Err(err) => {
+                warn!(
+                    job_id = %job_id,
+                    table = %table_key,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %err,
+                    "queued CDC batch-load job failed"
+                );
                 let _ = self
                     .state_handle
                     .mark_cdc_batch_load_job_failed(&job_id, &err.to_string())

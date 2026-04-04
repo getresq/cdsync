@@ -83,10 +83,28 @@ pub struct CdcBatchLoadQueueSummary {
     pub failed_jobs: i64,
     pub oldest_pending_age_seconds: Option<i64>,
     pub oldest_running_age_seconds: Option<i64>,
-    pub first_inflight_sequence: Option<u64>,
-    pub first_inflight_table: Option<String>,
+    pub jobs_per_minute: i64,
+    pub rows_per_minute: i64,
+    pub avg_job_duration_seconds: Option<f64>,
+    pub top_queued_tables: Vec<CdcBatchLoadQueueTableSummary>,
+    pub top_loaded_tables: Vec<CdcBatchLoadLoadedTableSummary>,
     pub latest_failed_error: Option<String>,
     pub latest_failed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CdcBatchLoadQueueTableSummary {
+    pub table_key: String,
+    pub queued_jobs: i64,
+    pub queued_rows: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CdcBatchLoadLoadedTableSummary {
+    pub table_key: String,
+    pub succeeded_jobs: i64,
+    pub loaded_rows: i64,
+    pub total_duration_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -627,6 +645,8 @@ impl SyncStateStore {
         connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
         let now = now_millis();
+        let one_minute_ago = now - 60_000;
+        let fifteen_minutes_ago = now - (15 * 60_000);
         let aggregate = sqlx::query(&format!(
             r#"
             select
@@ -636,29 +656,110 @@ impl SyncStateStore {
                 count(*) filter (where status = 'succeeded')::bigint as succeeded_jobs,
                 count(*) filter (where status = 'failed')::bigint as failed_jobs,
                 min(created_at) filter (where status = 'pending') as oldest_pending_ms,
-                min(updated_at) filter (where status = 'running') as oldest_running_ms
+                min(updated_at) filter (where status = 'running') as oldest_running_ms,
+                count(*) filter (where status = 'succeeded' and updated_at >= $2)::bigint as jobs_per_minute,
+                avg((updated_at - created_at)::double precision) filter (where status = 'succeeded' and updated_at >= $3) as avg_job_duration_ms
             from {}
             where connection_id = $1
             "#,
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
+        .bind(one_minute_ago)
+        .bind(fifteen_minutes_ago)
         .fetch_one(&self.pool)
         .await?;
 
-        let inflight = sqlx::query(&format!(
+        let queued_tables = sqlx::query(&format!(
             r#"
-            select first_sequence, table_key
-            from {}
-            where connection_id = $1
-              and status in ('pending', 'running')
-            order by first_sequence asc, created_at asc
-            limit 1
+            with job_rows as (
+                select
+                    job_id,
+                    table_key,
+                    coalesce(
+                        (
+                            select sum((step->>'row_count')::bigint)
+                            from jsonb_array_elements((payload_json::jsonb)->'steps') step
+                        ),
+                        0
+                    ) as row_count
+                from {}
+                where connection_id = $1
+                  and status in ('pending', 'running')
+            )
+            select table_key,
+                   count(*)::bigint as queued_jobs,
+                   coalesce(sum(row_count), 0)::bigint as queued_rows
+            from job_rows
+            group by table_key
+            order by queued_rows desc, queued_jobs desc, table_key asc
+            limit 5
             "#,
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let loaded_tables = sqlx::query(&format!(
+            r#"
+            with succeeded_jobs as (
+                select
+                    job_id,
+                    table_key,
+                    created_at,
+                    updated_at,
+                    coalesce(
+                        (
+                            select sum((step->>'row_count')::bigint)
+                            from jsonb_array_elements((payload_json::jsonb)->'steps') step
+                        ),
+                        0
+                    ) as row_count
+                from {}
+                where connection_id = $1
+                  and status = 'succeeded'
+                  and updated_at >= $2
+            )
+            select table_key,
+                   count(*)::bigint as succeeded_jobs,
+                   coalesce(sum(row_count), 0)::bigint as loaded_rows,
+                   coalesce(sum((updated_at - created_at)::double precision), 0) as total_duration_ms
+            from succeeded_jobs
+            group by table_key
+            order by total_duration_ms desc, succeeded_jobs desc, table_key asc
+            limit 5
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(fifteen_minutes_ago)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let rows_per_minute = sqlx::query_scalar::<_, i64>(&format!(
+            r#"
+            with recent_jobs as (
+                select
+                    coalesce(
+                        (
+                            select sum((step->>'row_count')::bigint)
+                            from jsonb_array_elements((payload_json::jsonb)->'steps') step
+                        ),
+                        0
+                    ) as row_count
+                from {}
+                where connection_id = $1
+                  and status = 'succeeded'
+                  and updated_at >= $2
+            )
+            select coalesce(sum(row_count), 0)::bigint from recent_jobs
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(one_minute_ago)
+        .fetch_one(&self.pool)
         .await?;
 
         let failed = sqlx::query(&format!(
@@ -678,6 +779,7 @@ impl SyncStateStore {
 
         let oldest_pending_ms: Option<i64> = aggregate.try_get("oldest_pending_ms")?;
         let oldest_running_ms: Option<i64> = aggregate.try_get("oldest_running_ms")?;
+        let avg_job_duration_ms: Option<f64> = aggregate.try_get("avg_job_duration_ms")?;
 
         Ok(CdcBatchLoadQueueSummary {
             total_jobs: aggregate.try_get::<i64, _>("total_jobs")?,
@@ -687,13 +789,29 @@ impl SyncStateStore {
             failed_jobs: aggregate.try_get::<i64, _>("failed_jobs")?,
             oldest_pending_age_seconds: oldest_pending_ms.map(|ts| ((now - ts).max(0)) / 1000),
             oldest_running_age_seconds: oldest_running_ms.map(|ts| ((now - ts).max(0)) / 1000),
-            first_inflight_sequence: inflight
-                .as_ref()
-                .and_then(|row| row.try_get::<i64, _>("first_sequence").ok())
-                .map(|value| value as u64),
-            first_inflight_table: inflight
-                .as_ref()
-                .and_then(|row| row.try_get::<String, _>("table_key").ok()),
+            jobs_per_minute: aggregate.try_get::<i64, _>("jobs_per_minute")?,
+            rows_per_minute,
+            avg_job_duration_seconds: avg_job_duration_ms.map(|value| value / 1000.0),
+            top_queued_tables: queued_tables
+                .into_iter()
+                .map(|row| CdcBatchLoadQueueTableSummary {
+                    table_key: row.try_get("table_key").unwrap_or_default(),
+                    queued_jobs: row.try_get("queued_jobs").unwrap_or_default(),
+                    queued_rows: row.try_get("queued_rows").unwrap_or_default(),
+                })
+                .collect(),
+            top_loaded_tables: loaded_tables
+                .into_iter()
+                .map(|row| CdcBatchLoadLoadedTableSummary {
+                    table_key: row.try_get("table_key").unwrap_or_default(),
+                    succeeded_jobs: row.try_get("succeeded_jobs").unwrap_or_default(),
+                    loaded_rows: row.try_get("loaded_rows").unwrap_or_default(),
+                    total_duration_seconds: row
+                        .try_get::<f64, _>("total_duration_ms")
+                        .unwrap_or_default()
+                        / 1000.0,
+                })
+                .collect(),
             latest_failed_error: failed
                 .as_ref()
                 .and_then(|row| row.try_get::<Option<String>, _>("last_error").ok())

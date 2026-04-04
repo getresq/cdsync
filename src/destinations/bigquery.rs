@@ -31,7 +31,7 @@ use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -718,9 +718,28 @@ impl BigQueryDestination {
         &self,
         payload: &CdcBatchLoadJobPayload,
     ) -> Result<()> {
-        self.ensure_table(&payload.schema).await?;
+        let target_started_at = std::time::Instant::now();
+        let target_span = info_span!(
+            "cdc_batch_load_job.ensure_target",
+            table = %payload.target_table
+        );
+        {
+            let _target_span = target_span.enter();
+            self.ensure_table(&payload.schema).await?;
+        }
+        info!(
+            table = %payload.target_table,
+            duration_ms = target_started_at.elapsed().as_millis() as u64,
+            "queued ensure target completed"
+        );
         if payload.truncate {
+            let truncate_started_at = std::time::Instant::now();
             self.truncate_table(&payload.target_table).await?;
+            info!(
+                table = %payload.target_table,
+                duration_ms = truncate_started_at.elapsed().as_millis() as u64,
+                "queued truncate target completed"
+            );
         }
         for step in &payload.steps {
             info!(
@@ -729,14 +748,17 @@ impl BigQueryDestination {
                 rows = step.row_count,
                 "ensuring staging table for queued BigQuery merge"
             );
+            let ensure_staging_started_at = std::time::Instant::now();
             self.ensure_table_internal(&payload.schema, &step.staging_table, false)
                 .await?;
             info!(
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
+                duration_ms = ensure_staging_started_at.elapsed().as_millis() as u64,
                 "queued staging table ensured for BigQuery merge"
             );
+            let load_started_at = std::time::Instant::now();
             self.run_load_job(
                 &step.staging_table,
                 &with_metadata_schema(&payload.schema, &self.metadata),
@@ -747,8 +769,16 @@ impl BigQueryDestination {
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
+                duration_ms = load_started_at.elapsed().as_millis() as u64,
+                "queued BigQuery load job completed"
+            );
+            info!(
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count,
                 "starting queued BigQuery merge from staging table"
             );
+            let merge_started_at = std::time::Instant::now();
             self.merge_staging(
                 &payload.target_table,
                 &step.staging_table,
@@ -760,6 +790,7 @@ impl BigQueryDestination {
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
+                duration_ms = merge_started_at.elapsed().as_millis() as u64,
                 "completed queued BigQuery merge from staging table"
             );
             self.spawn_drop_table_if_exists(step.staging_table.clone())
