@@ -760,6 +760,35 @@ impl SyncStateStore {
         Ok(result.rows_affected())
     }
 
+    pub async fn requeue_retryable_failed_cdc_batch_load_jobs(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $2,
+                last_error = null,
+                updated_at = $3
+            where connection_id = $1
+              and status = $4
+              and (
+                last_error ilike '%failed to process CDC batch-load job%'
+                or last_error ilike '%merging staging BigQuery table%'
+                or last_error ilike '%BigQuery query returned errors%'
+              )
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(now_millis())
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn mark_cdc_batch_load_job_succeeded(
         &self,
         connection_id: &str,
@@ -1543,6 +1572,12 @@ impl StateHandle {
     pub async fn requeue_cdc_batch_load_running_jobs(&self) -> anyhow::Result<u64> {
         self.store
             .requeue_cdc_batch_load_running_jobs(&self.connection_id)
+            .await
+    }
+
+    pub async fn requeue_retryable_failed_cdc_batch_load_jobs(&self) -> anyhow::Result<u64> {
+        self.store
+            .requeue_retryable_failed_cdc_batch_load_jobs(&self.connection_id)
             .await
     }
 

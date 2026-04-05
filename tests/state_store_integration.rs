@@ -346,6 +346,46 @@ async fn postgres_state_store_requeues_running_jobs() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    handle
+        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
+            job_id: "job-failed-merge".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: CdcBatchLoadJobStatus::Failed,
+            payload_json: "{}".to_string(),
+            attempt_count: 2,
+            last_error: Some(
+                "[DestinationError] failed to process CDC batch-load job: merging staging BigQuery table foo into bar".to_string(),
+            ),
+            created_at: now,
+            updated_at: now,
+        })
+        .await?;
+
+    let requeued = handle
+        .requeue_retryable_failed_cdc_batch_load_jobs()
+        .await?;
+    assert_eq!(requeued, 1);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, "job-failed-merge");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());

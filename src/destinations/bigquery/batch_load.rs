@@ -154,6 +154,7 @@ impl BigQueryDestination {
             source_uri,
             &job_id,
             location.as_deref(),
+            WriteDisposition::WriteTruncate,
         );
 
         let created = BigQueryDestination::await_with_timeout(
@@ -252,6 +253,7 @@ pub(super) async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> 
         .map_err(|err| anyhow::anyhow!("failed to join batch-load parquet task: {}", err))?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_load_job(
     project_id: &str,
     dataset_id: &str,
@@ -260,6 +262,7 @@ fn build_load_job(
     source_uri: &str,
     job_id: &str,
     location: Option<&str>,
+    write_disposition: WriteDisposition,
 ) -> Job {
     Job {
         job_reference: JobReference {
@@ -280,7 +283,7 @@ fn build_load_job(
                     table_id: table_id.to_string(),
                 },
                 create_disposition: Some(CreateDisposition::CreateIfNeeded),
-                write_disposition: Some(WriteDisposition::WriteAppend),
+                write_disposition: Some(write_disposition),
                 source_format: Some(SourceFormat::Parquet),
                 max_bad_records: Some(0),
                 autodetect: Some(false),
@@ -674,6 +677,7 @@ mod tests {
             "gs://bucket/path.parquet",
             "job_123",
             Some("US"),
+            WriteDisposition::WriteTruncate,
         );
 
         let JobType::Load(load) = job.configuration.job else {
@@ -681,5 +685,9 @@ mod tests {
         };
         assert!(load.schema.is_some());
         assert!(load.decimal_target_types.is_none());
+        assert_eq!(
+            load.write_disposition,
+            Some(WriteDisposition::WriteTruncate)
+        );
     }
 }

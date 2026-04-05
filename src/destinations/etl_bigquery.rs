@@ -724,16 +724,21 @@ impl CdcBatchLoadManager {
             .state_handle
             .requeue_cdc_batch_load_running_jobs()
             .await?;
+        let requeued_failed = self
+            .state_handle
+            .requeue_retryable_failed_cdc_batch_load_jobs()
+            .await?;
         let pending_jobs = self
             .state_handle
             .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
             .await?;
-        if requeued_running > 0 || !pending_jobs.is_empty() {
+        if requeued_running > 0 || requeued_failed > 0 || !pending_jobs.is_empty() {
             info!(
                 component = "consumer",
                 event = "cdc_consumer_restored_jobs",
                 connection_id = self.state_handle.connection_id(),
                 requeued_running_jobs = requeued_running,
+                requeued_failed_jobs = requeued_failed,
                 pending_jobs = pending_jobs.len(),
                 "restored queued CDC batch-load jobs from durable state"
             );
