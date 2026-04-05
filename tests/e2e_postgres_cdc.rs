@@ -97,7 +97,6 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
         service_account_key_path: None,
         service_account_key: None,
         partition_by_synced_at: Some(false),
-        storage_write_enabled: Some(true),
         batch_load_bucket: None,
         batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),

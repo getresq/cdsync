@@ -280,7 +280,7 @@ pub enum DestinationConfig {
 impl DestinationConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
-            DestinationConfig::BigQuery(_) => Ok(()),
+            DestinationConfig::BigQuery(bq) => bq.validate(),
         }
     }
 }
@@ -461,7 +461,6 @@ pub struct SalesforceRateLimitConfig {
 pub enum SchemaChangePolicy {
     Auto,
     Fail,
-    Resync,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,11 +510,32 @@ pub struct BigQueryConfig {
     pub service_account_key_path: Option<PathBuf>,
     pub service_account_key: Option<String>,
     pub partition_by_synced_at: Option<bool>,
-    pub storage_write_enabled: Option<bool>,
     pub batch_load_bucket: Option<String>,
     pub batch_load_prefix: Option<String>,
     pub emulator_http: Option<String>,
     pub emulator_grpc: Option<String>,
+}
+
+impl BigQueryConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.project_id.trim().is_empty() {
+            anyhow::bail!("bigquery.project_id is required");
+        }
+        if self.dataset.trim().is_empty() {
+            anyhow::bail!("bigquery.dataset is required");
+        }
+        if self.emulator_http.is_none()
+            && self
+                .batch_load_bucket
+                .as_deref()
+                .is_none_or(|bucket| bucket.trim().is_empty())
+        {
+            anyhow::bail!(
+                "bigquery.batch_load_bucket is required unless bigquery.emulator_http is set"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -611,8 +631,7 @@ connections:
       dataset: "cdsync"
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
-      storage_write_enabled: true
-      # batch_load_bucket: "my-cdsync-loads"
+      batch_load_bucket: "my-cdsync-loads"
       # batch_load_prefix: "staging/app"
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
@@ -645,8 +664,7 @@ connections:
       dataset: "cdsync"
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
-      storage_write_enabled: true
-      # batch_load_bucket: "my-cdsync-loads"
+      batch_load_bucket: "my-cdsync-loads"
       # batch_load_prefix: "staging/salesforce"
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
@@ -674,6 +692,7 @@ connections:
       type: bigquery
       project_id: "proj"
       dataset: "ds"
+      emulator_http: "http://localhost:9050"
 "#;
         let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_err());
@@ -698,6 +717,7 @@ connections:
       type: bigquery
       project_id: "proj"
       dataset: "ds"
+      emulator_http: "http://localhost:9050"
 "#;
         let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         let err = cfg.validate().expect_err("missing cdc pipeline id");
@@ -725,9 +745,37 @@ connections:
       type: bigquery
       project_id: "proj"
       dataset: "ds"
+      emulator_http: "http://localhost:9050"
 "#;
         let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_requires_batch_load_bucket_without_emulator() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@host:5432/db"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: false
+      tables:
+        - name: "public.accounts"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+"#;
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
+        let err = cfg.validate().expect_err("missing batch-load bucket");
+        assert!(
+            err.to_string()
+                .contains("bigquery.batch_load_bucket is required")
+        );
     }
 
     #[test]
@@ -751,6 +799,7 @@ connections:
       type: bigquery
       project_id: "proj"
       dataset: "ds"
+      emulator_http: "http://localhost:9050"
 "#;
         let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         let metadata = cfg.metadata_columns();
@@ -829,6 +878,7 @@ connections:
       type: bigquery
       project_id: "proj"
       dataset: "ds"
+      emulator_http: "http://localhost:9050"
 "#;
         let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_err());

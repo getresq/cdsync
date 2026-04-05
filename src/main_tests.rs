@@ -112,7 +112,6 @@ mod sync_selection_tests {
                     service_account_key_path: None,
                     service_account_key: None,
                     partition_by_synced_at: Some(false),
-                    storage_write_enabled: Some(false),
                     batch_load_bucket: None,
                     batch_load_prefix: None,
                     emulator_http: Some("http://localhost:9050".to_string()),
@@ -426,7 +425,18 @@ connections:
 "#;
         fs::write(&config_path, raw).await?;
 
-        let result = cmd_run(config_path.clone(), None).await;
+        let result = cmd_run(RunCommandRequest {
+            config_path: config_path.clone(),
+            connection_filter: None,
+            once: false,
+            full: false,
+            incremental: false,
+            dry_run: false,
+            schema_diff_enabled: false,
+            follow: false,
+            shutdown: None,
+        })
+        .await;
 
         let _ = fs::remove_file(&config_path).await;
         let err = result.expect_err("invalid polling config should fail");

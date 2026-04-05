@@ -1,5 +1,7 @@
 use crate::config::ConnectionConfig;
 use anyhow::Context;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -13,6 +15,11 @@ pub struct ShutdownController {
     tx: watch::Sender<bool>,
 }
 
+#[derive(Clone)]
+pub struct ConnectionRestartRegistry {
+    inner: Arc<HashMap<String, watch::Sender<u64>>>,
+}
+
 impl ShutdownController {
     pub fn new() -> (Self, ShutdownSignal) {
         let (tx, rx) = watch::channel(false);
@@ -21,6 +28,33 @@ impl ShutdownController {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(true);
+    }
+}
+
+impl ConnectionRestartRegistry {
+    pub fn new(connections: &[ConnectionConfig]) -> Self {
+        let mut inner = HashMap::new();
+        for connection in connections {
+            let (tx, _rx) = watch::channel(0_u64);
+            inner.insert(connection.id.clone(), tx);
+        }
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn subscribe(&self, connection_id: &str) -> Option<watch::Receiver<u64>> {
+        self.inner.get(connection_id).map(watch::Sender::subscribe)
+    }
+
+    pub fn request_restart(&self, connection_id: &str) -> anyhow::Result<()> {
+        let tx = self
+            .inner
+            .get(connection_id)
+            .with_context(|| format!("unknown connection {}", connection_id))?;
+        let next = tx.borrow().wrapping_add(1);
+        let _ = tx.send(next);
+        Ok(())
     }
 }
 

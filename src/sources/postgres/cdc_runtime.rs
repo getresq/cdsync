@@ -1178,27 +1178,14 @@ impl PostgresSource {
             match runtime.schema_policy.clone() {
                 SchemaChangePolicy::Fail => {
                     anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto or resync",
+                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                         table_cfg.name
                     );
-                }
-                SchemaChangePolicy::Resync => {
-                    warn!(
-                        table = %table_cfg.name,
-                        "schema change detected; marking CDC for resync"
-                    );
-                    if let Some(cdc_state) = runtime.state.postgres_cdc.as_mut() {
-                        cdc_state.last_lsn = None;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "schema change detected for {}; resync required",
-                        table_cfg.name
-                    ));
                 }
                 SchemaChangePolicy::Auto => {
                     if diff.has_incompatible() || primary_key_changed_detected {
                         anyhow::bail!(
-                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                            "incompatible schema change detected for {}; trigger a manual table resync",
                             table_cfg.name
                         );
                     }
@@ -1218,26 +1205,13 @@ impl PostgresSource {
             match runtime.schema_policy.clone() {
                 SchemaChangePolicy::Fail => {
                     anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto or resync",
+                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                         table_cfg.name
                     );
-                }
-                SchemaChangePolicy::Resync => {
-                    warn!(
-                        table = %table_cfg.name,
-                        "schema change detected; marking CDC for resync"
-                    );
-                    if let Some(cdc_state) = runtime.state.postgres_cdc.as_mut() {
-                        cdc_state.last_lsn = None;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "schema change detected for {}; resync required",
-                        table_cfg.name
-                    ));
                 }
                 SchemaChangePolicy::Auto => {
                     anyhow::bail!(
-                        "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                        "incompatible schema change detected for {}; trigger a manual table resync",
                         table_cfg.name
                     );
                 }

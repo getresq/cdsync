@@ -310,6 +310,37 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
 }
 
 #[tokio::test]
+async fn postgres_state_store_round_trips_manual_table_resync_requests() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+
+    store
+        .request_postgres_table_resync("app", "public.accounts")
+        .await?;
+    store
+        .request_postgres_table_resync("app", "public.orders")
+        .await?;
+
+    let requests = store.load_postgres_table_resync_requests("app").await?;
+    let requested_tables: Vec<&str> = requests
+        .iter()
+        .map(|request| request.source_table.as_str())
+        .collect();
+    assert_eq!(requested_tables, vec!["public.accounts", "public.orders"]);
+
+    store
+        .clear_postgres_table_resync_request("app", "public.accounts")
+        .await?;
+    let requests = store.load_postgres_table_resync_requests("app").await?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].source_table, "public.orders");
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_requeues_running_jobs() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());

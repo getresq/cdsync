@@ -15,10 +15,11 @@ use chrono::{TimeZone, Utc};
 use futures::StreamExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -30,6 +31,7 @@ struct FakeStateBackend {
     load_delay: Option<Duration>,
     batch_load_queue_summary: Option<CdcBatchLoadQueueSummary>,
     cdc_coordinator_summary: Option<CdcCoordinatorSummary>,
+    requested_resyncs: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[async_trait]
@@ -71,6 +73,32 @@ impl AdminStateBackend for FakeStateBackend {
         _wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
         Ok(self.cdc_coordinator_summary.clone().unwrap_or_default())
+    }
+
+    async fn request_postgres_table_resync(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        self.requested_resyncs
+            .lock()
+            .expect("requested_resyncs lock")
+            .push((connection_id.to_string(), source_table.to_string()));
+        Ok(())
+    }
+
+    async fn clear_postgres_table_resync_request(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        self.requested_resyncs
+            .lock()
+            .expect("requested_resyncs lock")
+            .retain(|(stored_connection, stored_table)| {
+                stored_connection != connection_id || stored_table != source_table
+            });
+        Ok(())
     }
 }
 
@@ -114,6 +142,49 @@ impl AdminStateBackend for CountingStateBackend {
         _wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
         Ok(CdcCoordinatorSummary::default())
+    }
+
+    async fn request_postgres_table_resync(
+        &self,
+        _connection_id: &str,
+        _source_table: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn clear_postgres_table_resync_request(
+        &self,
+        _connection_id: &str,
+        _source_table: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FakeRuntimeBackend {
+    restarted_connections: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl AdminRuntimeBackend for FakeRuntimeBackend {
+    async fn request_connection_restart(&self, connection_id: &str) -> anyhow::Result<()> {
+        self.restarted_connections
+            .lock()
+            .expect("restarted_connections lock")
+            .push(connection_id.to_string());
+        Ok(())
+    }
+}
+
+struct FailingRuntimeBackend {
+    message: String,
+}
+
+#[async_trait]
+impl AdminRuntimeBackend for FailingRuntimeBackend {
+    async fn request_connection_restart(&self, _connection_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!(self.message.clone());
     }
 }
 
@@ -242,7 +313,6 @@ fn test_config() -> Config {
                 service_account_key_path: None,
                 service_account_key: Some("secret-key".to_string()),
                 partition_by_synced_at: Some(true),
-                storage_write_enabled: Some(true),
                 batch_load_bucket: Some("bucket".to_string()),
                 batch_load_prefix: Some("prefix".to_string()),
                 emulator_http: Some("http://localhost:9050".to_string()),
@@ -487,6 +557,7 @@ async fn spawn_admin_server_thread_surfaces_bind_failures_before_returning() -> 
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -530,6 +601,7 @@ async fn spawn_admin_server_thread_does_not_wait_for_initial_slot_samples() -> a
             load_delay: Some(Duration::from_millis(300)),
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -566,6 +638,22 @@ fn test_admin_state_with_config(
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
 ) -> AdminApiState {
+    test_admin_state_with_runtime(
+        cfg,
+        state_store,
+        stats_db,
+        Arc::new(FakeRuntimeBackend::default()),
+    )
+}
+
+fn test_admin_state_with_runtime(
+    cfg: Config,
+    state_store: Arc<dyn AdminStateBackend>,
+    stats_db: Option<Arc<dyn AdminStatsBackend>>,
+    runtime_control: Arc<dyn AdminRuntimeBackend>,
+) -> AdminApiState {
+    let managed_connection_ids: HashSet<String> =
+        cfg.connections.iter().map(|connection| connection.id.clone()).collect();
     let cdc_slot_sampler_cache = test_cdc_slot_sampler_cache(&cfg);
     let auth_verifier = Arc::new(
         AdminApiServiceJwtVerifier::from_config(
@@ -579,6 +667,7 @@ fn test_admin_state_with_config(
     AdminApiState {
         cfg: Arc::new(cfg),
         state_store,
+        runtime_control,
         stats_db,
         cdc_slot_sampler_cache,
         auth_verifier,
@@ -586,6 +675,7 @@ fn test_admin_state_with_config(
         mode: "run".to_string(),
         connection_id: "app".to_string(),
         managed_connection_count: 1,
+        managed_connection_ids: Arc::new(managed_connection_ids),
         config_hash: "config-hash".to_string(),
         deploy_revision: Some("deploy-123".to_string()),
         last_restart_reason: "startup".to_string(),
@@ -618,6 +708,7 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -645,6 +736,7 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -689,6 +781,7 @@ async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -734,6 +827,7 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -800,6 +894,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend {
             runs,
@@ -912,6 +1007,158 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn admin_api_resync_table_route_persists_request_and_restarts_connection() -> anyhow::Result<()>
+{
+    let requested_resyncs = Arc::new(Mutex::new(Vec::new()));
+    let runtime_backend = Arc::new(FakeRuntimeBackend::default());
+    let state = test_admin_state_with_runtime(
+        test_config(),
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: None,
+            batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
+            requested_resyncs: Arc::clone(&requested_resyncs),
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+        runtime_backend.clone(),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .post(format!("{base_url}/v1/connections/app/resync-table"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({ "table": "public.accounts" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["connection_id"], "app");
+    assert_eq!(body["table"], "public.accounts");
+    assert_eq!(body["requested"], true);
+    assert_eq!(body["restart_requested"], true);
+
+    assert_eq!(
+        requested_resyncs.lock().expect("requested_resyncs lock").as_slice(),
+        &[("app".to_string(), "public.accounts".to_string())]
+    );
+    assert_eq!(
+        runtime_backend
+            .restarted_connections
+            .lock()
+            .expect("restarted connections lock")
+            .as_slice(),
+        &["app".to_string()]
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_resync_table_route_rejects_unmanaged_connection_without_persisting()
+-> anyhow::Result<()> {
+    let requested_resyncs = Arc::new(Mutex::new(Vec::new()));
+    let runtime_backend = Arc::new(FakeRuntimeBackend::default());
+    let mut cfg = test_config();
+    cfg.connections.push(ConnectionConfig {
+        id: "disabled_app".to_string(),
+        enabled: Some(false),
+        ..cfg.connections[0].clone()
+    });
+    let mut state = test_admin_state_with_runtime(
+        cfg,
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: None,
+            batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
+            requested_resyncs: Arc::clone(&requested_resyncs),
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+        runtime_backend.clone(),
+    );
+    state.managed_connection_ids = Arc::new(HashSet::from(["app".to_string()]));
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .post(format!("{base_url}/v1/connections/disabled_app/resync-table"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({ "table": "public.accounts" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(
+        body["error"],
+        "connection disabled_app is not managed by this CDSync process"
+    );
+    assert!(requested_resyncs
+        .lock()
+        .expect("requested_resyncs lock")
+        .is_empty());
+    assert!(runtime_backend
+        .restarted_connections
+        .lock()
+        .expect("restarted connections lock")
+        .is_empty());
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_resync_table_route_rolls_back_request_when_restart_fails()
+-> anyhow::Result<()> {
+    let requested_resyncs = Arc::new(Mutex::new(Vec::new()));
+    let runtime_backend = Arc::new(FailingRuntimeBackend {
+        message: "restart failed".to_string(),
+    });
+    let state = test_admin_state_with_runtime(
+        test_config(),
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+            load_delay: None,
+            batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
+            requested_resyncs: Arc::clone(&requested_resyncs),
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+        runtime_backend,
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .post(format!("{base_url}/v1/connections/app/resync-table"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({ "table": "public.accounts" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["error"], "restart failed");
+    assert!(requested_resyncs
+        .lock()
+        .expect("requested_resyncs lock")
+        .is_empty());
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Result<()> {
     let state = test_admin_state(
         Arc::new(FakeStateBackend {
@@ -920,6 +1167,7 @@ async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Resul
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         None,
     );
@@ -950,6 +1198,7 @@ async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()>
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -981,6 +1230,7 @@ async fn admin_api_accepts_array_audience_tokens() -> anyhow::Result<()> {
             load_delay: None,
             batch_load_queue_summary: None,
             cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend {
             ping_error: None,

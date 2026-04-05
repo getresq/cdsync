@@ -196,25 +196,14 @@ impl PostgresSource {
             match policy {
                 SchemaChangePolicy::Fail => {
                     anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto or resync",
+                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                         table.name
                     );
-                }
-                SchemaChangePolicy::Resync => {
-                    info!(table = %table.name, "schema change detected; resyncing table");
-                    if !dry_run {
-                        dest.truncate_table(&schema.name).await?;
-                    }
-                    self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
-                        .await?;
-                    entry.schema_hash = Some(schema_hash);
-                    entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
-                    return Ok(entry);
                 }
                 SchemaChangePolicy::Auto => {
                     if diff.has_incompatible() || primary_key_changed_detected {
                         anyhow::bail!(
-                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                            "incompatible schema change detected for {}; trigger a manual table resync",
                             table.name
                         );
                     }
@@ -237,25 +226,13 @@ impl PostgresSource {
             match policy {
                 SchemaChangePolicy::Fail => {
                     anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto or resync",
+                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                         table.name
                     );
                 }
-                SchemaChangePolicy::Resync => {
-                    info!(table = %table.name, "schema change detected; resyncing table");
-                    if !dry_run {
-                        dest.truncate_table(&schema.name).await?;
-                    }
-                    self.run_full_refresh(table, &schema, dest, &mut entry, &run_options)
-                        .await?;
-                    entry.schema_hash = Some(schema_hash.clone());
-                    entry.schema_snapshot = Some(schema_snapshot_from_schema(&schema));
-                    entry.schema_primary_key = schema.primary_key.clone();
-                    return Ok(entry);
-                }
                 SchemaChangePolicy::Auto => {
                     anyhow::bail!(
-                        "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                        "incompatible schema change detected for {}; trigger a manual table resync",
                         table.name
                     );
                 }

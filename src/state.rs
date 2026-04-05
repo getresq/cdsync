@@ -184,6 +184,12 @@ pub struct CdcBatchLoadLoadedTableSummary {
     pub total_duration_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresTableResyncRequest {
+    pub source_table: String,
+    pub requested_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConnectionState {
     #[serde(default)]
@@ -1360,6 +1366,75 @@ impl SyncStateStore {
         })
     }
 
+    pub async fn request_postgres_table_resync(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            r#"
+            insert into {} (
+                connection_id,
+                source_table,
+                requested_at
+            ) values ($1, $2, $3)
+            on conflict (connection_id, source_table) do update set
+                requested_at = excluded.requested_at
+            "#,
+            self.table("postgres_table_resync_requests")
+        ))
+        .bind(connection_id)
+        .bind(source_table)
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_postgres_table_resync_requests(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Vec<PostgresTableResyncRequest>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select source_table, requested_at
+            from {}
+            where connection_id = $1
+            order by requested_at asc, source_table asc
+            "#,
+            self.table("postgres_table_resync_requests")
+        ))
+        .bind(connection_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(PostgresTableResyncRequest {
+                    source_table: row.try_get("source_table")?,
+                    requested_at: datetime_from_millis(row.try_get("requested_at")?)
+                        .context("invalid requested_at for postgres table resync request")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn clear_postgres_table_resync_request(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(&format!(
+            "delete from {} where connection_id = $1 and source_table = $2",
+            self.table("postgres_table_resync_requests")
+        ))
+        .bind(connection_id)
+        .bind(source_table)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn acquire_connection_lock(
         &self,
         connection_id: &str,
@@ -1405,6 +1480,7 @@ impl SyncStateStore {
         ensure_table_exists(&mut conn, &self.schema, "cdc_batch_load_jobs").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_commit_fragments").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_watermark_state").await?;
+        ensure_table_exists(&mut conn, &self.schema, "postgres_table_resync_requests").await?;
         Ok(())
     }
 
@@ -1628,6 +1704,23 @@ impl StateHandle {
     pub async fn save_cdc_watermark_state(&self, state: &CdcWatermarkState) -> anyhow::Result<()> {
         self.store
             .save_cdc_watermark_state(&self.connection_id, state)
+            .await
+    }
+
+    pub async fn load_postgres_table_resync_requests(
+        &self,
+    ) -> anyhow::Result<Vec<PostgresTableResyncRequest>> {
+        self.store
+            .load_postgres_table_resync_requests(&self.connection_id)
+            .await
+    }
+
+    pub async fn clear_postgres_table_resync_request(
+        &self,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        self.store
+            .clear_postgres_table_resync_request(&self.connection_id, source_table)
             .await
     }
 

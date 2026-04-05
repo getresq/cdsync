@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cdsync::config::{BigQueryConfig, PostgresConfig, PostgresTableConfig, SchemaChangePolicy};
 use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
@@ -22,6 +22,8 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .unwrap_or_else(|_| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
     let real_bq = real_bigquery_support::load_env()?;
+    let batch_load_bucket = env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
+        .context("set CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET to a writable GCS bucket")?;
 
     let suffix = Uuid::new_v4().simple().to_string();
     let table_name = format!("cdsync_real_{}", &suffix[..8]);
@@ -92,9 +94,8 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
         service_account_key_path: Some(PathBuf::from(&real_bq.key_path)),
         service_account_key: None,
         partition_by_synced_at: Some(false),
-        storage_write_enabled: Some(true),
-        batch_load_bucket: None,
-        batch_load_prefix: None,
+        batch_load_bucket: Some(batch_load_bucket),
+        batch_load_prefix: Some(format!("cdsync-e2e-real-heavy/{}", &suffix[..8])),
         emulator_http: None,
         emulator_grpc: None,
     };

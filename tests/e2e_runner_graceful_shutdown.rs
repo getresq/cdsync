@@ -94,7 +94,6 @@ connections:
       project_id: "{project_id}"
       dataset: "{dataset}"
       location: "US"
-      storage_write_enabled: true
       batch_load_bucket:
       batch_load_prefix:
       emulator_http: "{bq_http}"
@@ -220,7 +219,6 @@ connections:
       project_id: "{project_id}"
       dataset: "{dataset}"
       location: "US"
-      storage_write_enabled: true
       batch_load_bucket:
       batch_load_prefix:
       emulator_http: "{bq_http}"

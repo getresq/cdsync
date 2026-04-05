@@ -96,7 +96,6 @@ async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
         service_account_key_path: None,
         service_account_key: None,
         partition_by_synced_at: Some(false),
-        storage_write_enabled: Some(true),
         batch_load_bucket: None,
         batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
@@ -265,7 +264,6 @@ async fn e2e_schema_change_fail_fast() -> Result<()> {
         service_account_key_path: None,
         service_account_key: None,
         partition_by_synced_at: Some(false),
-        storage_write_enabled: Some(true),
         batch_load_bucket: None,
         batch_load_prefix: None,
         emulator_http: Some(bq_http),
@@ -330,7 +328,7 @@ async fn e2e_schema_change_fail_fast() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn e2e_schema_removal_resyncs_table() -> Result<()> {
+async fn e2e_schema_removal_full_refresh_succeeds_non_destructively() -> Result<()> {
     dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
@@ -392,7 +390,7 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
         cdc: Some(false),
         publication: None,
         publication_mode: None,
-        schema_changes: Some(SchemaChangePolicy::Resync),
+        schema_changes: Some(SchemaChangePolicy::Auto),
         cdc_pipeline_id: None,
         cdc_batch_size: None,
         cdc_apply_concurrency: None,
@@ -411,7 +409,6 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
         service_account_key_path: None,
         service_account_key: None,
         partition_by_synced_at: Some(false),
-        storage_write_enabled: Some(true),
         batch_load_bucket: None,
         batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
@@ -508,5 +505,149 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
             assert!(extra.is_null());
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_primary_key_change_fails_fast() -> Result<()> {
+    dotenv_support::load_dotenv()?;
+    let pg_url = env::var("CDSYNC_E2E_PG_URL")
+        .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
+    let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
+        .context("set CDSYNC_E2E_BQ_HTTP to the BigQuery emulator HTTP base URL")?;
+    let bq_grpc = env::var("CDSYNC_E2E_BQ_GRPC")
+        .context("set CDSYNC_E2E_BQ_GRPC to the BigQuery emulator gRPC host:port")?;
+    let project_id = env::var("CDSYNC_E2E_BQ_PROJECT").unwrap_or_else(|_| "cdsync".to_string());
+    let dataset = env::var("CDSYNC_E2E_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e".to_string());
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let table_name = format!("cdsync_schema_pk_{}", &suffix[..8]);
+    let qualified_table = format!("public.{table_name}");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&pg_url)
+        .await?;
+    sqlx::query(&format!("drop table if exists {}", qualified_table))
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!(
+        "create table {} (id bigint primary key, alt_id bigint unique, name text)",
+        qualified_table
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "insert into {} (id, alt_id, name) values (1, 101, 'alpha')",
+        qualified_table
+    ))
+    .execute(&pool)
+    .await?;
+
+    let pg_config = PostgresConfig {
+        url: pg_url.clone(),
+        tables: Some(vec![PostgresTableConfig {
+            name: qualified_table.clone(),
+            primary_key: None,
+            updated_at_column: None,
+            soft_delete: Some(false),
+            soft_delete_column: None,
+            where_clause: None,
+            columns: None,
+        }]),
+        table_selection: None,
+        batch_size: Some(1000),
+        cdc: Some(false),
+        publication: None,
+        publication_mode: None,
+        schema_changes: Some(SchemaChangePolicy::Auto),
+        cdc_pipeline_id: None,
+        cdc_batch_size: None,
+        cdc_apply_concurrency: None,
+        cdc_max_fill_ms: None,
+        cdc_max_pending_events: None,
+        cdc_idle_timeout_seconds: None,
+        cdc_tls: None,
+        cdc_tls_ca_path: None,
+        cdc_tls_ca: None,
+    };
+
+    let bq_config = BigQueryConfig {
+        project_id,
+        dataset,
+        location: Some("US".to_string()),
+        service_account_key_path: None,
+        service_account_key: None,
+        partition_by_synced_at: Some(false),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
+        emulator_http: Some(bq_http),
+        emulator_grpc: Some(bq_grpc),
+    };
+
+    let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
+    let tables = source.resolve_tables().await?;
+    let dest = BigQueryDestination::new(bq_config, false, MetadataColumns::default()).await?;
+    dest.validate().await?;
+
+    let mut state = ConnectionState::default();
+    let checkpoint = source
+        .sync_table(TableSyncRequest {
+            table: &tables[0],
+            dest: &dest,
+            checkpoint: state
+                .postgres
+                .get(&qualified_table)
+                .cloned()
+                .unwrap_or_default(),
+            state_handle: None,
+            mode: SyncMode::Full,
+            dry_run: false,
+            default_batch_size: 1000,
+            schema_diff_enabled: false,
+            stats: None,
+        })
+        .await?;
+    state.postgres.insert(qualified_table.clone(), checkpoint);
+
+    sqlx::query(&format!(
+        "alter table {} drop constraint {}_pkey",
+        qualified_table, table_name
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "alter table {} add primary key (alt_id)",
+        qualified_table
+    ))
+    .execute(&pool)
+    .await?;
+
+    let source = PostgresSource::new(pg_config, MetadataColumns::default()).await?;
+    let tables = source.resolve_tables().await?;
+    let err = source
+        .sync_table(TableSyncRequest {
+            table: &tables[0],
+            dest: &dest,
+            checkpoint: state
+                .postgres
+                .get(&qualified_table)
+                .cloned()
+                .unwrap_or_default(),
+            state_handle: None,
+            mode: SyncMode::Full,
+            dry_run: false,
+            default_batch_size: 1000,
+            schema_diff_enabled: false,
+            stats: None,
+        })
+        .await
+        .expect_err("expected primary key change failure");
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("schema change detected") || err_text.contains("primary key changed"),
+        "{err_text}"
+    );
     Ok(())
 }

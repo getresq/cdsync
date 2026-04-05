@@ -108,16 +108,6 @@ pub(super) fn date_to_string(days: i32) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
-pub(super) fn value_to_insert_id(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Null => None,
-        other => serde_json::to_string(other).ok(),
-    }
-}
-
 pub(super) fn encode_base64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }

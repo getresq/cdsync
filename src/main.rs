@@ -18,7 +18,7 @@ mod types;
 use crate::config::{Config, DestinationConfig, SourceConfig};
 use crate::destinations::Destination;
 use crate::destinations::bigquery::BigQueryDestination;
-use crate::runner::{ShutdownController, ShutdownSignal, schedule_interval};
+use crate::runner::{ConnectionRestartRegistry, ShutdownController, ShutdownSignal, schedule_interval};
 use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use crate::sources::salesforce::{SalesforceSource, SalesforceSyncRequest};
 use crate::state::{ConnectionState, SyncStateStore};
@@ -33,7 +33,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -52,9 +52,13 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
-    Sync {
+    Run {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        connection: Option<String>,
+        #[arg(long)]
+        once: bool,
         #[arg(long)]
         full: bool,
         #[arg(long)]
@@ -62,17 +66,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
-        connection: Option<String>,
-        #[arg(long)]
         schema_diff: bool,
         #[arg(long)]
         follow: bool,
-    },
-    Run {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        connection: Option<String>,
     },
     Migrate {
         #[arg(long)]
@@ -130,12 +126,13 @@ struct SyncConnectionRequest<'a> {
     shutdown: Option<ShutdownSignal>,
 }
 
-struct SyncCommandRequest {
+struct RunCommandRequest {
     config_path: PathBuf,
+    connection_filter: Option<String>,
+    once: bool,
     full: bool,
     incremental: bool,
     dry_run: bool,
-    connection_filter: Option<String>,
     schema_diff_enabled: bool,
     follow: bool,
     shutdown: Option<ShutdownSignal>,
@@ -274,28 +271,29 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { config } => cmd_init(config).await,
-        Commands::Sync {
+        Commands::Run {
             config,
+            connection,
+            once,
             full,
             incremental,
             dry_run,
-            connection,
             schema_diff,
             follow,
         } => {
-            cmd_sync(SyncCommandRequest {
+            cmd_run(RunCommandRequest {
                 config_path: config,
+                connection_filter: connection,
+                once,
                 full,
                 incremental,
                 dry_run,
-                connection_filter: connection,
                 schema_diff_enabled: schema_diff,
                 follow,
                 shutdown: None,
             })
             .await
         }
-        Commands::Run { config, connection } => cmd_run(config, connection).await,
         Commands::Migrate { config } => cmd_migrate(config).await,
         Commands::Status { config, connection } => ops::cmd_status(config, connection).await,
         Commands::Validate {
@@ -380,13 +378,14 @@ async fn cmd_migrate(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
-    let SyncCommandRequest {
+async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
+    let RunCommandRequest {
         config_path,
+        connection_filter,
+        once: _,
         full,
         incremental,
         dry_run,
-        connection_filter,
         schema_diff_enabled,
         follow,
         shutdown,
@@ -922,6 +921,7 @@ async fn run_connection_worker(
     config_path: PathBuf,
     connection: crate::config::ConnectionConfig,
     shutdown_signal: ShutdownSignal,
+    restart_rx: Option<watch::Receiver<u64>>,
 ) -> Result<()> {
     let mode = connection_run_mode(&connection);
     telemetry::record_connection_worker_event(&connection.id, mode, "started");
@@ -930,17 +930,72 @@ async fn run_connection_worker(
             let cfg = Config::load(&config_path).await?;
             let checkpoint_age_task =
                 spawn_checkpoint_age_reporter(&cfg, &connection, shutdown_signal.clone()).await?;
-            let result = cmd_sync(SyncCommandRequest {
-                config_path,
-                full: false,
-                incremental: true,
-                dry_run: false,
-                connection_filter: Some(connection.id.clone()),
-                schema_diff_enabled: false,
-                follow: true,
-                shutdown: Some(shutdown_signal),
-            })
-            .await;
+            let restart_rx = restart_rx;
+            let mut restart_generation = restart_rx
+                .as_ref()
+                .map(|receiver| *receiver.borrow())
+                .unwrap_or_default();
+            let result = loop {
+                if shutdown_signal.is_shutdown() {
+                    break Ok(());
+                }
+                let (run_shutdown_controller, run_shutdown_signal) = ShutdownController::new();
+                let relay = tokio::spawn({
+                    let mut shutdown = shutdown_signal.clone();
+                    let mut restart_wait = restart_rx.clone();
+                    async move {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed {
+                                    run_shutdown_controller.shutdown();
+                                }
+                            }
+                            _ = async {
+                                if let Some(receiver) = &mut restart_wait {
+                                    let _ = receiver.changed().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => {
+                                run_shutdown_controller.shutdown();
+                            }
+                        }
+                    }
+                });
+
+                let result = cmd_run_once(RunCommandRequest {
+                    config_path: config_path.clone(),
+                    connection_filter: Some(connection.id.clone()),
+                    once: true,
+                    full: false,
+                    incremental: true,
+                    dry_run: false,
+                    schema_diff_enabled: false,
+                    follow: true,
+                    shutdown: Some(run_shutdown_signal),
+                })
+                .await;
+
+                relay.abort();
+                let _ = relay.await;
+
+                if shutdown_signal.is_shutdown() {
+                    break Ok(());
+                }
+                if let Some(receiver) = restart_rx.as_ref() {
+                    let current = *receiver.borrow();
+                    if current != restart_generation {
+                        restart_generation = current;
+                        info!(
+                            connection = %connection.id,
+                            restart_generation,
+                            "restarting postgres CDC worker to apply runtime control request"
+                        );
+                        continue;
+                    }
+                }
+                break result;
+            };
             if let Some(task) = checkpoint_age_task {
                 task.abort();
                 let _ = task.await;
@@ -963,12 +1018,13 @@ async fn run_connection_worker(
                     telemetry::record_connection_worker_event(&connection.id, mode, "stopped");
                     break;
                 }
-                let result = cmd_sync(SyncCommandRequest {
+                let result = cmd_run_once(RunCommandRequest {
                     config_path: config_path.clone(),
+                    connection_filter: Some(connection.id.clone()),
+                    once: true,
                     full: false,
                     incremental: true,
                     dry_run: false,
-                    connection_filter: Some(connection.id.clone()),
                     schema_diff_enabled: false,
                     follow: false,
                     shutdown: Some(shutdown_signal.clone()),
@@ -1138,10 +1194,45 @@ async fn run_checkpoint_age_reporter<LoadAge, LoadFuture, RecordAge>(
     }
 }
 
-async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<()> {
+async fn cmd_run(request: RunCommandRequest) -> Result<()> {
+    let RunCommandRequest {
+        config_path,
+        connection_filter,
+        once,
+        full,
+        incremental,
+        dry_run,
+        schema_diff_enabled,
+        follow,
+        shutdown,
+    } = request;
+    if once {
+        return cmd_run_once(RunCommandRequest {
+            config_path,
+            connection_filter,
+            once,
+            full,
+            incremental,
+            dry_run,
+            schema_diff_enabled,
+            follow,
+            shutdown,
+        })
+        .await;
+    }
+    if full || incremental || dry_run || schema_diff_enabled || follow || shutdown.is_some() {
+        anyhow::bail!(
+            "--full, --incremental, --dry-run, --schema-diff, and --follow require --once"
+        );
+    }
+
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let selected_connections = select_sync_connections(&cfg.connections, connection_id.as_deref())?;
+    let selected_connections =
+        select_sync_connections(&cfg.connections, connection_filter.as_deref())?;
+    let selected_connection_configs: Vec<crate::config::ConnectionConfig> =
+        selected_connections.iter().map(|connection| (*connection).clone()).collect();
+    let restart_registry = Arc::new(ConnectionRestartRegistry::new(&selected_connection_configs));
 
     let (shutdown_controller, shutdown_signal) = ShutdownController::new();
     let signal_controller = shutdown_controller.clone();
@@ -1152,11 +1243,17 @@ async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<
 
     let mode = run_supervisor_mode(&selected_connections);
     let connection_label = run_connection_label(&selected_connections);
+    let managed_connection_ids: Vec<String> = selected_connections
+        .iter()
+        .map(|connection| connection.id.clone())
+        .collect();
     let admin_task = admin_api::spawn_admin_api(
         &cfg,
         &connection_label,
+        &managed_connection_ids,
         selected_connections.len(),
         &mode,
+        Some(restart_registry.clone()),
         shutdown_signal.clone(),
     )
     .await?;
@@ -1166,6 +1263,7 @@ async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<
             config_path,
             (*selected_connections[0]).clone(),
             shutdown_signal.clone(),
+            restart_registry.subscribe(&selected_connections[0].id),
         )
         .await
     } else {
@@ -1175,6 +1273,7 @@ async fn cmd_run(config_path: PathBuf, connection_id: Option<String>) -> Result<
                 config_path.clone(),
                 (*connection).clone(),
                 shutdown_signal.clone(),
+                restart_registry.subscribe(&connection.id),
             )));
         }
 

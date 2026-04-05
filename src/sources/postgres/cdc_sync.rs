@@ -57,12 +57,12 @@ pub(super) fn should_preserve_existing_backlog(
     table_ids: &HashMap<TableId, ResolvedPostgresTable>,
     state: &ConnectionState,
     snapshot_progress_tables: &HashSet<TableId>,
-    resync_tables: &HashSet<TableId>,
+    _resync_tables: &HashSet<TableId>,
     initial_snapshot_tables: &HashSet<TableId>,
     mode: crate::types::SyncMode,
     last_lsn: Option<&str>,
 ) -> bool {
-    if mode == crate::types::SyncMode::Full || last_lsn.is_none() || !resync_tables.is_empty() {
+    if mode == crate::types::SyncMode::Full || last_lsn.is_none() {
         return false;
     }
 
@@ -79,7 +79,7 @@ pub(super) fn should_preserve_existing_backlog(
         return false;
     }
 
-    !initial_snapshot_tables.is_empty()
+    !initial_snapshot_tables.is_empty() || !_resync_tables.is_empty()
 }
 
 pub(super) fn snapshot_table_ids(
@@ -96,8 +96,9 @@ pub(super) fn snapshot_table_ids(
     } else if !snapshot_progress_tables.is_empty() {
         if preserve_existing_backlog {
             snapshot_progress_tables
-                .union(initial_snapshot_tables)
+                .union(resync_tables)
                 .copied()
+                .chain(initial_snapshot_tables.iter().copied())
                 .collect()
         } else {
             include_tables.clone()
@@ -118,15 +119,15 @@ pub(super) fn snapshot_table_write_plan(
     is_resync_table: bool,
     force_snapshot_restart: bool,
 ) -> SnapshotTableWritePlan {
+    let requires_fresh_snapshot = is_initial_snapshot_table || is_resync_table;
     if !resume_snapshot_run {
         SnapshotTableWritePlan {
             write_mode: WriteMode::Append,
             truncate_before_copy: mode == crate::types::SyncMode::Full
-                || is_resync_table
-                || is_initial_snapshot_table
+                || requires_fresh_snapshot
                 || (force_snapshot_restart && had_progress),
         }
-    } else if is_initial_snapshot_table && !had_progress {
+    } else if requires_fresh_snapshot && !had_progress {
         SnapshotTableWritePlan {
             write_mode: WriteMode::Append,
             truncate_before_copy: true,
@@ -137,6 +138,14 @@ pub(super) fn snapshot_table_write_plan(
             truncate_before_copy: false,
         }
     }
+}
+
+pub(super) fn cdc_startup_requires_manual_resync(
+    manual_resync_requested: bool,
+    diff: Option<&SchemaDiff>,
+    primary_key_changed_detected: bool,
+) -> bool {
+    manual_resync_requested && (diff.is_some_and(|diff| !diff.is_empty()) || primary_key_changed_detected)
 }
 
 fn bootstrap_snapshot_slot_name(slot_name: &str) -> Result<String> {
@@ -274,8 +283,18 @@ impl PostgresSource {
         let mut table_hashes: HashMap<TableId, String> = HashMap::new();
         let mut table_snapshots: HashMap<TableId, Vec<SchemaFieldSnapshot>> = HashMap::new();
         let mut resync_tables: HashSet<TableId> = HashSet::new();
+        let manual_resync_table_names: HashSet<String> = match &state_handle {
+            Some(handle) => handle
+                .load_postgres_table_resync_requests()
+                .await?
+                .into_iter()
+                .map(|request| request.source_table)
+                .collect(),
+            None => HashSet::new(),
+        };
 
         for (table_id, table_cfg) in table_ids.iter() {
+            let manual_resync_requested = manual_resync_table_names.contains(&table_cfg.name);
             let etl_schema = self.load_etl_table_schema(*table_id).await?;
             store.store_table_schema(etl_schema.clone()).await?;
             let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
@@ -297,6 +316,19 @@ impl PostgresSource {
             if let Some(diff) = diff
                 && !diff.is_empty()
             {
+                if cdc_startup_requires_manual_resync(
+                    manual_resync_requested,
+                    Some(&diff),
+                    primary_key_changed_detected,
+                ) {
+                    resync_tables.insert(*table_id);
+                    table_snapshots.insert(*table_id, schema_snapshot_from_schema(&info.schema));
+                    table_hashes.insert(*table_id, schema_hash);
+                    include_tables.insert(*table_id);
+                    table_info_map.insert(*table_id, info);
+                    etl_schemas.insert(*table_id, etl_schema);
+                    continue;
+                }
                 if schema_diff_enabled {
                     log_schema_diff(&table_cfg.name, &diff);
                 }
@@ -313,23 +345,33 @@ impl PostgresSource {
                 match policy {
                     SchemaChangePolicy::Fail => {
                         anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto or resync",
+                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                             table_cfg.name
                         );
-                    }
-                    SchemaChangePolicy::Resync => {
-                        resync_tables.insert(*table_id);
                     }
                     SchemaChangePolicy::Auto => {
                         if diff.has_incompatible() || primary_key_changed_detected {
                             anyhow::bail!(
-                                "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                                "incompatible schema change detected for {}; trigger a manual table resync",
                                 table_cfg.name
                             );
                         }
                     }
                 }
             } else if primary_key_changed_detected {
+                if cdc_startup_requires_manual_resync(
+                    manual_resync_requested,
+                    None,
+                    primary_key_changed_detected,
+                ) {
+                    resync_tables.insert(*table_id);
+                    table_snapshots.insert(*table_id, schema_snapshot_from_schema(&info.schema));
+                    table_hashes.insert(*table_id, schema_hash);
+                    include_tables.insert(*table_id);
+                    table_info_map.insert(*table_id, info);
+                    etl_schemas.insert(*table_id, etl_schema);
+                    continue;
+                }
                 warn!(
                     table = %table_cfg.name,
                     previous_primary_key = checkpoint
@@ -341,20 +383,20 @@ impl PostgresSource {
                 match policy {
                     SchemaChangePolicy::Fail => {
                         anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto or resync",
+                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
                             table_cfg.name
                         );
                     }
-                    SchemaChangePolicy::Resync => {
-                        resync_tables.insert(*table_id);
-                    }
                     SchemaChangePolicy::Auto => {
                         anyhow::bail!(
-                            "incompatible schema change detected for {}; set schema_changes=resync or fail",
+                            "incompatible schema change detected for {}; trigger a manual table resync",
                             table_cfg.name
                         );
                     }
                 }
+            }
+            if manual_resync_requested {
+                resync_tables.insert(*table_id);
             }
             table_snapshots.insert(*table_id, schema_snapshot_from_schema(&info.schema));
             table_hashes.insert(*table_id, schema_hash);
@@ -398,6 +440,7 @@ impl PostgresSource {
                 .unwrap_or("postgres"),
             include_table_count = include_tables.len(),
             resync_table_count = resync_tables.len(),
+            manual_resync_table_count = manual_resync_table_names.len(),
             initial_snapshot_table_count = initial_snapshot_tables.len(),
             snapshot_progress_table_count = snapshot_progress_tables.len(),
             last_lsn = last_lsn.as_deref().unwrap_or("<none>"),
@@ -567,7 +610,9 @@ impl PostgresSource {
                         }
                         entry.snapshot_start_lsn = Some(snapshot_start_lsn.clone());
                         entry.snapshot_preserve_backlog = preserve_existing_backlog
-                            && (is_initial_snapshot_table || entry.snapshot_preserve_backlog);
+                            && (is_initial_snapshot_table
+                                || resync_tables.contains(table_id)
+                                || entry.snapshot_preserve_backlog);
                         entry.snapshot_chunks =
                             snapshot_chunk_checkpoints_from_ranges(&snapshot_plan.chunk_ranges);
                         if write_plan.truncate_before_copy {
@@ -590,8 +635,8 @@ impl PostgresSource {
                             );
                         }
                         entry.snapshot_start_lsn = Some(snapshot_start_lsn.clone());
-                        entry.snapshot_preserve_backlog =
-                            preserve_existing_backlog && is_initial_snapshot_table;
+                        entry.snapshot_preserve_backlog = preserve_existing_backlog
+                            && (is_initial_snapshot_table || resync_tables.contains(table_id));
                         entry.snapshot_chunks =
                             snapshot_chunk_checkpoints_from_ranges(&snapshot_plan.chunk_ranges);
                         if write_plan.truncate_before_copy {
@@ -768,6 +813,11 @@ impl PostgresSource {
                     state_handle
                         .save_postgres_checkpoint(&table_name, &checkpoint)
                         .await?;
+                    if manual_resync_table_names.contains(&table_name) {
+                        state_handle
+                            .clear_postgres_table_resync_request(&table_name)
+                            .await?;
+                    }
                 }
                 state.postgres.insert(table_name, checkpoint);
             }

@@ -366,6 +366,7 @@ impl PostgresSource {
         table: &PostgresTableConfig,
         defaults: Option<&PostgresTableDefaults>,
     ) -> Result<ResolvedPostgresTable> {
+        self.ensure_source_table_exists(&table.name).await?;
         let mut primary_key = table.primary_key.clone();
         if primary_key.is_none() {
             primary_key = defaults.and_then(|d| d.primary_key.clone());
@@ -410,6 +411,29 @@ impl PostgresSource {
             where_clause,
             columns,
         })
+    }
+
+    async fn ensure_source_table_exists(&self, table: &str) -> Result<()> {
+        let (schema_name, table_name) = split_table_name(table);
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            select exists(
+                select 1
+                from information_schema.tables
+                where table_schema = $1
+                  and table_name = $2
+                  and table_type = 'BASE TABLE'
+            )
+            "#,
+        )
+        .bind(&schema_name)
+        .bind(&table_name)
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            anyhow::bail!("source table {} does not exist", table);
+        }
+        Ok(())
     }
 
     async fn discover_primary_key(&self, table: &str) -> Result<Option<String>> {

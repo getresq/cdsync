@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream};
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -56,6 +57,7 @@ const CDC_SLOT_SAMPLER_INTERVAL: Duration = Duration::from_secs(2);
 pub struct AdminApiState {
     cfg: Arc<Config>,
     state_store: Arc<dyn AdminStateBackend>,
+    runtime_control: Arc<dyn AdminRuntimeBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
     cdc_slot_sampler_cache: CdcSlotSamplerCache,
     auth_verifier: Arc<AdminApiServiceJwtVerifier>,
@@ -63,6 +65,7 @@ pub struct AdminApiState {
     mode: String,
     connection_id: String,
     managed_connection_count: usize,
+    managed_connection_ids: Arc<HashSet<String>>,
     config_hash: String,
     deploy_revision: Option<String>,
     last_restart_reason: String,
@@ -123,6 +126,38 @@ trait AdminStateBackend: Send + Sync {
         connection_id: &str,
         wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary>;
+    async fn request_postgres_table_resync(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()>;
+    async fn clear_postgres_table_resync_request(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait AdminRuntimeBackend: Send + Sync {
+    async fn request_connection_restart(&self, connection_id: &str) -> anyhow::Result<()>;
+}
+
+#[derive(Default)]
+struct NoopAdminRuntimeBackend;
+
+#[async_trait]
+impl AdminRuntimeBackend for NoopAdminRuntimeBackend {
+    async fn request_connection_restart(&self, _connection_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AdminRuntimeBackend for crate::runner::ConnectionRestartRegistry {
+    async fn request_connection_restart(&self, connection_id: &str) -> anyhow::Result<()> {
+        self.request_restart(connection_id)
+    }
 }
 
 #[async_trait]
@@ -171,6 +206,23 @@ impl AdminStateBackend for SyncStateStore {
             wal_bytes_behind_confirmed,
         )
         .await
+    }
+
+    async fn request_postgres_table_resync(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        SyncStateStore::request_postgres_table_resync(self, connection_id, source_table).await
+    }
+
+    async fn clear_postgres_table_resync_request(
+        &self,
+        connection_id: &str,
+        source_table: &str,
+    ) -> anyhow::Result<()> {
+        SyncStateStore::clear_postgres_table_resync_request(self, connection_id, source_table)
+            .await
     }
 }
 
@@ -550,7 +602,6 @@ struct ScrubbedBigQueryConfig {
     location: Option<String>,
     service_account_key_path: Option<std::path::PathBuf>,
     partition_by_synced_at: Option<bool>,
-    storage_write_enabled: Option<bool>,
     batch_load_bucket: Option<String>,
     batch_load_prefix: Option<String>,
     emulator_http: Option<String>,
@@ -565,6 +616,19 @@ struct RunsQuery {
 #[derive(serde::Deserialize)]
 struct StreamQuery {
     connection: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ResyncTableRequest {
+    table: String,
+}
+
+#[derive(Serialize)]
+struct ResyncTableResponse {
+    connection_id: String,
+    table: String,
+    requested: bool,
+    restart_requested: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -968,8 +1032,10 @@ fn cached_postgres_cdc_runtime_state(
 pub async fn spawn_admin_api(
     cfg: &Config,
     connection_id: &str,
+    managed_connection_ids: &[String],
     managed_connection_count: usize,
     mode: &str,
+    runtime_control: Option<Arc<dyn AdminRuntimeBackend>>,
     shutdown: ShutdownSignal,
 ) -> anyhow::Result<Option<AdminApiHandle>> {
     let Some(admin_cfg) = cfg.admin_api.as_ref() else {
@@ -1003,6 +1069,7 @@ pub async fn spawn_admin_api(
     let state = AdminApiState {
         cfg: Arc::new(cfg.clone()),
         state_store,
+        runtime_control: runtime_control.unwrap_or_else(|| Arc::new(NoopAdminRuntimeBackend)),
         stats_db,
         cdc_slot_sampler_cache,
         auth_verifier,
@@ -1010,6 +1077,7 @@ pub async fn spawn_admin_api(
         mode: mode.to_string(),
         connection_id: connection_id.to_string(),
         managed_connection_count,
+        managed_connection_ids: Arc::new(managed_connection_ids.iter().cloned().collect()),
         config_hash: config_hash(cfg)?,
         deploy_revision: std::env::var("CDSYNC_DEPLOY_REVISION")
             .ok()
@@ -1043,6 +1111,7 @@ fn router(state: AdminApiState) -> Router {
         .route("/v1/connections/{id}/progress", get(progress))
         .route("/v1/connections/{id}/tables", get(connection_tables))
         .route("/v1/connections/{id}/runs", get(runs))
+        .route("/v1/connections/{id}/resync-table", post(request_resync_table))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_api_auth,
@@ -1161,6 +1230,88 @@ async fn runs(
     let limit = query.limit.unwrap_or(20).max(1);
     let runs = stats.recent_runs(Some(&connection_id), limit).await?;
     Ok(Json(runs))
+}
+
+async fn request_resync_table(
+    State(state): State<AdminApiState>,
+    Path(connection_id): Path<String>,
+    Json(request): Json<ResyncTableRequest>,
+) -> Result<impl IntoResponse, AdminApiError> {
+    let connection = state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == connection_id)
+        .context("connection not found")?;
+    if !state.managed_connection_ids.contains(&connection_id) {
+        return Err(anyhow::anyhow!(
+            "connection {} is not managed by this CDSync process",
+            connection_id
+        )
+        .into());
+    }
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return Err(anyhow::anyhow!("table resync is only supported for postgres connections").into());
+    };
+    if !pg.cdc.unwrap_or(true) {
+        return Err(
+            anyhow::anyhow!("table resync is only supported for postgres CDC connections").into(),
+        );
+    }
+
+    let requested_table = request.table.trim();
+    if requested_table.is_empty() {
+        return Err(anyhow::anyhow!("table is required").into());
+    }
+    let table_is_configured = if pg.tables.as_ref().is_some_and(|tables| !tables.is_empty()) {
+        pg.tables
+            .as_ref()
+            .is_some_and(|tables| tables.iter().any(|table| table.name == requested_table))
+    } else {
+        let source = crate::sources::postgres::PostgresSource::new(
+            pg.clone(),
+            state.cfg.metadata_columns(),
+        )
+        .await?;
+        let resolved_tables = source.resolve_tables().await?;
+        resolved_tables
+            .iter()
+            .any(|table| table.name == requested_table)
+    };
+    if !table_is_configured {
+        return Err(anyhow::anyhow!(
+            "table {} is not currently configured for connection {}",
+            requested_table,
+            connection_id
+        )
+        .into());
+    }
+
+    state
+        .state_store
+        .request_postgres_table_resync(&connection_id, requested_table)
+        .await?;
+    if let Err(err) = state
+        .runtime_control
+        .request_connection_restart(&connection_id)
+        .await
+    {
+        let _ = state
+            .state_store
+            .clear_postgres_table_resync_request(&connection_id, requested_table)
+            .await;
+        return Err(err.into());
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ResyncTableResponse {
+            connection_id,
+            table: requested_table.to_string(),
+            requested: true,
+            restart_requested: true,
+        }),
+    ))
 }
 
 async fn connection_runtime(
@@ -2089,7 +2240,6 @@ fn scrub_bigquery_config(bq: &BigQueryConfig) -> ScrubbedBigQueryConfig {
         location: bq.location.clone(),
         service_account_key_path: bq.service_account_key_path.clone(),
         partition_by_synced_at: bq.partition_by_synced_at,
-        storage_write_enabled: bq.storage_write_enabled,
         batch_load_bucket: bq.batch_load_bucket.clone(),
         batch_load_prefix: bq.batch_load_prefix.clone(),
         emulator_http: bq.emulator_http.clone(),
@@ -2193,7 +2343,6 @@ mod tests {
                     service_account_key_path: None,
                     service_account_key: None,
                     partition_by_synced_at: Some(true),
-                    storage_write_enabled: Some(false),
                     batch_load_bucket: None,
                     batch_load_prefix: None,
                     emulator_http: Some("http://localhost:9050".to_string()),
@@ -2374,7 +2523,6 @@ mod tests {
                 service_account_key_path: None,
                 service_account_key: None,
                 partition_by_synced_at: Some(true),
-                storage_write_enabled: Some(false),
                 batch_load_bucket: None,
                 batch_load_prefix: None,
                 emulator_http: Some("http://localhost:9050".to_string()),
@@ -2443,7 +2591,6 @@ mod tests {
                 service_account_key_path: None,
                 service_account_key: None,
                 partition_by_synced_at: Some(true),
-                storage_write_enabled: Some(false),
                 batch_load_bucket: None,
                 batch_load_prefix: None,
                 emulator_http: Some("http://localhost:9050".to_string()),

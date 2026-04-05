@@ -823,7 +823,7 @@ fn initial_snapshot_table_ids_select_new_tables_under_existing_cdc_lsn() {
 }
 
 #[test]
-fn should_preserve_existing_backlog_only_for_bootstrap_snapshots() {
+fn should_preserve_existing_backlog_for_bootstrap_and_resync_snapshots() {
     let table_accounts = TableId::new(1);
     let table_messages = TableId::new(2);
     let table_ids = HashMap::from([
@@ -883,6 +883,17 @@ fn should_preserve_existing_backlog_only_for_bootstrap_snapshots() {
         crate::types::SyncMode::Incremental,
         Some("0/16B6C50"),
     ));
+
+    let resync_tables = HashSet::from([table_messages]);
+    assert!(super::cdc_sync::should_preserve_existing_backlog(
+        &table_ids,
+        &ConnectionState::default(),
+        &HashSet::new(),
+        &resync_tables,
+        &HashSet::new(),
+        crate::types::SyncMode::Incremental,
+        Some("0/16B6C50"),
+    ));
 }
 
 #[test]
@@ -914,7 +925,7 @@ fn snapshot_table_ids_keep_resume_bootstrap_scope_narrow() {
     );
     assert_eq!(
         resume_selected,
-        HashSet::from([TableId::new(1), TableId::new(3)])
+        HashSet::from([TableId::new(1), TableId::new(2), TableId::new(3)])
     );
 }
 
@@ -941,6 +952,37 @@ fn snapshot_table_write_plan_truncates_new_bootstrap_tables_on_resume() {
     );
     assert!(matches!(resumed_progress.write_mode, WriteMode::Upsert));
     assert!(!resumed_progress.truncate_before_copy);
+
+    let resumed_resync = super::cdc_sync::snapshot_table_write_plan(
+        crate::types::SyncMode::Incremental,
+        true,
+        false,
+        false,
+        true,
+        false,
+    );
+    assert!(matches!(resumed_resync.write_mode, WriteMode::Append));
+    assert!(resumed_resync.truncate_before_copy);
+}
+
+#[test]
+fn manual_resync_request_overrides_incompatible_startup_schema_checks() {
+    let mut diff = SchemaDiff::default();
+    diff.type_changed
+        .push(("name".to_string(), DataType::String, DataType::Int64));
+    assert!(super::cdc_sync::cdc_startup_requires_manual_resync(
+        true,
+        Some(&diff),
+        false
+    ));
+    assert!(super::cdc_sync::cdc_startup_requires_manual_resync(
+        true, None, true
+    ));
+    assert!(!super::cdc_sync::cdc_startup_requires_manual_resync(
+        false,
+        Some(&diff),
+        false
+    ));
 }
 
 #[test]

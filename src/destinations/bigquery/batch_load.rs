@@ -29,24 +29,17 @@ use crate::destinations::with_metadata_schema;
 use crate::types::{ColumnSchema, DataType, TableSchema};
 
 impl BigQueryDestination {
-    fn batch_load_enabled(&self) -> bool {
-        self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none()
-    }
-
     pub(super) async fn append_rows_via_batch_load(
         &self,
         table_id: &str,
         schema: &TableSchema,
         frame: &DataFrame,
-    ) -> Result<bool> {
-        if !self.batch_load_enabled() {
-            return Ok(false);
-        }
-
-        let bucket = match &self.config.batch_load_bucket {
-            Some(bucket) => bucket,
-            None => return Ok(false),
-        };
+    ) -> Result<()> {
+        let bucket = self
+            .config
+            .batch_load_bucket
+            .as_deref()
+            .context("missing bigquery.batch_load_bucket")?;
         let token_source = match &self.gcs_token_source {
             Some(token_source) => token_source,
             None => anyhow::bail!("GCS batch load requested but token source is unavailable"),
@@ -76,14 +69,15 @@ impl BigQueryDestination {
         .await
         .with_context(|| format!("uploading batch load object {}", object_uri))?;
 
-        self.run_load_job(table_id, &schema, &object_uri).await?;
+        self.run_load_job(table_id, &schema, &object_uri, WriteDisposition::WriteAppend)
+            .await?;
         tracing::info!(
             table = table_id,
             rows = frame.height(),
             object_uri = %object_uri,
             "batch-load append completed"
         );
-        Ok(true)
+        Ok(())
     }
 
     pub(super) async fn upload_batch_load_object(
@@ -143,6 +137,7 @@ impl BigQueryDestination {
         table_id: &str,
         schema: &TableSchema,
         source_uri: &str,
+        write_disposition: WriteDisposition,
     ) -> Result<()> {
         let job_id = format!("cdsync_load_{}", Uuid::new_v4().simple());
         let location = self.config.location.clone();
@@ -154,7 +149,7 @@ impl BigQueryDestination {
             source_uri,
             &job_id,
             location.as_deref(),
-            WriteDisposition::WriteTruncate,
+            write_disposition,
         );
 
         let created = BigQueryDestination::await_with_timeout(
@@ -689,5 +684,34 @@ mod tests {
             load.write_disposition,
             Some(WriteDisposition::WriteTruncate)
         );
+    }
+
+    #[test]
+    fn build_load_job_preserves_append_write_disposition_for_direct_loads() {
+        let schema = TableSchema {
+            name: "public__documents".to_string(),
+            columns: vec![ColumnSchema {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            primary_key: Some("id".to_string()),
+        };
+
+        let job = build_load_job(
+            "proj",
+            "dataset",
+            "public__documents",
+            &schema,
+            "gs://bucket/path.parquet",
+            "job_456",
+            Some("US"),
+            WriteDisposition::WriteAppend,
+        );
+
+        let JobType::Load(load) = job.configuration.job else {
+            panic!("expected load job");
+        };
+        assert_eq!(load.write_disposition, Some(WriteDisposition::WriteAppend));
     }
 }

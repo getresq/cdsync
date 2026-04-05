@@ -1,5 +1,4 @@
 mod batch_load;
-mod storage_write;
 mod values;
 
 use crate::config::BigQueryConfig;
@@ -18,12 +17,11 @@ use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
 use gcloud_bigquery::http::table::{
     Table, TableReference, TableSchema as BqTableSchema, TimePartitionType, TimePartitioning,
 };
-use gcloud_bigquery::http::tabledata::insert_all::{InsertAllRequest, Row};
 use polars::prelude::DataFrame;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,10 +34,9 @@ use url::Url;
 use uuid::Uuid;
 
 pub(crate) use self::batch_load::BATCH_LOAD_JOB_HARD_TIMEOUT;
-use self::storage_write::StorageWriteTableWriter;
 use self::values::{
-    bq_fields_from_schema, bq_ident, dataframe_to_json_rows, default_port, tuple_value_as_datetime,
-    tuple_value_as_i64, value_to_insert_id,
+    bq_fields_from_schema, bq_ident, dataframe_to_json_rows, default_port,
+    tuple_value_as_datetime, tuple_value_as_i64,
 };
 
 #[derive(Clone)]
@@ -49,7 +46,6 @@ pub struct BigQueryDestination {
     config: BigQueryConfig,
     dry_run: bool,
     metadata: MetadataColumns,
-    storage_writers: Arc<Mutex<HashMap<String, Arc<StorageWriteTableWriter>>>>,
     cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -80,7 +76,7 @@ pub(crate) struct CdcBatchLoadJobPayload {
     pub(crate) steps: Vec<CdcBatchLoadJobStep>,
 }
 
-const INSERT_ALL_BLOCKING_ROWS: usize = 512;
+const EMULATOR_INSERT_BLOCKING_ROWS: usize = 512;
 pub(super) const BIGQUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl BigQueryDestination {
@@ -176,7 +172,6 @@ impl BigQueryDestination {
             config,
             dry_run,
             metadata,
-            storage_writers: Arc::new(Mutex::new(HashMap::new())),
             cleanup_tasks: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -571,10 +566,8 @@ impl BigQueryDestination {
         info!(
             table = table_id,
             rows = frame.height(),
-            batch_load_enabled =
-                self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none(),
-            storage_write_enabled = self.config.storage_write_enabled.unwrap_or(true)
-                && self.config.emulator_http.is_none(),
+            batch_load_enabled = self.config.emulator_http.is_none(),
+            emulator_enabled = self.config.emulator_http.is_some(),
             has_primary_key = primary_key.is_some(),
             "append_rows entry"
         );
@@ -582,98 +575,61 @@ impl BigQueryDestination {
             info!("dry-run: insert {} rows into {}", frame.height(), table_id);
             return Ok(());
         }
-        if self
-            .append_rows_via_batch_load(table_id, schema, frame)
-            .await?
-        {
-            return Ok(());
+        if self.config.emulator_http.is_some() {
+            return self.append_rows_via_emulator(table_id, frame).await;
         }
-        if self
-            .append_rows_via_storage_write(table_id, schema, frame)
-            .await?
-        {
-            return Ok(());
-        }
+        self.append_rows_via_batch_load(table_id, schema, frame).await?;
+        Ok(())
+    }
 
-        let rows = insert_all_rows(frame).await?;
-        let mut request: InsertAllRequest<Map<String, Value>> = InsertAllRequest::default();
-        for row in rows {
-            let insert_id = primary_key
-                .and_then(|pk| row.get(pk))
-                .and_then(value_to_insert_id);
-            request.rows.push(Row {
-                insert_id,
-                json: row,
-            });
-        }
-
-        if let Some(emulator_http) = &self.config.emulator_http {
-            let url = format!(
-                "{}/projects/{}/datasets/{}/tables/{}/insertAll",
-                emulator_http, self.config.project_id, self.config.dataset, table_id
-            );
-            let response = Self::await_with_timeout(
-                format!("posting emulator insertAll for {}", table_id),
-                BIGQUERY_REQUEST_TIMEOUT,
-                reqwest::Client::new().post(url).json(&request).send(),
-            )
-            .await?;
-            if !response.status().is_success() {
-                error!(
-                    table = %table_id,
-                    status = %response.status(),
-                    rows = frame.height(),
-                    "BigQuery emulator insert request failed"
-                );
-                anyhow::bail!("emulator insert failed: {}", response.status());
-            }
-            let payload: serde_json::Value = Self::await_with_timeout(
-                format!("decoding emulator insertAll response for {}", table_id),
-                BIGQUERY_REQUEST_TIMEOUT,
-                response.json(),
-            )
-            .await?;
-            if let Some(errors) = payload.get("insertErrors") {
-                let row_errors = errors.as_array().map(|rows| rows.len()).unwrap_or(1) as u64;
-                crate::telemetry::record_bigquery_row_errors(table_id, row_errors);
-                error!(
-                    table = %table_id,
-                    row_errors,
-                    rows = frame.height(),
-                    "BigQuery emulator insert returned row errors"
-                );
-                anyhow::bail!(
-                    "BigQuery emulator insert errors for {}: {}",
-                    table_id,
-                    errors
-                );
-            }
-            return Ok(());
-        }
-
+    async fn append_rows_via_emulator(&self, table_id: &str, frame: &DataFrame) -> Result<()> {
+        let rows = emulator_insert_rows(frame).await?;
+        let request = json!({
+            "rows": rows.into_iter().map(|row| json!({ "json": row })).collect::<Vec<_>>()
+        });
+        let emulator_http = self
+            .config
+            .emulator_http
+            .as_deref()
+            .context("missing bigquery.emulator_http")?;
+        let url = format!(
+            "{}/projects/{}/datasets/{}/tables/{}/insertAll",
+            emulator_http, self.config.project_id, self.config.dataset, table_id
+        );
         let response = Self::await_with_timeout(
-            format!("running BigQuery insertAll for {}", table_id),
+            format!("posting emulator insertAll for {}", table_id),
             BIGQUERY_REQUEST_TIMEOUT,
-            self.client.tabledata().insert(
-                &self.config.project_id,
-                &self.config.dataset,
-                table_id,
-                &request,
-            ),
+            reqwest::Client::new().post(url).json(&request).send(),
         )
         .await?;
-        if let Some(errors) = response.insert_errors {
-            crate::telemetry::record_bigquery_row_errors(table_id, errors.len() as u64);
+        if !response.status().is_success() {
             error!(
                 table = %table_id,
-                row_errors = errors.len(),
+                status = %response.status(),
                 rows = frame.height(),
-                "BigQuery insertAll returned row errors"
+                "BigQuery emulator insert request failed"
+            );
+            anyhow::bail!("emulator insert failed: {}", response.status());
+        }
+        let payload: serde_json::Value = Self::await_with_timeout(
+            format!("decoding emulator insertAll response for {}", table_id),
+            BIGQUERY_REQUEST_TIMEOUT,
+            response.json(),
+        )
+        .await?;
+        if let Some(errors) = payload.get("insertErrors") {
+            let row_errors = errors.as_array().map(|rows| rows.len()).unwrap_or(1) as u64;
+            crate::telemetry::record_bigquery_row_errors(table_id, row_errors);
+            error!(
+                table = %table_id,
+                row_errors,
+                rows = frame.height(),
+                "BigQuery emulator insert returned row errors"
             );
             anyhow::bail!(
-                "BigQuery insert errors for {}: {} rows",
+                "BigQuery emulator insert errors for {}: {}",
                 table_id,
-                errors.len()
+                errors
             );
         }
         Ok(())
@@ -806,6 +762,7 @@ impl BigQueryDestination {
                     &step.staging_table,
                     &with_metadata_schema(&payload.schema, &self.metadata),
                     &step.object_uri,
+                    gcloud_bigquery::http::job::WriteDisposition::WriteTruncate,
                 )
                 .await?;
             }
@@ -925,7 +882,6 @@ impl BigQueryDestination {
             info!("dry-run: drop {}", table);
             return Ok(());
         }
-        self.invalidate_storage_writer(table).await;
         if let Some(emulator_http) = &self.config.emulator_http {
             let client = reqwest::Client::new();
             let url = format!(
@@ -1035,7 +991,6 @@ impl Destination for BigQueryDestination {
             info!("dry-run: truncate {}", table);
             return Ok(());
         }
-        self.invalidate_storage_writer(table).await;
         if let Some(emulator_http) = &self.config.emulator_http {
             let client = reqwest::Client::new();
             let url = format!(
@@ -1141,15 +1096,15 @@ impl Destination for BigQueryDestination {
     }
 }
 
-async fn insert_all_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
-    if frame.height() < INSERT_ALL_BLOCKING_ROWS {
+async fn emulator_insert_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
+    if frame.height() < EMULATOR_INSERT_BLOCKING_ROWS {
         return dataframe_to_json_rows(frame);
     }
 
     let frame = frame.clone();
     task::spawn_blocking(move || dataframe_to_json_rows(&frame))
         .await
-        .map_err(|err| anyhow::anyhow!("failed to join insertAll row conversion task: {}", err))?
+        .map_err(|err| anyhow::anyhow!("failed to join emulator row conversion task: {}", err))?
 }
 
 pub(crate) fn upsert_staging_table_id(table: &str) -> String {
