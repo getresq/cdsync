@@ -1275,31 +1275,29 @@ SwIDAQAB
         ));
         fs::write(&key_path, TEST_PRIVATE_KEY_PEM).expect("write private key");
 
-        unsafe {
-            std::env::set_var(MONITOR_ISSUER_ENV, "env-ops");
-            std::env::set_var(MONITOR_AUDIENCE_ENV, "env-cdsync");
-            std::env::remove_var(MONITOR_KID_ENV);
-        }
+        temp_env::with_vars(
+            [
+                (MONITOR_ISSUER_ENV, Some("env-ops")),
+                (MONITOR_AUDIENCE_ENV, Some("env-cdsync")),
+                (MONITOR_KID_ENV, None),
+            ],
+            || {
+                let auth = MonitorAuthConfig::from_args(&MonitorAuthArgs {
+                    private_key_path: Some(key_path.display().to_string()),
+                    issuer: None,
+                    audience: None,
+                    subject: None,
+                    scope: "cdsync:admin".to_string(),
+                    kid: None,
+                    expires_in_seconds: 300,
+                })
+                .expect("auth config from env");
 
-        let auth = MonitorAuthConfig::from_args(&MonitorAuthArgs {
-            private_key_path: Some(key_path.display().to_string()),
-            issuer: None,
-            audience: None,
-            subject: None,
-            scope: "cdsync:admin".to_string(),
-            kid: None,
-            expires_in_seconds: 300,
-        })
-        .expect("auth config from env");
-
-        assert_eq!(auth.issuer, "env-ops");
-        assert_eq!(auth.audience, "env-cdsync");
-        assert_eq!(auth.kid, "env-ops-20260401");
-        assert_eq!(auth.subject, "env-ops:monitor");
-
-        unsafe {
-            std::env::remove_var(MONITOR_ISSUER_ENV);
-            std::env::remove_var(MONITOR_AUDIENCE_ENV);
-        }
+                assert_eq!(auth.issuer, "env-ops");
+                assert_eq!(auth.audience, "env-cdsync");
+                assert_eq!(auth.kid, "env-ops-20260401");
+                assert_eq!(auth.subject, "env-ops:monitor");
+            },
+        );
     }
 }
