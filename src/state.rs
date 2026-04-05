@@ -123,6 +123,10 @@ pub struct CdcWatermarkState {
     pub last_received_lsn: Option<String>,
     pub last_flushed_lsn: Option<String>,
     pub last_persisted_lsn: Option<String>,
+    pub last_relevant_change_seen_at: Option<DateTime<Utc>>,
+    pub last_status_update_sent_at: Option<DateTime<Utc>>,
+    pub last_keepalive_reply_at: Option<DateTime<Utc>>,
+    pub last_slot_feedback_lsn: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -139,6 +143,11 @@ pub struct CdcCoordinatorSummary {
     pub last_received_lsn: Option<String>,
     pub last_flushed_lsn: Option<String>,
     pub last_persisted_lsn: Option<String>,
+    pub last_relevant_change_seen_at: Option<DateTime<Utc>>,
+    pub last_status_update_sent_at: Option<DateTime<Utc>>,
+    pub last_keepalive_reply_at: Option<DateTime<Utc>>,
+    pub last_slot_feedback_lsn: Option<String>,
+    pub wal_bytes_unattributed_or_idle: Option<i64>,
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -1160,14 +1169,22 @@ impl SyncStateStore {
                 last_received_lsn,
                 last_flushed_lsn,
                 last_persisted_lsn,
+                last_relevant_change_seen_at,
+                last_status_update_sent_at,
+                last_keepalive_reply_at,
+                last_slot_feedback_lsn,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             on conflict(connection_id) do update set
                 next_sequence_to_ack = excluded.next_sequence_to_ack,
                 last_enqueued_sequence = excluded.last_enqueued_sequence,
                 last_received_lsn = excluded.last_received_lsn,
                 last_flushed_lsn = excluded.last_flushed_lsn,
                 last_persisted_lsn = excluded.last_persisted_lsn,
+                last_relevant_change_seen_at = excluded.last_relevant_change_seen_at,
+                last_status_update_sent_at = excluded.last_status_update_sent_at,
+                last_keepalive_reply_at = excluded.last_keepalive_reply_at,
+                last_slot_feedback_lsn = excluded.last_slot_feedback_lsn,
                 updated_at = excluded.updated_at
             "#,
             self.table("cdc_watermark_state")
@@ -1178,6 +1195,22 @@ impl SyncStateStore {
         .bind(state.last_received_lsn.clone())
         .bind(state.last_flushed_lsn.clone())
         .bind(state.last_persisted_lsn.clone())
+        .bind(
+            state
+                .last_relevant_change_seen_at
+                .map(|value| value.timestamp_millis()),
+        )
+        .bind(
+            state
+                .last_status_update_sent_at
+                .map(|value| value.timestamp_millis()),
+        )
+        .bind(
+            state
+                .last_keepalive_reply_at
+                .map(|value| value.timestamp_millis()),
+        )
+        .bind(state.last_slot_feedback_lsn.clone())
         .bind(updated_at)
         .execute(&self.pool)
         .await?;
@@ -1191,7 +1224,10 @@ impl SyncStateStore {
         let row = sqlx::query(&format!(
             r#"
             select next_sequence_to_ack, last_enqueued_sequence, last_received_lsn,
-                   last_flushed_lsn, last_persisted_lsn, updated_at
+                   last_flushed_lsn, last_persisted_lsn,
+                   last_relevant_change_seen_at, last_status_update_sent_at,
+                   last_keepalive_reply_at, last_slot_feedback_lsn,
+                   updated_at
             from {}
             where connection_id = $1
             "#,
@@ -1210,6 +1246,16 @@ impl SyncStateStore {
                 last_received_lsn: row.try_get("last_received_lsn")?,
                 last_flushed_lsn: row.try_get("last_flushed_lsn")?,
                 last_persisted_lsn: row.try_get("last_persisted_lsn")?,
+                last_relevant_change_seen_at: row
+                    .try_get::<Option<i64>, _>("last_relevant_change_seen_at")?
+                    .and_then(datetime_from_millis),
+                last_status_update_sent_at: row
+                    .try_get::<Option<i64>, _>("last_status_update_sent_at")?
+                    .and_then(datetime_from_millis),
+                last_keepalive_reply_at: row
+                    .try_get::<Option<i64>, _>("last_keepalive_reply_at")?
+                    .and_then(datetime_from_millis),
+                last_slot_feedback_lsn: row.try_get("last_slot_feedback_lsn")?,
                 updated_at: row
                     .try_get::<i64, _>("updated_at")
                     .ok()
@@ -1222,6 +1268,7 @@ impl SyncStateStore {
     pub async fn load_cdc_coordinator_summary(
         &self,
         connection_id: &str,
+        wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
         let now = now_millis();
         let watermark = self.load_cdc_watermark_state(connection_id).await?;
@@ -1263,6 +1310,23 @@ impl SyncStateStore {
             last_persisted_lsn: watermark
                 .as_ref()
                 .and_then(|state| state.last_persisted_lsn.clone()),
+            last_relevant_change_seen_at: watermark
+                .as_ref()
+                .and_then(|state| state.last_relevant_change_seen_at),
+            last_status_update_sent_at: watermark
+                .as_ref()
+                .and_then(|state| state.last_status_update_sent_at),
+            last_keepalive_reply_at: watermark
+                .as_ref()
+                .and_then(|state| state.last_keepalive_reply_at),
+            last_slot_feedback_lsn: watermark
+                .as_ref()
+                .and_then(|state| state.last_slot_feedback_lsn.clone()),
+            wal_bytes_unattributed_or_idle: if pending.is_empty() {
+                wal_bytes_behind_confirmed
+            } else {
+                None
+            },
             updated_at: watermark.and_then(|state| state.updated_at),
         })
     }

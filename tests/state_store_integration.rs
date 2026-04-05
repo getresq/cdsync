@@ -210,6 +210,10 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
             last_received_lsn: Some("0/AAB".to_string()),
             last_flushed_lsn: Some("0/AAA".to_string()),
             last_persisted_lsn: Some("0/AAA".to_string()),
+            last_relevant_change_seen_at: None,
+            last_status_update_sent_at: None,
+            last_keepalive_reply_at: None,
+            last_slot_feedback_lsn: None,
             updated_at: None,
         })
         .await?;

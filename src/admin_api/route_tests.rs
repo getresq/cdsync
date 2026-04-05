@@ -68,6 +68,7 @@ impl AdminStateBackend for FakeStateBackend {
     async fn load_cdc_coordinator_summary(
         &self,
         _connection_id: &str,
+        _wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
         Ok(self.cdc_coordinator_summary.clone().unwrap_or_default())
     }
@@ -110,6 +111,7 @@ impl AdminStateBackend for CountingStateBackend {
     async fn load_cdc_coordinator_summary(
         &self,
         _connection_id: &str,
+        _wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
         Ok(CdcCoordinatorSummary::default())
     }

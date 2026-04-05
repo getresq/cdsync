@@ -121,6 +121,7 @@ trait AdminStateBackend: Send + Sync {
     async fn load_cdc_coordinator_summary(
         &self,
         connection_id: &str,
+        wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary>;
 }
 
@@ -162,8 +163,14 @@ impl AdminStateBackend for SyncStateStore {
     async fn load_cdc_coordinator_summary(
         &self,
         connection_id: &str,
+        wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
-        SyncStateStore::load_cdc_coordinator_summary(self, connection_id).await
+        SyncStateStore::load_cdc_coordinator_summary(
+            self,
+            connection_id,
+            wal_bytes_behind_confirmed,
+        )
+        .await
     }
 }
 
@@ -841,6 +848,10 @@ fn publish_cached_postgres_cdc_slot_state(
     tx.send_replace(sample);
 }
 
+fn datetime_age_seconds(value: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<u64> {
+    value.map(|value| (now - value).num_seconds().max(0) as u64)
+}
+
 fn spawn_cdc_slot_sampler_tasks(
     cfg: Arc<Config>,
     state_store: Arc<dyn AdminStateBackend>,
@@ -867,6 +878,30 @@ fn spawn_cdc_slot_sampler_tasks(
                 tokio::select! {
                     _ = interval.tick() => {
                         let sample = sample_cached_postgres_cdc_slot_state(&connection, &state_store).await;
+                        if uses_cdc_batch_load_queue(&connection)
+                            && let Ok(summary) = state_store
+                                .load_cdc_coordinator_summary(
+                                    &connection.id,
+                                    sample
+                                        .snapshot
+                                        .as_ref()
+                                        .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed),
+                                )
+                                .await
+                        {
+                            let now = Utc::now();
+                            crate::telemetry::record_cdc_coordinator_diagnostics(
+                                &connection.id,
+                                summary.pending_fragments.max(0) as u64,
+                                summary.failed_fragments.max(0) as u64,
+                                summary.next_sequence_to_ack,
+                                summary.oldest_pending_age_seconds.map(|value| value.max(0) as u64),
+                                datetime_age_seconds(summary.last_relevant_change_seen_at, now),
+                                datetime_age_seconds(summary.last_status_update_sent_at, now),
+                                datetime_age_seconds(summary.last_keepalive_reply_at, now),
+                                summary.wal_bytes_unattributed_or_idle.map(|value| value.max(0) as u64),
+                            );
+                        }
                         publish_cached_postgres_cdc_slot_state(&tx, sample);
                     }
                     changed = shutdown.changed() => {
@@ -1199,7 +1234,7 @@ async fn progress(
         Some(
             state
                 .state_store
-                .load_cdc_coordinator_summary(&connection_id)
+                .load_cdc_coordinator_summary(&connection_id, cdc.wal_bytes_behind_confirmed)
                 .await?,
         )
     } else {

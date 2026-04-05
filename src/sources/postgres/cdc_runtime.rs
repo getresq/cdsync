@@ -535,6 +535,8 @@ impl PostgresSource {
                     }
                     if keepalive.reply() == 1 {
                         info!(
+                            event = "cdc_keepalive_reply_requested",
+                            component = "coordinator",
                             slot_name = slot_name,
                             wal_end = %wal_end,
                             last_received_lsn = %last_received_lsn,
@@ -552,6 +554,21 @@ impl PostgresSource {
                             ),
                         )
                         .await?;
+                        if let Some(state_handle) = state_handle.as_ref() {
+                            let mut watermark_state = state_handle
+                                .load_cdc_watermark_state()
+                                .await?
+                                .unwrap_or_default();
+                            let now = chrono::Utc::now();
+                            watermark_state.last_status_update_sent_at = Some(now);
+                            watermark_state.last_keepalive_reply_at = Some(now);
+                            watermark_state.last_slot_feedback_lsn =
+                                Some(last_flushed_lsn.to_string());
+                            watermark_state.updated_at = Some(now);
+                            state_handle
+                                .save_cdc_watermark_state(&watermark_state)
+                                .await?;
+                        }
                     }
                 }
                 ReplicationMessage::XLogData(xlog) => {

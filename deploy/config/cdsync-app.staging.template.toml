@@ -18,7 +18,7 @@ level = "info"
 json = true
 
 [observability]
-service_name = "cdsync-app-staging"
+service_name = "staging-cdsync-app"
 metrics_interval_seconds = 30
 
 [sync]

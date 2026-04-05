@@ -69,6 +69,14 @@ struct ReplicationMetrics {
     cdc_batch_load_jobs_total: Counter<u64>,
     cdc_batch_load_job_duration_ms: Histogram<f64>,
     cdc_batch_load_stage_duration_ms: Histogram<f64>,
+    cdc_coordinator_pending_fragments: Histogram<u64>,
+    cdc_coordinator_failed_fragments: Histogram<u64>,
+    cdc_coordinator_next_sequence_to_ack: Histogram<u64>,
+    cdc_coordinator_oldest_pending_fragment_age_seconds: Histogram<u64>,
+    cdc_relevant_change_age_seconds: Histogram<u64>,
+    cdc_status_update_age_seconds: Histogram<u64>,
+    cdc_keepalive_reply_age_seconds: Histogram<u64>,
+    cdc_unattributed_wal_gap_bytes: Histogram<u64>,
 }
 
 static METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
@@ -286,6 +294,52 @@ pub fn record_cdc_batch_load_stage_duration(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn record_cdc_coordinator_diagnostics(
+    connection_id: &str,
+    pending_fragments: u64,
+    failed_fragments: u64,
+    next_sequence_to_ack: u64,
+    oldest_pending_fragment_age_seconds: Option<u64>,
+    relevant_change_age_seconds: Option<u64>,
+    status_update_age_seconds: Option<u64>,
+    keepalive_reply_age_seconds: Option<u64>,
+    unattributed_wal_gap_bytes: Option<u64>,
+) {
+    let metrics = metrics();
+    let attrs = [KeyValue::new("connection_id", connection_id.to_string())];
+    metrics
+        .cdc_coordinator_pending_fragments
+        .record(pending_fragments, &attrs);
+    metrics
+        .cdc_coordinator_failed_fragments
+        .record(failed_fragments, &attrs);
+    metrics
+        .cdc_coordinator_next_sequence_to_ack
+        .record(next_sequence_to_ack, &attrs);
+    if let Some(value) = oldest_pending_fragment_age_seconds {
+        metrics
+            .cdc_coordinator_oldest_pending_fragment_age_seconds
+            .record(value, &attrs);
+    }
+    if let Some(value) = relevant_change_age_seconds {
+        metrics
+            .cdc_relevant_change_age_seconds
+            .record(value, &attrs);
+    }
+    if let Some(value) = status_update_age_seconds {
+        metrics.cdc_status_update_age_seconds.record(value, &attrs);
+    }
+    if let Some(value) = keepalive_reply_age_seconds {
+        metrics
+            .cdc_keepalive_reply_age_seconds
+            .record(value, &attrs);
+    }
+    if let Some(value) = unattributed_wal_gap_bytes {
+        metrics.cdc_unattributed_wal_gap_bytes.record(value, &attrs);
+    }
+}
+
 fn metrics() -> &'static ReplicationMetrics {
     METRICS.get_or_init(|| {
         let meter: Meter = global::meter("cdsync");
@@ -323,6 +377,30 @@ fn metrics() -> &'static ReplicationMetrics {
                 .build(),
             cdc_batch_load_stage_duration_ms: meter
                 .f64_histogram("cdsync_cdc_batch_load_stage_duration_ms")
+                .build(),
+            cdc_coordinator_pending_fragments: meter
+                .u64_histogram("cdsync_cdc_coordinator_pending_fragments")
+                .build(),
+            cdc_coordinator_failed_fragments: meter
+                .u64_histogram("cdsync_cdc_coordinator_failed_fragments")
+                .build(),
+            cdc_coordinator_next_sequence_to_ack: meter
+                .u64_histogram("cdsync_cdc_coordinator_next_sequence_to_ack")
+                .build(),
+            cdc_coordinator_oldest_pending_fragment_age_seconds: meter
+                .u64_histogram("cdsync_cdc_coordinator_oldest_pending_fragment_age_seconds")
+                .build(),
+            cdc_relevant_change_age_seconds: meter
+                .u64_histogram("cdsync_cdc_relevant_change_age_seconds")
+                .build(),
+            cdc_status_update_age_seconds: meter
+                .u64_histogram("cdsync_cdc_status_update_age_seconds")
+                .build(),
+            cdc_keepalive_reply_age_seconds: meter
+                .u64_histogram("cdsync_cdc_keepalive_reply_age_seconds")
+                .build(),
+            cdc_unattributed_wal_gap_bytes: meter
+                .u64_histogram("cdsync_cdc_unattributed_wal_gap_bytes")
                 .build(),
         }
     })

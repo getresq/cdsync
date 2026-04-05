@@ -694,6 +694,9 @@ impl CdcBatchLoadManager {
                 }
                 Err(err) => {
                     warn!(
+                        component = "consumer",
+                        event = "cdc_consumer_claim_failed",
+                        connection_id = self.state_handle.connection_id(),
                         worker = worker_index,
                         error = %err,
                         "consumer worker failed to claim queued CDC batch-load job"
@@ -703,6 +706,9 @@ impl CdcBatchLoadManager {
                 }
             };
             info!(
+                component = "consumer",
+                event = "cdc_consumer_claimed_job",
+                connection_id = self.state_handle.connection_id(),
                 worker = worker_index,
                 job_id = %job.record.job_id,
                 table = %job.record.table_key,
@@ -724,6 +730,9 @@ impl CdcBatchLoadManager {
             .await?;
         if requeued_running > 0 || !pending_jobs.is_empty() {
             info!(
+                component = "consumer",
+                event = "cdc_consumer_restored_jobs",
+                connection_id = self.state_handle.connection_id(),
                 requeued_running_jobs = requeued_running,
                 pending_jobs = pending_jobs.len(),
                 "restored queued CDC batch-load jobs from durable state"
@@ -844,6 +853,7 @@ impl CdcBatchLoadManager {
                     .max(last_fragment.sequence),
             );
             watermark.last_received_lsn = Some(last_fragment.commit_lsn.clone());
+            watermark.last_relevant_change_seen_at = Some(Utc::now());
             watermark.updated_at = Some(Utc::now());
             self.state_handle
                 .save_cdc_watermark_state(&watermark)
@@ -874,9 +884,13 @@ impl CdcBatchLoadManager {
             }
             CdcBatchLoadJobStatus::Pending | CdcBatchLoadJobStatus::Running => {
                 info!(
+                    component = "producer",
+                    event = "cdc_producer_enqueued_job",
+                    connection_id = self.state_handle.connection_id(),
                     table = %persisted_record.table_key,
                     first_sequence = persisted_record.first_sequence,
                     status = ?persisted_record.status,
+                    job_id = %persisted_record.job_id,
                     "queued CDC batch-load job scheduled for consumer workers"
                 );
                 self.notify.notify_one();
@@ -939,6 +953,9 @@ impl CdcBatchLoadManager {
                         _ = tokio::time::sleep(CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL) => {
                             if let Err(err) = state_handle.heartbeat_cdc_batch_load_job(&heartbeat_job_id).await {
                                 warn!(
+                                    component = "consumer",
+                                    event = "cdc_consumer_job_heartbeat_failed",
+                                    connection_id = state_handle.connection_id(),
                                     job_id = %heartbeat_job_id,
                                     table = %heartbeat_table,
                                     error = %err,
@@ -974,6 +991,9 @@ impl CdcBatchLoadManager {
                     started_at.elapsed().as_secs_f64() * 1000.0,
                 );
                 info!(
+                    component = "consumer",
+                    event = "cdc_consumer_job_succeeded",
+                    connection_id = self.state_handle.connection_id(),
                     job_id = %job_id,
                     table = %table_key,
                     duration_ms = started_at.elapsed().as_millis() as u64,
@@ -1020,6 +1040,9 @@ impl CdcBatchLoadManager {
                     started_at.elapsed().as_secs_f64() * 1000.0,
                 );
                 warn!(
+                    component = "consumer",
+                    event = "cdc_consumer_job_failed",
+                    connection_id = self.state_handle.connection_id(),
                     job_id = %job_id,
                     table = %table_key,
                     duration_ms = started_at.elapsed().as_millis() as u64,

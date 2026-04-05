@@ -527,9 +527,16 @@ pub(super) async fn apply_cdc_watermark_advance(
 
     *last_flushed_lsn = advance.commit_lsn;
     info!(
+        component = "coordinator",
+        event = "cdc_coordinator_advanced_watermark",
+        connection_id = runtime
+            .state_handle
+            .map(|state_handle| state_handle.connection_id())
+            .unwrap_or("unknown"),
         commit_lsn = %advance.commit_lsn,
         stats_tables = advance.stats.len(),
         extract_ms = advance.extract_ms,
+        next_sequence_to_ack = advance.next_sequence_to_ack,
         last_received_lsn = %last_received_lsn,
         "advancing cdc watermark"
     );
@@ -560,6 +567,8 @@ pub(super) async fn apply_cdc_watermark_advance(
             watermark_state.last_received_lsn = Some(last_received_lsn.to_string());
             watermark_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
             watermark_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
+            watermark_state.last_status_update_sent_at = Some(chrono::Utc::now());
+            watermark_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
             watermark_state.updated_at = Some(chrono::Utc::now());
             state_handle
                 .save_cdc_watermark_state(&watermark_state)

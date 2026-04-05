@@ -736,6 +736,9 @@ impl BigQueryDestination {
             payload.steps.iter().map(|step| step.row_count as u64).sum(),
         );
         info!(
+            component = "consumer",
+            event = "cdc_consumer_ensure_target_completed",
+            connection_id = connection_id,
             table = %payload.target_table,
             duration_ms = target_started_at.elapsed().as_millis() as u64,
             "queued ensure target completed"
@@ -751,6 +754,9 @@ impl BigQueryDestination {
         }
         for step in &payload.steps {
             info!(
+                component = "consumer",
+                event = "cdc_consumer_ensure_staging_started",
+                connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
@@ -777,6 +783,9 @@ impl BigQueryDestination {
                 step.row_count as u64,
             );
             info!(
+                component = "consumer",
+                event = "cdc_consumer_ensure_staging_completed",
+                connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
@@ -808,6 +817,9 @@ impl BigQueryDestination {
                 step.row_count as u64,
             );
             info!(
+                component = "consumer",
+                event = "cdc_consumer_load_job_completed",
+                connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
@@ -815,6 +827,9 @@ impl BigQueryDestination {
                 "queued BigQuery load job completed"
             );
             info!(
+                component = "consumer",
+                event = "cdc_consumer_merge_started",
+                connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
@@ -846,6 +861,9 @@ impl BigQueryDestination {
                 step.row_count as u64,
             );
             info!(
+                component = "consumer",
+                event = "cdc_consumer_merge_completed",
+                connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
                 rows = step.row_count,
