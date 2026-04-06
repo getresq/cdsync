@@ -5,7 +5,7 @@ pub(crate) fn connection_run_mode(connection: &crate::config::ConnectionConfig) 
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
             "cdc_follow"
         }
-        _ => "scheduled_polling",
+        (SourceConfig::Postgres(_), DestinationConfig::BigQuery(_)) => "scheduled_polling",
     }
 }
 
@@ -162,25 +162,17 @@ pub(crate) fn connection_source_kind(
 ) -> &'static str {
     match &connection.source {
         SourceConfig::Postgres(_) => "postgres",
-        SourceConfig::Salesforce(_) => "salesforce",
     }
 }
 
 fn configured_entity_names(
     connection: &crate::config::ConnectionConfig,
 ) -> std::collections::BTreeSet<String> {
-    match &connection.source {
-        SourceConfig::Postgres(pg) => pg
-            .tables
-            .as_ref()
-            .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
-            .unwrap_or_default(),
-        SourceConfig::Salesforce(sf) => sf
-            .objects
-            .as_ref()
-            .map(|objects| objects.iter().map(|object| object.name.clone()).collect())
-            .unwrap_or_default(),
-    }
+    let SourceConfig::Postgres(pg) = &connection.source;
+    pg.tables
+        .as_ref()
+        .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+        .unwrap_or_default()
 }
 
 fn connection_checkpoint_age_seconds(
@@ -200,10 +192,7 @@ pub(crate) fn max_checkpoint_age_seconds(
     now: chrono::DateTime<Utc>,
 ) -> Option<u64> {
     let configured = configured_entity_names(connection);
-    let checkpoints = match &connection.source {
-        SourceConfig::Postgres(_) => state.postgres.iter().collect::<Vec<_>>(),
-        SourceConfig::Salesforce(_) => state.salesforce.iter().collect::<Vec<_>>(),
-    };
+    let checkpoints = state.postgres.iter().collect::<Vec<_>>();
     checkpoints
         .into_iter()
         .filter(|(entity_name, _)| configured.is_empty() || configured.contains(*entity_name))

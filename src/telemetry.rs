@@ -69,22 +69,6 @@ struct ReplicationMetrics {
     cdc_batch_load_jobs_total: Counter<u64>,
     cdc_batch_load_job_duration_ms: Histogram<f64>,
     cdc_batch_load_stage_duration_ms: Histogram<f64>,
-    cdc_batch_load_pending_jobs: Histogram<u64>,
-    cdc_batch_load_running_jobs: Histogram<u64>,
-    cdc_batch_load_failed_jobs: Histogram<u64>,
-    cdc_batch_load_succeeded_jobs: Histogram<u64>,
-    cdc_batch_load_jobs_per_minute: Histogram<u64>,
-    cdc_batch_load_rows_per_minute: Histogram<u64>,
-    cdc_batch_load_oldest_pending_age_seconds: Histogram<u64>,
-    cdc_batch_load_oldest_running_age_seconds: Histogram<u64>,
-    cdc_coordinator_pending_fragments: Histogram<u64>,
-    cdc_coordinator_failed_fragments: Histogram<u64>,
-    cdc_coordinator_next_sequence_to_ack: Histogram<u64>,
-    cdc_coordinator_oldest_pending_fragment_age_seconds: Histogram<u64>,
-    cdc_relevant_change_age_seconds: Histogram<u64>,
-    cdc_status_update_age_seconds: Histogram<u64>,
-    cdc_keepalive_reply_age_seconds: Histogram<u64>,
-    cdc_unattributed_wal_gap_bytes: Histogram<u64>,
 }
 
 static METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
@@ -302,96 +286,6 @@ pub fn record_cdc_batch_load_stage_duration(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn record_cdc_batch_load_queue_diagnostics(
-    connection_id: &str,
-    pending_jobs: u64,
-    running_jobs: u64,
-    failed_jobs: u64,
-    succeeded_jobs: u64,
-    jobs_per_minute: u64,
-    rows_per_minute: u64,
-    oldest_pending_age_seconds: Option<u64>,
-    oldest_running_age_seconds: Option<u64>,
-) {
-    let metrics = metrics();
-    let attrs = [KeyValue::new("connection_id", connection_id.to_string())];
-    metrics
-        .cdc_batch_load_pending_jobs
-        .record(pending_jobs, &attrs);
-    metrics
-        .cdc_batch_load_running_jobs
-        .record(running_jobs, &attrs);
-    metrics
-        .cdc_batch_load_failed_jobs
-        .record(failed_jobs, &attrs);
-    metrics
-        .cdc_batch_load_succeeded_jobs
-        .record(succeeded_jobs, &attrs);
-    metrics
-        .cdc_batch_load_jobs_per_minute
-        .record(jobs_per_minute, &attrs);
-    metrics
-        .cdc_batch_load_rows_per_minute
-        .record(rows_per_minute, &attrs);
-    if let Some(value) = oldest_pending_age_seconds {
-        metrics
-            .cdc_batch_load_oldest_pending_age_seconds
-            .record(value, &attrs);
-    }
-    if let Some(value) = oldest_running_age_seconds {
-        metrics
-            .cdc_batch_load_oldest_running_age_seconds
-            .record(value, &attrs);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn record_cdc_coordinator_diagnostics(
-    connection_id: &str,
-    pending_fragments: u64,
-    failed_fragments: u64,
-    next_sequence_to_ack: u64,
-    oldest_pending_fragment_age_seconds: Option<u64>,
-    relevant_change_age_seconds: Option<u64>,
-    status_update_age_seconds: Option<u64>,
-    keepalive_reply_age_seconds: Option<u64>,
-    unattributed_wal_gap_bytes: Option<u64>,
-) {
-    let metrics = metrics();
-    let attrs = [KeyValue::new("connection_id", connection_id.to_string())];
-    metrics
-        .cdc_coordinator_pending_fragments
-        .record(pending_fragments, &attrs);
-    metrics
-        .cdc_coordinator_failed_fragments
-        .record(failed_fragments, &attrs);
-    metrics
-        .cdc_coordinator_next_sequence_to_ack
-        .record(next_sequence_to_ack, &attrs);
-    if let Some(value) = oldest_pending_fragment_age_seconds {
-        metrics
-            .cdc_coordinator_oldest_pending_fragment_age_seconds
-            .record(value, &attrs);
-    }
-    if let Some(value) = relevant_change_age_seconds {
-        metrics
-            .cdc_relevant_change_age_seconds
-            .record(value, &attrs);
-    }
-    if let Some(value) = status_update_age_seconds {
-        metrics.cdc_status_update_age_seconds.record(value, &attrs);
-    }
-    if let Some(value) = keepalive_reply_age_seconds {
-        metrics
-            .cdc_keepalive_reply_age_seconds
-            .record(value, &attrs);
-    }
-    if let Some(value) = unattributed_wal_gap_bytes {
-        metrics.cdc_unattributed_wal_gap_bytes.record(value, &attrs);
-    }
-}
-
 fn metrics() -> &'static ReplicationMetrics {
     METRICS.get_or_init(|| {
         let meter: Meter = global::meter("cdsync");
@@ -429,54 +323,6 @@ fn metrics() -> &'static ReplicationMetrics {
                 .build(),
             cdc_batch_load_stage_duration_ms: meter
                 .f64_histogram("cdsync_cdc_batch_load_stage_duration_ms")
-                .build(),
-            cdc_batch_load_pending_jobs: meter
-                .u64_histogram("cdsync_cdc_batch_load_pending_jobs")
-                .build(),
-            cdc_batch_load_running_jobs: meter
-                .u64_histogram("cdsync_cdc_batch_load_running_jobs")
-                .build(),
-            cdc_batch_load_failed_jobs: meter
-                .u64_histogram("cdsync_cdc_batch_load_failed_jobs")
-                .build(),
-            cdc_batch_load_succeeded_jobs: meter
-                .u64_histogram("cdsync_cdc_batch_load_succeeded_jobs")
-                .build(),
-            cdc_batch_load_jobs_per_minute: meter
-                .u64_histogram("cdsync_cdc_batch_load_jobs_per_minute")
-                .build(),
-            cdc_batch_load_rows_per_minute: meter
-                .u64_histogram("cdsync_cdc_batch_load_rows_per_minute")
-                .build(),
-            cdc_batch_load_oldest_pending_age_seconds: meter
-                .u64_histogram("cdsync_cdc_batch_load_oldest_pending_age_seconds")
-                .build(),
-            cdc_batch_load_oldest_running_age_seconds: meter
-                .u64_histogram("cdsync_cdc_batch_load_oldest_running_age_seconds")
-                .build(),
-            cdc_coordinator_pending_fragments: meter
-                .u64_histogram("cdsync_cdc_coordinator_pending_fragments")
-                .build(),
-            cdc_coordinator_failed_fragments: meter
-                .u64_histogram("cdsync_cdc_coordinator_failed_fragments")
-                .build(),
-            cdc_coordinator_next_sequence_to_ack: meter
-                .u64_histogram("cdsync_cdc_coordinator_next_sequence_to_ack")
-                .build(),
-            cdc_coordinator_oldest_pending_fragment_age_seconds: meter
-                .u64_histogram("cdsync_cdc_coordinator_oldest_pending_fragment_age_seconds")
-                .build(),
-            cdc_relevant_change_age_seconds: meter
-                .u64_histogram("cdsync_cdc_relevant_change_age_seconds")
-                .build(),
-            cdc_status_update_age_seconds: meter
-                .u64_histogram("cdsync_cdc_status_update_age_seconds")
-                .build(),
-            cdc_keepalive_reply_age_seconds: meter
-                .u64_histogram("cdsync_cdc_keepalive_reply_age_seconds")
-                .build(),
-            cdc_unattributed_wal_gap_bytes: meter
-                .u64_histogram("cdsync_cdc_unattributed_wal_gap_bytes")
                 .build(),
         }
     })

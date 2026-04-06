@@ -1,7 +1,6 @@
 use crate::config::{Config, SourceConfig};
 use crate::destinations::bigquery::BigQueryDestination;
 use crate::sources::postgres::PostgresSource;
-use crate::sources::salesforce::SalesforceSource;
 use crate::state::SyncState;
 use crate::stats::StatsDb;
 use crate::{select_sync_connections, telemetry};
@@ -91,10 +90,6 @@ pub(crate) async fn cmd_validate(
                     source.validate_cdc_publication(&tables, verbose).await?;
                 }
             }
-            SourceConfig::Salesforce(sf) => {
-                let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
-                source.validate().await?;
-            }
         }
         match &connection.destination {
             crate::config::DestinationConfig::BigQuery(bq) => {
@@ -166,71 +161,64 @@ pub(crate) async fn cmd_reconcile(
         .find(|c| c.id == connection_id)
         .context("connection not found")?;
 
-    let report = match (&connection.source, &connection.destination) {
-        (SourceConfig::Postgres(pg), crate::config::DestinationConfig::BigQuery(bq)) => {
-            let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
-            let tables = source.resolve_tables().await?;
-            let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
-            dest.validate().await?;
+    let (SourceConfig::Postgres(pg), crate::config::DestinationConfig::BigQuery(bq)) =
+        (&connection.source, &connection.destination);
+    let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
+    let tables = source.resolve_tables().await?;
+    let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
+    dest.validate().await?;
 
-            let tables = match &table_filter {
-                Some(filter) => tables
-                    .into_iter()
-                    .filter(|table| table.name == *filter)
-                    .collect::<Vec<_>>(),
-                None => tables,
-            };
+    let tables = match &table_filter {
+        Some(filter) => tables
+            .into_iter()
+            .filter(|table| table.name == *filter)
+            .collect::<Vec<_>>(),
+        None => tables,
+    };
 
-            let mut rows = Vec::with_capacity(tables.len());
-            for table in tables {
-                let destination_table = crate::types::destination_table_name(&table.name);
-                let report = match tokio::join!(
-                    source.summarize_table(&table),
-                    dest.summarize_table(&destination_table),
-                ) {
-                    (Ok(source_summary), Ok(dest_summary)) => TableReconciliationReport {
-                        source_table: table.name.clone(),
-                        destination_table,
-                        source_row_count: Some(source_summary.row_count),
-                        destination_row_count: Some(dest_summary.row_count),
-                        deleted_rows: Some(dest_summary.deleted_rows),
-                        source_max_updated_at: source_summary.max_updated_at,
-                        destination_max_synced_at: dest_summary.max_synced_at,
-                        count_match: Some(reconcile_count_match(
-                            &source_summary,
-                            &dest_summary,
-                            &table,
-                        )),
-                        error: None,
-                    },
-                    (source_result, dest_result) => TableReconciliationReport {
-                        source_table: table.name.clone(),
-                        destination_table,
-                        source_row_count: None,
-                        destination_row_count: None,
-                        deleted_rows: None,
-                        source_max_updated_at: None,
-                        destination_max_synced_at: None,
-                        count_match: None,
-                        error: Some(format!(
-                            "source={:?} destination={:?}",
-                            source_result.err(),
-                            dest_result.err()
-                        )),
-                    },
-                };
-                if let Some(count_match) = report.count_match {
-                    telemetry::record_reconcile_table(&connection_id, count_match);
-                }
-                rows.push(report);
-            }
-
-            ReconciliationOutput {
-                connection_id: connection.id.clone(),
-                tables: rows,
-            }
+    let mut rows = Vec::with_capacity(tables.len());
+    for table in tables {
+        let destination_table = crate::types::destination_table_name(&table.name);
+        let report = match tokio::join!(
+            source.summarize_table(&table),
+            dest.summarize_table(&destination_table),
+        ) {
+            (Ok(source_summary), Ok(dest_summary)) => TableReconciliationReport {
+                source_table: table.name.clone(),
+                destination_table,
+                source_row_count: Some(source_summary.row_count),
+                destination_row_count: Some(dest_summary.row_count),
+                deleted_rows: Some(dest_summary.deleted_rows),
+                source_max_updated_at: source_summary.max_updated_at,
+                destination_max_synced_at: dest_summary.max_synced_at,
+                count_match: Some(reconcile_count_match(&source_summary, &dest_summary, &table)),
+                error: None,
+            },
+            (source_result, dest_result) => TableReconciliationReport {
+                source_table: table.name.clone(),
+                destination_table,
+                source_row_count: None,
+                destination_row_count: None,
+                deleted_rows: None,
+                source_max_updated_at: None,
+                destination_max_synced_at: None,
+                count_match: None,
+                error: Some(format!(
+                    "source={:?} destination={:?}",
+                    source_result.err(),
+                    dest_result.err()
+                )),
+            },
+        };
+        if let Some(count_match) = report.count_match {
+            telemetry::record_reconcile_table(&connection_id, count_match);
         }
-        _ => anyhow::bail!("reconcile currently supports postgres -> bigquery only"),
+        rows.push(report);
+    }
+
+    let report = ReconciliationOutput {
+        connection_id: connection.id.clone(),
+        tables: rows,
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);

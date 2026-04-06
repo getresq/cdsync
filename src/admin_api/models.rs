@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 
 #[derive(Serialize)]
 pub(super) struct HealthResponse {
@@ -151,8 +152,6 @@ pub(super) struct ScrubbedConnectionConfig {
 pub(super) enum ScrubbedSourceConfig {
     #[serde(rename = "postgres")]
     Postgres(ScrubbedPostgresConfig),
-    #[serde(rename = "salesforce")]
-    Salesforce(ScrubbedSalesforceConfig),
 }
 
 #[derive(Serialize)]
@@ -181,17 +180,6 @@ pub(super) struct ScrubbedPostgresConfig {
     pub(super) cdc_tls: Option<bool>,
     pub(super) cdc_tls_ca_path: Option<std::path::PathBuf>,
     pub(super) cdc_tls_ca: Option<String>,
-}
-
-#[derive(Serialize)]
-pub(super) struct ScrubbedSalesforceConfig {
-    pub(super) login_url: Option<String>,
-    pub(super) instance_url: Option<String>,
-    pub(super) client_id: String,
-    pub(super) objects: Option<Vec<crate::config::SalesforceObjectConfig>>,
-    pub(super) object_selection: Option<crate::config::ObjectSelectionConfig>,
-    pub(super) polling_interval_seconds: Option<u64>,
-    pub(super) api_version: Option<String>,
 }
 
 #[derive(Serialize)]

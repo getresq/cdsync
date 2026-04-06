@@ -529,9 +529,7 @@ async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown
 async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_scan() {
     let mut cfg = test_config();
     let mut connection = cfg.connections[0].clone();
-    let SourceConfig::Postgres(pg) = &mut connection.source else {
-        unreachable!();
-    };
+    let SourceConfig::Postgres(pg) = &mut connection.source;
     pg.url = "postgres://127.0.0.1:1/postgres".to_string();
     let load_state_calls = Arc::new(AtomicUsize::new(0));
     let load_connection_state_calls = Arc::new(AtomicUsize::new(0));
@@ -724,9 +722,8 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
 #[tokio::test]
 async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
     let mut cfg = test_config();
-    if let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source {
-        pg.cdc = Some(false);
-    }
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source;
+    pg.cdc = Some(false);
 
     let state = test_admin_state_with_config(
         cfg,

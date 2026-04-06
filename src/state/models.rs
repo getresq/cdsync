@@ -177,8 +177,6 @@ pub struct ConnectionState {
     #[serde(default)]
     pub postgres: HashMap<String, TableCheckpoint>,
     pub postgres_cdc: Option<PostgresCdcState>,
-    #[serde(default)]
-    pub salesforce: HashMap<String, TableCheckpoint>,
     pub last_sync_started_at: Option<DateTime<Utc>>,
     pub last_sync_finished_at: Option<DateTime<Utc>>,
     pub last_sync_status: Option<String>,

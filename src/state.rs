@@ -94,7 +94,6 @@ impl SyncStateStore {
             let connection_state = ConnectionState {
                 postgres: HashMap::new(),
                 postgres_cdc: load_cdc_state_from_row(&row)?,
-                salesforce: HashMap::new(),
                 last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
                 last_sync_finished_at: parse_optional_rfc3339(
                     row.try_get("last_sync_finished_at")?,
@@ -116,14 +115,8 @@ impl SyncStateStore {
                     format!("parsing checkpoint for {}:{}", connection_id, entity_name)
                 })?;
             let connection = connections.entry(connection_id).or_default();
-            match source_kind.as_str() {
-                "postgres" => {
-                    connection.postgres.insert(entity_name, checkpoint);
-                }
-                "salesforce" => {
-                    connection.salesforce.insert(entity_name, checkpoint);
-                }
-                _ => {}
+            if source_kind.as_str() == "postgres" {
+                connection.postgres.insert(entity_name, checkpoint);
             }
         }
 
@@ -152,7 +145,6 @@ impl SyncStateStore {
         Ok(Some(ConnectionState {
             postgres: HashMap::new(),
             postgres_cdc: load_cdc_state_from_row(&row)?,
-            salesforce: HashMap::new(),
             last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
             last_sync_finished_at: parse_optional_rfc3339(row.try_get("last_sync_finished_at")?),
             last_sync_status: row.try_get("last_sync_status")?,
@@ -174,10 +166,6 @@ impl SyncStateStore {
             .await?;
         for (table_name, checkpoint) in &connection_state.postgres {
             self.save_table_checkpoint(connection_id, "postgres", table_name, checkpoint)
-                .await?;
-        }
-        for (object_name, checkpoint) in &connection_state.salesforce {
-            self.save_table_checkpoint(connection_id, "salesforce", object_name, checkpoint)
                 .await?;
         }
         Ok(())
@@ -1460,7 +1448,6 @@ mod tests {
             .context("missing connection")?;
         assert_eq!(loaded.last_sync_status.as_deref(), Some("running"));
         assert!(loaded.postgres.is_empty());
-        assert!(loaded.salesforce.is_empty());
         assert_eq!(
             loaded
                 .postgres_cdc

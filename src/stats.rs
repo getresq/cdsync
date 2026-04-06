@@ -180,15 +180,6 @@ impl StatsHandle {
         self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
-    pub async fn record_api_call(&self, rate_limited: bool) {
-        let mut guard = self.inner.lock().await;
-        guard.api_calls += 1;
-        if rate_limited {
-            guard.rate_limit_hits += 1;
-        }
-        self.live_tx.send_replace(snapshot_from_state(&guard));
-    }
-
     pub async fn snapshot(&self) -> RunStatsSnapshot {
         let guard = self.inner.lock().await;
         snapshot_from_state(&guard)

@@ -1101,9 +1101,9 @@ SwIDAQAB
                 max_checkpoint_age_seconds: Some(12),
             },
             ConnectionSummary {
-                id: "salesforce".to_string(),
+                id: "app_secondary".to_string(),
                 enabled: true,
-                source_kind: "salesforce".to_string(),
+                source_kind: "postgres".to_string(),
                 destination_kind: "bigquery".to_string(),
                 last_sync_started_at: None,
                 last_sync_finished_at: None,
@@ -1120,10 +1120,10 @@ SwIDAQAB
     fn resolve_selected_connection_prefers_requested_when_present() {
         let connections = test_connections();
         assert_eq!(
-            resolve_selected_connection_id(&connections, Some("salesforce"))
+            resolve_selected_connection_id(&connections, Some("app_secondary"))
                 .expect("selected connection")
                 .as_deref(),
-            Some("salesforce")
+            Some("app_secondary")
         );
     }
 
@@ -1150,7 +1150,7 @@ SwIDAQAB
                 last_restart_reason: "startup".to_string(),
             },
             connections: test_connections(),
-            selected_connection_id: Some("salesforce".to_string()),
+            selected_connection_id: Some("app_secondary".to_string()),
             progress: None,
             fetched_at: Utc::now(),
         };

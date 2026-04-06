@@ -257,15 +257,12 @@ pub struct ScheduleConfig {
 pub enum SourceConfig {
     #[serde(rename = "postgres")]
     Postgres(PostgresConfig),
-    #[serde(rename = "salesforce")]
-    Salesforce(SalesforceConfig),
 }
 
 impl SourceConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
             SourceConfig::Postgres(pg) => pg.validate(),
-            SourceConfig::Salesforce(sf) => sf.validate(),
         }
     }
 }
@@ -393,105 +390,10 @@ pub struct PostgresTableConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SalesforceConfig {
-    pub client_id: String,
-    pub client_secret: String,
-    pub refresh_token: String,
-    pub login_url: Option<String>,
-    pub instance_url: Option<String>,
-    pub api_version: Option<String>,
-    pub objects: Option<Vec<SalesforceObjectConfig>>,
-    pub object_selection: Option<ObjectSelectionConfig>,
-    pub polling_interval_seconds: Option<u64>,
-    pub rate_limit: Option<SalesforceRateLimitConfig>,
-}
-
-impl SalesforceConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        let has_objects = self
-            .objects
-            .as_ref()
-            .map(|o| !o.is_empty())
-            .unwrap_or(false);
-        let has_selection = self
-            .object_selection
-            .as_ref()
-            .map(|s| !(s.include.is_empty() && s.exclude.is_empty()))
-            .unwrap_or(false);
-        if !has_objects && !has_selection {
-            anyhow::bail!("salesforce requires objects or object_selection.include/exclude");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectSelectionConfig {
-    #[serde(default)]
-    pub include: Vec<String>,
-    #[serde(default)]
-    pub exclude: Vec<String>,
-    pub defaults: Option<SalesforceObjectDefaults>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SalesforceObjectDefaults {
-    pub primary_key: Option<String>,
-    pub soft_delete: Option<bool>,
-    pub fields: Option<FieldSelection>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SalesforceObjectConfig {
-    pub name: String,
-    pub primary_key: Option<String>,
-    pub fields: Option<FieldSelection>,
-    pub soft_delete: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SalesforceRateLimitConfig {
-    pub max_retries: Option<u32>,
-    pub backoff_ms: Option<u64>,
-    pub max_backoff_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaChangePolicy {
     Auto,
     Fail,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FieldSelection {
-    List(Vec<String>),
-    Filtered {
-        #[serde(default)]
-        include: Vec<String>,
-        #[serde(default)]
-        exclude: Vec<String>,
-    },
-}
-
-impl FieldSelection {
-    pub fn include_list(&self) -> Option<Vec<String>> {
-        match self {
-            FieldSelection::List(list) => Some(list.clone()),
-            FieldSelection::Filtered { include, .. } if !include.is_empty() => {
-                Some(include.clone())
-            }
-            _ => None,
-        }
-    }
-
-    pub fn exclude_list(&self) -> Vec<String> {
-        match self {
-            FieldSelection::Filtered { exclude, .. } => exclude.clone(),
-            _ => Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,39 +535,6 @@ connections:
       partition_by_synced_at: true
       batch_load_bucket: "my-cdsync-loads"
       # batch_load_prefix: "staging/app"
-      # emulator_http: "http://localhost:9050"
-      # emulator_grpc: "localhost:9051"
-
-  - id: "salesforce"
-    enabled: false
-    source:
-      type: salesforce
-      client_id: "YOUR_CLIENT_ID"
-      client_secret: "YOUR_CLIENT_SECRET"
-      refresh_token: "YOUR_REFRESH_TOKEN"
-      login_url: "https://login.salesforce.com"
-      api_version: "v59.0"
-      rate_limit:
-        max_retries: 5
-        backoff_ms: 1000
-        max_backoff_ms: 30000
-      object_selection:
-        include: ["Account"]
-        exclude: []
-      objects:
-        - name: "Account"
-          primary_key: "Id"
-          fields:
-            include: ["Id", "Name"]
-            exclude: []
-    destination:
-      type: bigquery
-      project_id: "your-project"
-      dataset: "cdsync"
-      service_account_key_path: "/path/to/service-account.json"
-      partition_by_synced_at: true
-      batch_load_bucket: "my-cdsync-loads"
-      # batch_load_prefix: "staging/salesforce"
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
 "#;

@@ -8,7 +8,7 @@
 ## 1. Core Architecture
 - [x] Define core traits: `Destination`.
 - [x] Define shared data model: `TableSchema`, `RowBatch`, `SyncMode`.
-- [x] Implement type mapping utilities (Postgres/Salesforce -> BigQuery).
+- [x] Implement type mapping utilities (Postgres -> BigQuery).
 - [x] Implement pipeline orchestration: discover → extract → transform → load.
 
 ## 2. Config + State
@@ -24,13 +24,6 @@
 - [x] Handle soft deletes if delete detection is available; otherwise skip.
 - [x] Row filtering support (optional WHERE clause).
 - [x] CDC streaming as default (logical replication).
-
-### Salesforce
-- [x] OAuth2 config with refresh token.
-- [ ] Describe API discovery for objects/fields.
-- [x] Full refresh via REST query pagination.
-- [x] Incremental polling via `SystemModstamp > last_synced` and `IsDeleted`.
-- [ ] Rate limiting + backoff.
 
 ## 4. Destination
 ### BigQuery
@@ -58,7 +51,6 @@
 ## 7. Tests
 - [x] Unit tests for type mapping and config parsing.
 - [x] Integration tests with dockerized Postgres and BigQuery emulator.
-- [x] Salesforce API mock tests.
 - [x] Real BigQuery heavy polling/incremental integration test.
 - [x] Real BigQuery heavy CDC integration test.
 

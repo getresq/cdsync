@@ -29,16 +29,6 @@ impl StateHandle {
             .await
     }
 
-    pub async fn save_salesforce_checkpoint(
-        &self,
-        object_name: &str,
-        checkpoint: &TableCheckpoint,
-    ) -> anyhow::Result<()> {
-        self.store
-            .save_table_checkpoint(&self.connection_id, "salesforce", object_name, checkpoint)
-            .await
-    }
-
     pub async fn save_postgres_cdc_state(
         &self,
         cdc_state: &PostgresCdcState,
@@ -172,15 +162,6 @@ impl StateHandle {
     ) -> anyhow::Result<Option<TableCheckpoint>> {
         self.store
             .load_table_checkpoint(&self.connection_id, "postgres", table_name)
-            .await
-    }
-
-    pub async fn load_salesforce_checkpoint(
-        &self,
-        object_name: &str,
-    ) -> anyhow::Result<Option<TableCheckpoint>> {
-        self.store
-            .load_table_checkpoint(&self.connection_id, "salesforce", object_name)
             .await
     }
 

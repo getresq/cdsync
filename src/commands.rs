@@ -82,25 +82,6 @@ pub(crate) async fn load_latest_postgres_checkpoint(
     }
 }
 
-pub(crate) async fn load_latest_salesforce_checkpoint(
-    state_handle: &crate::state::StateHandle,
-    object_name: &str,
-    fallback: &TableCheckpoint,
-) -> TableCheckpoint {
-    match state_handle.load_salesforce_checkpoint(object_name).await {
-        Ok(Some(checkpoint)) => checkpoint,
-        Ok(None) => fallback.clone(),
-        Err(err) => {
-            warn!(
-                object = %object_name,
-                error = %err,
-                "failed to load persisted salesforce checkpoint after interrupted retry; using in-memory checkpoint"
-            );
-            fallback.clone()
-        }
-    }
-}
-
 pub(crate) async fn refresh_postgres_checkpoints_from_store(
     state_handle: &crate::state::StateHandle,
     state: &mut ConnectionState,
@@ -148,10 +129,6 @@ pub(crate) async fn cmd_init(config_path: PathBuf) -> Result<()> {
                         schema.columns.len()
                     );
                 }
-            }
-            SourceConfig::Salesforce(sf) => {
-                let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
-                source.validate().await?;
             }
         }
 
@@ -571,133 +548,6 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                 }
                 Ok(())
             }
-        }
-        SourceConfig::Salesforce(sf) => {
-            if follow {
-                return Err(anyhow::anyhow!(
-                    "--follow is only supported for postgres CDC connections"
-                ));
-            }
-            let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
-            let objects = source.resolve_objects().await?;
-            let source = Arc::new(source);
-            let dest = Arc::new(dest.clone());
-            let semaphore = Arc::new(Semaphore::new(max_concurrency));
-            let mut tasks = FuturesUnordered::new();
-
-            for object in &objects {
-                let object = object.clone();
-                let checkpoint = state
-                    .salesforce
-                    .get(&object.name)
-                    .cloned()
-                    .unwrap_or_default();
-                let source = Arc::clone(&source);
-                let dest = Arc::clone(&dest);
-                let stats = stats.clone();
-                let state_handle = state_handle.clone();
-                let shutdown = shutdown.clone();
-                let run_id = run_id.clone();
-                let connection_id = connection.id.clone();
-                let semaphore = Arc::clone(&semaphore);
-                tasks.push(async move {
-                    let permit = match semaphore.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            return (
-                                object.name.clone(),
-                                Err(anyhow::anyhow!("failed to acquire concurrency permit")),
-                            );
-                        }
-                    };
-                    let _permit = permit;
-                    let mut attempt = 0;
-                    let mut backoff = Duration::from_millis(retry_backoff_ms);
-                    let result = loop {
-                        attempt += 1;
-                        let attempt_result = source
-                            .sync_object(SalesforceSyncRequest {
-                                object: &object,
-                                dest: dest.as_ref(),
-                                checkpoint: checkpoint.clone(),
-                                state_handle: Some(state_handle.clone()),
-                                mode,
-                                dry_run,
-                                stats: stats.clone(),
-                            })
-                            .await
-                            .with_context(|| format!("syncing salesforce object {}", object.name));
-                        match attempt_result {
-                            Ok(next_checkpoint) => break Ok(next_checkpoint),
-                            Err(err) if attempt < max_retries => {
-                                telemetry::record_retry_attempt(&connection_id, "salesforce_object");
-                                warn!(
-                                    connection = %connection_id,
-                                    run_id = run_id.as_deref().unwrap_or("none"),
-                                    object = %object.name,
-                                    attempt,
-                                    backoff_ms = backoff.as_millis() as u64,
-                                    last_synced_at = ?checkpoint.last_synced_at,
-                                    last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
-                                    error = %err,
-                                    "salesforce object sync attempt failed; retrying"
-                                );
-                                if super::wait_backoff(backoff, shutdown.clone()).await {
-                                    info!(
-                                        connection = %connection_id,
-                                        run_id = run_id.as_deref().unwrap_or("none"),
-                                        object = %object.name,
-                                        attempt,
-                                        "shutdown requested during salesforce retry backoff"
-                                    );
-                                    break Ok(
-                                        load_latest_salesforce_checkpoint(
-                                            &state_handle,
-                                            &object.name,
-                                            &checkpoint,
-                                        )
-                                        .await,
-                                    );
-                                }
-                                backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
-                            }
-                            Err(err) => {
-                                error!(
-                                    connection = %connection_id,
-                                    run_id = run_id.as_deref().unwrap_or("none"),
-                                    object = %object.name,
-                                    attempt,
-                                    last_synced_at = ?checkpoint.last_synced_at,
-                                    last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
-                                    error = %err,
-                                    "salesforce object sync attempt failed permanently"
-                                );
-                                break Err(err);
-                            }
-                        }
-                    };
-                    (object.name.clone(), result)
-                });
-            }
-
-            let mut first_error: Option<anyhow::Error> = None;
-            while let Some((object_name, result)) = tasks.next().await {
-                match result {
-                    Ok(checkpoint) => {
-                        state.salesforce.insert(object_name, checkpoint);
-                    }
-                    Err(err) => {
-                        if first_error.is_none() {
-                            first_error = Some(err);
-                        }
-                    }
-                }
-            }
-
-            if let Some(err) = first_error {
-                return Err(err);
-            }
-            Ok(())
         }
     };
 

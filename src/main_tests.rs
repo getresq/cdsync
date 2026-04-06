@@ -126,10 +126,9 @@ mod sync_selection_tests {
 
     fn test_cdc_connection(id: &str) -> crate::config::ConnectionConfig {
         let mut connection = test_connection(id, Some(true));
-        if let crate::config::SourceConfig::Postgres(pg) = &mut connection.source {
-            pg.cdc = Some(true);
-            pg.publication = Some("cdsync_app_pub".to_string());
-        }
+        let crate::config::SourceConfig::Postgres(pg) = &mut connection.source;
+        pg.cdc = Some(true);
+        pg.publication = Some("cdsync_app_pub".to_string());
         connection
     }
 
@@ -281,32 +280,6 @@ mod sync_selection_tests {
             ..Default::default()
         };
         let loaded = load_latest_postgres_checkpoint(&handle, "public.accounts", &fallback).await;
-
-        assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_latest_salesforce_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
-        let Some(config) = test_state_config() else {
-            return Ok(());
-        };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
-        let handle = store.handle("app");
-        let persisted = TableCheckpoint {
-            last_primary_key: Some("42".to_string()),
-            ..Default::default()
-        };
-        handle
-            .save_salesforce_checkpoint("Account", &persisted)
-            .await?;
-
-        let fallback = TableCheckpoint {
-            last_primary_key: Some("1".to_string()),
-            ..Default::default()
-        };
-        let loaded = load_latest_salesforce_checkpoint(&handle, "Account", &fallback).await;
 
         assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
         Ok(())
