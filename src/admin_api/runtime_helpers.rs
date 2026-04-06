@@ -53,7 +53,7 @@ pub(super) async fn sample_cached_postgres_cdc_slot_state(
     };
     match load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await {
         Ok(snapshot) => Some(CachedPostgresCdcSlotState::sampled(snapshot)),
-        Err(()) => None,
+        Err(()) => Some(CachedPostgresCdcSlotState::unknown()),
     }
 }
 
@@ -152,15 +152,14 @@ pub(super) fn cached_postgres_cdc_slot_state(
     state: &AdminApiState,
     connection: &ConnectionConfig,
 ) -> Option<CachedPostgresCdcSlotState> {
+    if !is_postgres_cdc_connection(connection) {
+        return None;
+    }
+
     state
         .cdc_slot_sampler_cache
         .get(&connection.id)
         .map(|sender| sender.borrow().clone())
-        .or(Some(CachedPostgresCdcSlotState {
-            sampler_status: "disabled",
-            sampled_at: None,
-            snapshot: None,
-        }))
 }
 
 pub(super) fn cached_postgres_cdc_runtime_state(
