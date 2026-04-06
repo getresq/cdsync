@@ -151,7 +151,9 @@ impl SyncStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.as_ref().map(cdc_batch_load_job_record_from_row).transpose()
+        row.as_ref()
+            .map(cdc_batch_load_job_record_from_row)
+            .transpose()
     }
 
     pub async fn heartbeat_cdc_batch_load_job(

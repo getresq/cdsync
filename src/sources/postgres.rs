@@ -53,10 +53,10 @@ use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
+mod cdc_loop;
 mod cdc_pipeline;
 mod cdc_relation;
 mod cdc_runtime;
-mod cdc_loop;
 mod cdc_sync;
 mod convert;
 mod schema;
@@ -65,8 +65,8 @@ mod table_selection;
 #[cfg(test)]
 mod tests;
 
-use self::cdc_pipeline::*;
 use self::cdc_loop::*;
+use self::cdc_pipeline::*;
 use self::convert::*;
 use self::schema::*;
 use self::table_selection::*;

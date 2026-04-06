@@ -454,9 +454,7 @@ impl EtlBigQueryDestination {
                     &fragments,
                 )
                 .await?;
-            let first_sequence = fragments
-                .first()
-                .map_or(0, |fragment| fragment.sequence);
+            let first_sequence = fragments.first().map_or(0, |fragment| fragment.sequence);
             let rx = manager.enqueue(first_sequence, payload, fragments).await?;
             return Ok(crate::sources::postgres::CdcTableApplyExecution::Deferred(
                 rx,

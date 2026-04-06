@@ -27,10 +27,14 @@ pub(super) fn next_cdc_wait_timeout(
             pending
                 .first_buffered_at
                 .checked_add(apply_max_fill)
-                .map_or(Duration::ZERO, |deadline| deadline.saturating_duration_since(now))
+                .map_or(Duration::ZERO, |deadline| {
+                    deadline.saturating_duration_since(now)
+                })
         })
         .min()
-        .map_or(idle_timeout, |pending_timeout| pending_timeout.min(idle_timeout))
+        .map_or(idle_timeout, |pending_timeout| {
+            pending_timeout.min(idle_timeout)
+        })
 }
 
 pub(super) fn cdc_fill_deadline_reached(
@@ -261,7 +265,10 @@ pub(super) async fn handle_primary_keepalive_reply(
     )
     .await?;
     if let Some(state_handle) = state_handle {
-        let mut watermark_state = state_handle.load_cdc_watermark_state().await?.unwrap_or_default();
+        let mut watermark_state = state_handle
+            .load_cdc_watermark_state()
+            .await?
+            .unwrap_or_default();
         let now = chrono::Utc::now();
         watermark_state.last_status_update_sent_at = Some(now);
         watermark_state.last_keepalive_reply_at = Some(now);

@@ -68,8 +68,13 @@ impl BigQueryDestination {
         .await
         .with_context(|| format!("uploading batch load object {}", object_uri))?;
 
-        self.run_load_job(table_id, &schema, &object_uri, WriteDisposition::WriteAppend)
-            .await?;
+        self.run_load_job(
+            table_id,
+            &schema,
+            &object_uri,
+            WriteDisposition::WriteAppend,
+        )
+        .await?;
         tracing::info!(
             table = table_id,
             rows = frame.height(),

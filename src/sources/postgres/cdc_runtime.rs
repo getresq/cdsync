@@ -1,10 +1,9 @@
-use super::*;
 pub(super) use super::cdc_loop::{
-    CdcIdleState, cdc_fill_deadline_reached, cdc_should_stop_after_idle,
-    next_cdc_wait_timeout,
+    CdcIdleState, cdc_fill_deadline_reached, cdc_should_stop_after_idle, next_cdc_wait_timeout,
 };
 #[cfg(test)]
 pub(super) use super::cdc_relation::relation_change_requires_destination_ensure;
+use super::*;
 
 const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
@@ -957,5 +956,4 @@ impl PostgresSource {
         )
         .await
     }
-
 }

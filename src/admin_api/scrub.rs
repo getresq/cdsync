@@ -41,9 +41,7 @@ pub(super) fn scrub_admin_api_config(admin_api: &AdminApiConfig) -> ScrubbedAdmi
     }
 }
 
-pub(super) fn scrub_observability_config(
-    obs: &ObservabilityConfig,
-) -> ScrubbedObservabilityConfig {
+pub(super) fn scrub_observability_config(obs: &ObservabilityConfig) -> ScrubbedObservabilityConfig {
     ScrubbedObservabilityConfig {
         service_name: obs.service_name.clone(),
         otlp_traces_endpoint: obs.otlp_traces_endpoint.clone(),

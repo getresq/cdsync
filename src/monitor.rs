@@ -928,11 +928,11 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
             progress.runtime.connection_id,
             progress.runtime.phase,
             progress.runtime.reason_code,
-                format_age(progress.runtime.max_checkpoint_age_seconds),
-                progress
-                    .runtime
-                    .last_sync_finished_at
-                    .map_or_else(|| "-".to_string(), format_timestamp),
+            format_age(progress.runtime.max_checkpoint_age_seconds),
+            progress
+                .runtime
+                .last_sync_finished_at
+                .map_or_else(|| "-".to_string(), format_timestamp),
             progress.runtime.last_error.as_deref().unwrap_or("-"),
         ));
         if let Some(run) = &progress.current_run {
@@ -970,19 +970,16 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
                     .as_ref()
                     .and_then(|checkpoint| checkpoint.last_primary_key.as_deref())
                     .unwrap_or("-"),
-                table
-                    .stats
-                    .as_ref()
-                    .map_or_else(
-                        || "-".to_string(),
-                        |stats| format!(
-                            "read={} written={} upserted={} deleted={}",
-                            stats.rows_read,
-                            stats.rows_written,
-                            stats.rows_upserted,
-                            stats.rows_deleted
-                        ),
+                table.stats.as_ref().map_or_else(
+                    || "-".to_string(),
+                    |stats| format!(
+                        "read={} written={} upserted={} deleted={}",
+                        stats.rows_read,
+                        stats.rows_written,
+                        stats.rows_upserted,
+                        stats.rows_deleted
                     ),
+                ),
             ));
         }
     }

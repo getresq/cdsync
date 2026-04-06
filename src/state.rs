@@ -483,5 +483,4 @@ impl StateHandle {
     pub fn connection_id(&self) -> &str {
         &self.connection_id
     }
-
 }

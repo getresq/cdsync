@@ -35,8 +35,8 @@ use uuid::Uuid;
 
 pub(crate) use self::batch_load::BATCH_LOAD_JOB_HARD_TIMEOUT;
 use self::values::{
-    bq_fields_from_schema, bq_ident, dataframe_to_json_rows, default_port,
-    tuple_value_as_datetime, tuple_value_as_i64,
+    bq_fields_from_schema, bq_ident, dataframe_to_json_rows, default_port, tuple_value_as_datetime,
+    tuple_value_as_i64,
 };
 
 #[derive(Clone)]
@@ -578,7 +578,8 @@ impl BigQueryDestination {
         if self.config.emulator_http.is_some() {
             return self.append_rows_via_emulator(table_id, frame).await;
         }
-        self.append_rows_via_batch_load(table_id, schema, frame).await?;
+        self.append_rows_via_batch_load(table_id, schema, frame)
+            .await?;
         Ok(())
     }
 

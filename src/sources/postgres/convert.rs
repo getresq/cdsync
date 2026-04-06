@@ -627,8 +627,9 @@ pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
             .map_or_else(|_| Cell::String(text.to_string()), Cell::F64),
         Type::INTERVAL => parse_postgres_interval_to_seconds(text)
             .map_or_else(|_| Cell::String(text.to_string()), Cell::F64),
-        Type::BYTEA => parse_bytea(text)
-            .map_or_else(|_| Cell::String(text.to_string()), Cell::Bytes),
+        Type::BYTEA => {
+            parse_bytea(text).map_or_else(|_| Cell::String(text.to_string()), Cell::Bytes)
+        }
         _ => Cell::String(text.to_string()),
     }
 }

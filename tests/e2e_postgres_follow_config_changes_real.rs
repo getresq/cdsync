@@ -26,7 +26,9 @@ struct RealCdcE2eEnv {
 impl RealCdcE2eEnv {
     fn load() -> Result<Self> {
         if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
-            anyhow::bail!("real BigQuery follow tests are disabled; set CDSYNC_RUN_REAL_BQ_TESTS=1");
+            anyhow::bail!(
+                "real BigQuery follow tests are disabled; set CDSYNC_RUN_REAL_BQ_TESTS=1"
+            );
         }
         dotenv_support::load_dotenv()?;
         real_bigquery_support::install_rustls_provider();
@@ -135,12 +137,8 @@ async fn run_cdc_once(
 ) -> Result<()> {
     let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
-    let dest = BigQueryDestination::new(
-        env.bq_config(prefix),
-        false,
-        MetadataColumns::default(),
-    )
-    .await?;
+    let dest =
+        BigQueryDestination::new(env.bq_config(prefix), false, MetadataColumns::default()).await?;
     dest.validate().await?;
     source
         .sync_cdc(CdcSyncRequest {
@@ -173,8 +171,10 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
     let prefix = format!("cdsync-e2e-follow-add/{}", &suffix[..8]);
 
     let pool = connect_pool(&env.pg_url).await?;
-    pool.execute(format!("drop table if exists {table_a}").as_str()).await?;
-    pool.execute(format!("drop table if exists {table_b}").as_str()).await?;
+    pool.execute(format!("drop table if exists {table_a}").as_str())
+        .await?;
+    pool.execute(format!("drop table if exists {table_b}").as_str())
+        .await?;
     pool.execute(format!("drop publication if exists {publication}").as_str())
         .await?;
     for table in [&table_a, &table_b] {
@@ -220,7 +220,10 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
             &publication,
             pipeline_id,
             SchemaChangePolicy::Auto,
-            vec![tracked_table(table_a.clone()), tracked_table(table_b.clone())],
+            vec![
+                tracked_table(table_a.clone()),
+                tracked_table(table_b.clone()),
+            ],
         ),
         &prefix,
         SyncMode::Incremental,
@@ -280,8 +283,10 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
     let prefix = format!("cdsync-e2e-follow-remove/{}", &suffix[..8]);
 
     let pool = connect_pool(&env.pg_url).await?;
-    pool.execute(format!("drop table if exists {table_a}").as_str()).await?;
-    pool.execute(format!("drop table if exists {table_b}").as_str()).await?;
+    pool.execute(format!("drop table if exists {table_a}").as_str())
+        .await?;
+    pool.execute(format!("drop table if exists {table_b}").as_str())
+        .await?;
     pool.execute(format!("drop publication if exists {publication}").as_str())
         .await?;
     for table in [&table_a, &table_b] {
@@ -306,7 +311,10 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
             &publication,
             pipeline_id,
             SchemaChangePolicy::Auto,
-            vec![tracked_table(table_a.clone()), tracked_table(table_b.clone())],
+            vec![
+                tracked_table(table_a.clone()),
+                tracked_table(table_b.clone()),
+            ],
         ),
         &prefix,
         SyncMode::Full,
@@ -371,8 +379,8 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
 }
 
 #[tokio::test]
-async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_bigquery(
-) -> Result<()> {
+async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_bigquery()
+-> Result<()> {
     let Ok(env) = RealCdcE2eEnv::load() else {
         return Ok(());
     };
@@ -384,8 +392,10 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
     let prefix = format!("cdsync-e2e-follow-resync/{}", &suffix[..8]);
 
     let pool = connect_pool(&env.pg_url).await?;
-    pool.execute(format!("drop table if exists {table_a}").as_str()).await?;
-    pool.execute(format!("drop table if exists {table_b}").as_str()).await?;
+    pool.execute(format!("drop table if exists {table_a}").as_str())
+        .await?;
+    pool.execute(format!("drop table if exists {table_b}").as_str())
+        .await?;
     pool.execute(format!("drop publication if exists {publication}").as_str())
         .await?;
     pool.execute(
@@ -417,7 +427,10 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
     let state_store = SyncStateStore::open_with_config(&state_config).await?;
     let state_handle = state_store.handle("app");
     let mut state = ConnectionState::default();
-    let tracked = vec![tracked_table(table_a.clone()), tracked_table(table_b.clone())];
+    let tracked = vec![
+        tracked_table(table_a.clone()),
+        tracked_table(table_b.clone()),
+    ];
     run_cdc_once(
         &env,
         &mut state,
@@ -435,10 +448,8 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
 
     pool.execute(format!("alter table {table_a} drop column extra").as_str())
         .await?;
-    pool.execute(
-        format!("insert into {table_a} (id, name) values (2, 'alpha-two')").as_str(),
-    )
-    .await?;
+    pool.execute(format!("insert into {table_a} (id, name) values (2, 'alpha-two')").as_str())
+        .await?;
     pool.execute(
         format!("update {table_b} set name = 'beta-updated', updated_at = now() where id = 1")
             .as_str(),
@@ -451,12 +462,7 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
     run_cdc_once(
         &env,
         &mut state,
-        env.pg_config(
-            &publication,
-            pipeline_id,
-            SchemaChangePolicy::Auto,
-            tracked,
-        ),
+        env.pg_config(&publication, pipeline_id, SchemaChangePolicy::Auto, tracked),
         &prefix,
         SyncMode::Incremental,
         Some(state_handle),

@@ -145,7 +145,8 @@ pub(super) fn cdc_startup_requires_manual_resync(
     diff: Option<&SchemaDiff>,
     primary_key_changed_detected: bool,
 ) -> bool {
-    manual_resync_requested && (diff.is_some_and(|diff| !diff.is_empty()) || primary_key_changed_detected)
+    manual_resync_requested
+        && (diff.is_some_and(|diff| !diff.is_empty()) || primary_key_changed_detected)
 }
 
 fn bootstrap_snapshot_slot_name(slot_name: &str) -> Result<String> {
@@ -417,10 +418,7 @@ impl PostgresSource {
         )
         .await?;
 
-        let slot_name = cdc_slot_name(
-            connection_label,
-            pipeline_id,
-        )?;
+        let slot_name = cdc_slot_name(connection_label, pipeline_id)?;
 
         {
             let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
@@ -570,7 +568,9 @@ impl PostgresSource {
                     if let Some(snapshot) = table_snapshots.get(table_id) {
                         entry.schema_snapshot = Some(snapshot.clone());
                     }
-                    entry.schema_primary_key.clone_from(&info.schema.primary_key);
+                    entry
+                        .schema_primary_key
+                        .clone_from(&info.schema.primary_key);
                     let write_plan = snapshot_table_write_plan(
                         mode,
                         resume_snapshot_run,

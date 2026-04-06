@@ -23,7 +23,10 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
     let Ok(real_bq) = real_bigquery_support::load_env() else {
         return Ok(());
     };
-    let Some(batch_load_bucket) = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET").ok().filter(|value| !value.is_empty()) else {
+    let Some(batch_load_bucket) = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
     let pg_url = std::env::var("CDSYNC_E2E_PG_URL")

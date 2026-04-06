@@ -157,9 +157,7 @@ pub(crate) fn run_connection_label(
     }
 }
 
-pub(crate) fn connection_source_kind(
-    connection: &crate::config::ConnectionConfig,
-) -> &'static str {
+pub(crate) fn connection_source_kind(connection: &crate::config::ConnectionConfig) -> &'static str {
     match &connection.source {
         SourceConfig::Postgres(_) => "postgres",
     }
@@ -317,8 +315,10 @@ pub(crate) async fn cmd_run(request: RunCommandRequest) -> Result<()> {
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
     let selected_connections =
         select_sync_connections(&cfg.connections, connection_filter.as_deref())?;
-    let selected_connection_configs: Vec<crate::config::ConnectionConfig> =
-        selected_connections.iter().map(|connection| (*connection).clone()).collect();
+    let selected_connection_configs: Vec<crate::config::ConnectionConfig> = selected_connections
+        .iter()
+        .map(|connection| (*connection).clone())
+        .collect();
     let restart_registry = Arc::new(ConnectionRestartRegistry::new(&selected_connection_configs));
 
     let (shutdown_controller, shutdown_signal) = ShutdownController::new();

@@ -15,17 +15,32 @@ mod emulator_read_support;
 #[tokio::test]
 async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
     dotenv_support::load_dotenv()?;
-    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok().filter(|value| !value.is_empty()) else {
+    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
-    let Some(bq_http) = std::env::var("CDSYNC_E2E_BQ_HTTP").ok().filter(|value| !value.is_empty()) else {
+    let Some(bq_http) = std::env::var("CDSYNC_E2E_BQ_HTTP")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
-    let Some(bq_grpc) = std::env::var("CDSYNC_E2E_BQ_GRPC").ok().filter(|value| !value.is_empty()) else {
+    let Some(bq_grpc) = std::env::var("CDSYNC_E2E_BQ_GRPC")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
-    let project_id = std::env::var("CDSYNC_E2E_BQ_PROJECT").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync".to_string());
-    let dataset = std::env::var("CDSYNC_E2E_BQ_DATASET").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync_e2e".to_string());
+    let project_id = std::env::var("CDSYNC_E2E_BQ_PROJECT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "cdsync".to_string());
+    let dataset = std::env::var("CDSYNC_E2E_BQ_DATASET")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "cdsync_e2e".to_string());
 
     let suffix = Uuid::new_v4().simple().to_string();
     let table_name = format!("cdsync_cdc_{}", &suffix[..8]);

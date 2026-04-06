@@ -90,7 +90,11 @@ impl EtlBigQueryDestination {
             let object_uri = {
                 let _upload_span = upload_span.enter();
                 self.inner
-                    .upload_cdc_batch_load_artifact_with_object_name(&info.schema, &frame, &object_name)
+                    .upload_cdc_batch_load_artifact_with_object_name(
+                        &info.schema,
+                        &frame,
+                        &object_name,
+                    )
                     .await
                     .map_err(|err| {
                         etl::etl_error!(
@@ -150,7 +154,11 @@ impl EtlBigQueryDestination {
             let object_uri = {
                 let _upload_span = upload_span.enter();
                 self.inner
-                    .upload_cdc_batch_load_artifact_with_object_name(&info.schema, &frame, &object_name)
+                    .upload_cdc_batch_load_artifact_with_object_name(
+                        &info.schema,
+                        &frame,
+                        &object_name,
+                    )
                     .await
                     .map_err(|err| {
                         etl::etl_error!(
@@ -248,7 +256,10 @@ impl CdcBatchLoadManager {
     }
 
     async fn restore_pending_jobs(&self) -> Result<()> {
-        let requeued_running = self.state_handle.requeue_cdc_batch_load_running_jobs().await?;
+        let requeued_running = self
+            .state_handle
+            .requeue_cdc_batch_load_running_jobs()
+            .await?;
         let requeued_failed = self
             .state_handle
             .requeue_retryable_failed_cdc_batch_load_jobs()
@@ -296,7 +307,11 @@ impl CdcBatchLoadManager {
             created_at: now,
             updated_at: now,
         };
-        let total_rows = payload.steps.iter().map(|step| step.row_count).sum::<usize>() as i64;
+        let total_rows = payload
+            .steps
+            .iter()
+            .map(|step| step.row_count)
+            .sum::<usize>() as i64;
         let total_upserted = payload
             .steps
             .iter()
@@ -533,7 +548,12 @@ impl CdcBatchLoadManager {
                         .iter()
                         .map(|step| step.upserted_count)
                         .sum();
-                    let deleted = job.payload.steps.iter().map(|step| step.deleted_count).sum();
+                    let deleted = job
+                        .payload
+                        .steps
+                        .iter()
+                        .map(|step| step.deleted_count)
+                        .sum();
                     stats
                         .record_load(
                             &job.payload.source_table,

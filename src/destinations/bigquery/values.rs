@@ -68,7 +68,9 @@ pub(super) fn anyvalue_to_json(value: &AnyValue) -> Value {
         AnyValue::UInt64(v) => Value::Number((*v).into()),
         AnyValue::UInt32(v) => Value::Number(u64::from(*v).into()),
         AnyValue::Float64(v) => serde_json::Number::from_f64(*v).map_or(Value::Null, Value::Number),
-        AnyValue::Float32(v) => serde_json::Number::from_f64(f64::from(*v)).map_or(Value::Null, Value::Number),
+        AnyValue::Float32(v) => {
+            serde_json::Number::from_f64(f64::from(*v)).map_or(Value::Null, Value::Number)
+        }
         AnyValue::String(v) => Value::String(v.to_string()),
         AnyValue::StringOwned(v) => Value::String(v.to_string()),
         AnyValue::Binary(bytes) => Value::String(encode_base64(bytes)),
@@ -133,8 +135,8 @@ pub(super) fn tuple_value_as_datetime(
             if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
                 return Ok(Some(parsed.with_timezone(&Utc)));
             }
-            let (whole_seconds, nanos) =
-                parse_epoch_seconds(value).with_context(|| format!("parsing datetime cell at index {}", index))?;
+            let (whole_seconds, nanos) = parse_epoch_seconds(value)
+                .with_context(|| format!("parsing datetime cell at index {}", index))?;
             Ok(DateTime::<Utc>::from_timestamp(whole_seconds, nanos))
         }
         None | Some(BqValue::Null | BqValue::String(_)) => Ok(None),
@@ -167,7 +169,9 @@ pub(super) fn anyvalue_to_i64(value: &AnyValue) -> Result<i64> {
     match value {
         AnyValue::Int64(value) => Ok(*value),
         AnyValue::Int32(value) => Ok(i64::from(*value)),
-        AnyValue::UInt64(value) => i64::try_from(*value).context("uint64 value outside int64 range"),
+        AnyValue::UInt64(value) => {
+            i64::try_from(*value).context("uint64 value outside int64 range")
+        }
         AnyValue::UInt32(value) => Ok(i64::from(*value)),
         AnyValue::String(value) => value
             .parse::<i64>()
@@ -247,7 +251,9 @@ fn parse_epoch_seconds(value: &str) -> Result<(i64, u32)> {
     let trimmed = value.trim();
     let negative = trimmed.starts_with('-');
     let unsigned = trimmed.strip_prefix('-').unwrap_or(trimmed);
-    let (whole_str, frac_str) = unsigned.split_once('.').map_or((unsigned, ""), |parts| parts);
+    let (whole_str, frac_str) = unsigned
+        .split_once('.')
+        .map_or((unsigned, ""), |parts| parts);
     let mut whole_seconds = whole_str
         .parse::<i64>()
         .with_context(|| format!("parsing epoch seconds {}", value))?;

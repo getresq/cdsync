@@ -18,8 +18,8 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -650,8 +650,11 @@ fn test_admin_state_with_runtime(
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
     runtime_control: Arc<dyn AdminRuntimeBackend>,
 ) -> AdminApiState {
-    let managed_connection_ids: HashSet<String> =
-        cfg.connections.iter().map(|connection| connection.id.clone()).collect();
+    let managed_connection_ids: HashSet<String> = cfg
+        .connections
+        .iter()
+        .map(|connection| connection.id.clone())
+        .collect();
     let cdc_slot_sampler_cache = test_cdc_slot_sampler_cache(&cfg);
     let auth_verifier = Arc::new(
         AdminApiServiceJwtVerifier::from_config(
@@ -1004,8 +1007,8 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn admin_api_resync_table_route_persists_request_and_restarts_connection() -> anyhow::Result<()>
-{
+async fn admin_api_resync_table_route_persists_request_and_restarts_connection()
+-> anyhow::Result<()> {
     let requested_resyncs = Arc::new(Mutex::new(Vec::new()));
     let runtime_backend = Arc::new(FakeRuntimeBackend::default());
     let state = test_admin_state_with_runtime(
@@ -1039,7 +1042,10 @@ async fn admin_api_resync_table_route_persists_request_and_restarts_connection()
     assert_eq!(body["restart_requested"], true);
 
     assert_eq!(
-        requested_resyncs.lock().expect("requested_resyncs lock").as_slice(),
+        requested_resyncs
+            .lock()
+            .expect("requested_resyncs lock")
+            .as_slice(),
         &[("app".to_string(), "public.accounts".to_string())]
     );
     assert_eq!(
@@ -1086,7 +1092,9 @@ async fn admin_api_resync_table_route_rejects_unmanaged_connection_without_persi
     let auth = auth_header(&["cdsync:admin"]);
 
     let response = client
-        .post(format!("{base_url}/v1/connections/disabled_app/resync-table"))
+        .post(format!(
+            "{base_url}/v1/connections/disabled_app/resync-table"
+        ))
         .header("Authorization", &auth)
         .json(&serde_json::json!({ "table": "public.accounts" }))
         .send()
@@ -1097,15 +1105,19 @@ async fn admin_api_resync_table_route_rejects_unmanaged_connection_without_persi
         body["error"],
         "connection disabled_app is not managed by this CDSync process"
     );
-    assert!(requested_resyncs
-        .lock()
-        .expect("requested_resyncs lock")
-        .is_empty());
-    assert!(runtime_backend
-        .restarted_connections
-        .lock()
-        .expect("restarted connections lock")
-        .is_empty());
+    assert!(
+        requested_resyncs
+            .lock()
+            .expect("requested_resyncs lock")
+            .is_empty()
+    );
+    assert!(
+        runtime_backend
+            .restarted_connections
+            .lock()
+            .expect("restarted connections lock")
+            .is_empty()
+    );
 
     handle.abort();
     let _ = handle.await;
@@ -1113,8 +1125,8 @@ async fn admin_api_resync_table_route_rejects_unmanaged_connection_without_persi
 }
 
 #[tokio::test]
-async fn admin_api_resync_table_route_rolls_back_request_when_restart_fails()
--> anyhow::Result<()> {
+async fn admin_api_resync_table_route_rolls_back_request_when_restart_fails() -> anyhow::Result<()>
+{
     let requested_resyncs = Arc::new(Mutex::new(Vec::new()));
     let runtime_backend = Arc::new(FailingRuntimeBackend {
         message: "restart failed".to_string(),
@@ -1145,10 +1157,12 @@ async fn admin_api_resync_table_route_rolls_back_request_when_restart_fails()
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = response.json::<serde_json::Value>().await?;
     assert_eq!(body["error"], "restart failed");
-    assert!(requested_resyncs
-        .lock()
-        .expect("requested_resyncs lock")
-        .is_empty());
+    assert!(
+        requested_resyncs
+            .lock()
+            .expect("requested_resyncs lock")
+            .is_empty()
+    );
 
     handle.abort();
     let _ = handle.await;

@@ -2,8 +2,8 @@ use anyhow::Result;
 use cdsync::config::{PostgresConfig, PostgresTableConfig, SchemaChangePolicy};
 use cdsync::sources::postgres::PostgresSource;
 use cdsync::types::MetadataColumns;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
+use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 #[path = "support/dotenv.rs"]
 mod dotenv_support;
@@ -23,7 +23,10 @@ fn tracked_table(name: String) -> PostgresTableConfig {
 #[tokio::test]
 async fn e2e_configured_source_table_must_exist() -> Result<()> {
     dotenv_support::load_dotenv()?;
-    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok().filter(|value| !value.is_empty()) else {
+    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
     let suffix = Uuid::new_v4().simple().to_string();
@@ -46,7 +49,10 @@ async fn e2e_configured_source_table_must_exist() -> Result<()> {
     let source = PostgresSource::new(
         PostgresConfig {
             url: pg_url,
-            tables: Some(vec![tracked_table(existing_table), tracked_table(missing_table.clone())]),
+            tables: Some(vec![
+                tracked_table(existing_table),
+                tracked_table(missing_table.clone()),
+            ]),
             table_selection: None,
             batch_size: Some(1000),
             cdc: Some(false),
@@ -66,7 +72,13 @@ async fn e2e_configured_source_table_must_exist() -> Result<()> {
         MetadataColumns::default(),
     )
     .await?;
-    let err = source.resolve_tables().await.expect_err("missing source table");
-    assert!(err.to_string().contains(&format!("source table {missing_table} does not exist")));
+    let err = source
+        .resolve_tables()
+        .await
+        .expect_err("missing source table");
+    assert!(
+        err.to_string()
+            .contains(&format!("source table {missing_table} does not exist"))
+    );
     Ok(())
 }

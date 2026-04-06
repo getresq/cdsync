@@ -191,7 +191,11 @@ pub(crate) async fn cmd_reconcile(
                 deleted_rows: Some(dest_summary.deleted_rows),
                 source_max_updated_at: source_summary.max_updated_at,
                 destination_max_synced_at: dest_summary.max_synced_at,
-                count_match: Some(reconcile_count_match(&source_summary, &dest_summary, &table)),
+                count_match: Some(reconcile_count_match(
+                    &source_summary,
+                    &dest_summary,
+                    &table,
+                )),
                 error: None,
             },
             (source_result, dest_result) => TableReconciliationReport {

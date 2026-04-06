@@ -1,7 +1,7 @@
 mod models;
-mod runtime_helpers;
 #[cfg(test)]
 mod route_tests;
+mod runtime_helpers;
 mod scrub;
 mod streaming;
 
@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -55,9 +55,9 @@ use url::Url;
 use self::models::*;
 use self::runtime_helpers::*;
 use self::scrub::*;
-use self::streaming::stream;
 #[cfg(test)]
 use self::streaming::load_current_run_view;
+use self::streaming::stream;
 
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const STREAM_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -232,8 +232,7 @@ impl AdminStateBackend for SyncStateStore {
         connection_id: &str,
         source_table: &str,
     ) -> anyhow::Result<()> {
-        SyncStateStore::clear_postgres_table_resync_request(self, connection_id, source_table)
-            .await
+        SyncStateStore::clear_postgres_table_resync_request(self, connection_id, source_table).await
     }
 }
 
@@ -461,7 +460,6 @@ fn spawn_admin_server_thread(
     Ok((AdminApiHandle { thread: handle }, ready_rx))
 }
 
-
 pub async fn spawn_admin_api(
     cfg: &Config,
     connection_id: &str,
@@ -544,7 +542,10 @@ fn router(state: AdminApiState) -> Router {
         .route("/v1/connections/{id}/progress", get(progress))
         .route("/v1/connections/{id}/tables", get(connection_tables))
         .route("/v1/connections/{id}/runs", get(runs))
-        .route("/v1/connections/{id}/resync-table", post(request_resync_table))
+        .route(
+            "/v1/connections/{id}/resync-table",
+            post(request_resync_table),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_api_auth,
@@ -699,11 +700,9 @@ async fn request_resync_table(
             .as_ref()
             .is_some_and(|tables| tables.iter().any(|table| table.name == requested_table))
     } else {
-        let source = crate::sources::postgres::PostgresSource::new(
-            pg.clone(),
-            state.cfg.metadata_columns(),
-        )
-        .await?;
+        let source =
+            crate::sources::postgres::PostgresSource::new(pg.clone(), state.cfg.metadata_columns())
+                .await?;
         let resolved_tables = source.resolve_tables().await?;
         resolved_tables
             .iter()

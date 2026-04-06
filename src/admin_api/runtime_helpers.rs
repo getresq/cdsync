@@ -395,7 +395,11 @@ pub(super) fn build_table_progress(
 ) -> Vec<TableProgress> {
     let mut table_names = configured_entity_names(connection);
     if let Some(state) = state {
-        table_names.extend(active_checkpoint_map(state, &connection.source).keys().cloned());
+        table_names.extend(
+            active_checkpoint_map(state, &connection.source)
+                .keys()
+                .cloned(),
+        );
     }
     table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
 
@@ -418,16 +422,15 @@ pub(super) fn build_table_progress(
             let snapshot_chunks_total = checkpoint
                 .as_ref()
                 .map_or(0, |checkpoint| checkpoint.snapshot_chunks.len());
-            let snapshot_chunks_complete = checkpoint
-                .as_ref()
-                .map_or(0, |checkpoint| {
-                    checkpoint
-                        .snapshot_chunks
-                        .iter()
-                        .filter(|chunk| chunk.complete)
-                        .count()
-                });
-            let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref())
+            let snapshot_chunks_complete = checkpoint.as_ref().map_or(0, |checkpoint| {
+                checkpoint
+                    .snapshot_chunks
+                    .iter()
+                    .filter(|chunk| chunk.complete)
+                    .count()
+            });
+            let (phase, reason_code) = match state
+                .and_then(|state| state.last_sync_status.as_deref())
             {
                 Some("failed")
                     if matches!(

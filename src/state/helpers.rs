@@ -55,9 +55,12 @@ pub(super) async fn create_schema_if_missing(
     conn: &mut sqlx::PgConnection,
     schema: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(&format!("create schema if not exists {}", quote_ident(schema)))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "create schema if not exists {}",
+        quote_ident(schema)
+    ))
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
