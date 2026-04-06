@@ -417,18 +417,16 @@ pub(super) fn build_table_progress(
             let checkpoint_age_seconds = checkpoint_age_seconds(checkpoint.as_ref(), now);
             let snapshot_chunks_total = checkpoint
                 .as_ref()
-                .map(|checkpoint| checkpoint.snapshot_chunks.len())
-                .unwrap_or(0);
+                .map_or(0, |checkpoint| checkpoint.snapshot_chunks.len());
             let snapshot_chunks_complete = checkpoint
                 .as_ref()
-                .map(|checkpoint| {
+                .map_or(0, |checkpoint| {
                     checkpoint
                         .snapshot_chunks
                         .iter()
                         .filter(|chunk| chunk.complete)
                         .count()
-                })
-                .unwrap_or(0);
+                });
             let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref())
             {
                 Some("failed")

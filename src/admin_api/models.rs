@@ -290,9 +290,7 @@ impl ConnectionCdcSnapshot {
     pub(super) fn from_cached(state: Option<&CachedPostgresCdcSlotState>) -> Self {
         let snapshot = state.and_then(|state| state.snapshot.as_ref());
         Self {
-            sampler_status: state
-                .map(|state| state.sampler_status)
-                .unwrap_or("disabled"),
+            sampler_status: state.map_or("disabled", |state| state.sampler_status),
             sampled_at: state.and_then(|state| state.sampled_at),
             slot_name: snapshot.and_then(|snapshot| snapshot.slot_name.clone()),
             slot_active: snapshot.map(|snapshot| snapshot.active),

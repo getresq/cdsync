@@ -321,12 +321,11 @@ impl PostgresConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let has_tables = self.tables.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+        let has_tables = self.tables.as_ref().is_some_and(|tables| !tables.is_empty());
         let has_selection = self
             .table_selection
             .as_ref()
-            .map(|s| !(s.include.is_empty() && s.exclude.is_empty()))
-            .unwrap_or(false);
+            .is_some_and(|selection| !(selection.include.is_empty() && selection.exclude.is_empty()));
         if !has_tables && !has_selection {
             anyhow::bail!("postgres requires tables or table_selection.include/exclude");
         }

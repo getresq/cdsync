@@ -630,8 +630,7 @@ impl SyncStateStore {
     ) -> anyhow::Result<()> {
         let updated_at = state
             .updated_at
-            .map(|value| value.timestamp_millis())
-            .unwrap_or_else(now_millis);
+            .map_or_else(now_millis, |value| value.timestamp_millis());
         sqlx::query(&format!(
             r#"
             insert into {} (

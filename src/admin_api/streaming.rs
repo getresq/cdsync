@@ -146,8 +146,7 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
         ConnectionCdcData {
             sampler_status: cached_cdc_state
                 .as_ref()
-                .map(|state| state.sampler_status)
-                .unwrap_or("disabled"),
+                .map_or("disabled", |state| state.sampler_status),
             sampled_at: cached_cdc_state.as_ref().and_then(|state| state.sampled_at),
             slot_name: cdc_slot_snapshot
                 .as_ref()

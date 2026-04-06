@@ -618,7 +618,9 @@ impl BigQueryDestination {
         )
         .await?;
         if let Some(errors) = payload.get("insertErrors") {
-            let row_errors = errors.as_array().map(|rows| rows.len()).unwrap_or(1) as u64;
+            let row_errors = errors
+                .as_array()
+                .map_or(1_u64, |rows| u64::try_from(rows.len()).unwrap_or(u64::MAX));
             crate::telemetry::record_bigquery_row_errors(table_id, row_errors);
             error!(
                 table = %table_id,
@@ -908,7 +910,7 @@ impl BigQueryDestination {
         )
         .await
         {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(BqError::Response(err)) if err.code == 404 => Ok(()),
             Err(err) => Err(err.into()),
         }

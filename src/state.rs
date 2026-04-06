@@ -368,7 +368,7 @@ impl SyncStateStore {
         let heartbeat_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(LOCK_HEARTBEAT_SECONDS)) => {
+                    () = tokio::time::sleep(Duration::from_secs(LOCK_HEARTBEAT_SECONDS)) => {
                         let _ = store.heartbeat_lock(&connection, &owner).await;
                     }
                     _ = &mut stop_rx => {

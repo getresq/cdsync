@@ -621,18 +621,14 @@ pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
         },
         Type::INT2 | Type::INT4 | Type::INT8 => text
             .parse::<i64>()
-            .map(Cell::I64)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
+            .map_or_else(|_| Cell::String(text.to_string()), Cell::I64),
         Type::FLOAT4 | Type::FLOAT8 => text
             .parse::<f64>()
-            .map(Cell::F64)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
+            .map_or_else(|_| Cell::String(text.to_string()), Cell::F64),
         Type::INTERVAL => parse_postgres_interval_to_seconds(text)
-            .map(Cell::F64)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
+            .map_or_else(|_| Cell::String(text.to_string()), Cell::F64),
         Type::BYTEA => parse_bytea(text)
-            .map(Cell::Bytes)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
+            .map_or_else(|_| Cell::String(text.to_string()), Cell::Bytes),
         _ => Cell::String(text.to_string()),
     }
 }

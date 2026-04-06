@@ -27,12 +27,10 @@ pub(super) fn next_cdc_wait_timeout(
             pending
                 .first_buffered_at
                 .checked_add(apply_max_fill)
-                .map(|deadline| deadline.saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO)
+                .map_or(Duration::ZERO, |deadline| deadline.saturating_duration_since(now))
         })
         .min()
-        .map(|pending_timeout| pending_timeout.min(idle_timeout))
-        .unwrap_or(idle_timeout)
+        .map_or(idle_timeout, |pending_timeout| pending_timeout.min(idle_timeout))
 }
 
 pub(super) fn cdc_fill_deadline_reached(

@@ -721,13 +721,11 @@ fn render_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot)
                 progress
                     .runtime
                     .last_sync_started_at
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "-".to_string()),
+                    .map_or_else(|| "-".to_string(), format_timestamp),
                 progress
                     .runtime
                     .last_sync_finished_at
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "-".to_string()),
+                    .map_or_else(|| "-".to_string(), format_timestamp),
             )),
             Line::from(format!(
                 " runtime connection: {}   config: {}   deploy: {}",
@@ -769,8 +767,7 @@ fn render_run(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
                 run.status.as_deref().unwrap_or("-"),
                 format_timestamp(run.started_at),
                 run.finished_at
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "-".to_string()),
+                    .map_or_else(|| "-".to_string(), format_timestamp),
             )),
             Line::from(format!(
                 " connection: {}   rows read: {}   written: {}   upserted: {}   deleted: {}",
@@ -916,12 +913,10 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
             "  started={} finished={}",
             connection
                 .last_sync_started_at
-                .map(format_timestamp)
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), format_timestamp),
             connection
                 .last_sync_finished_at
-                .map(format_timestamp)
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), format_timestamp),
         ));
     }
 
@@ -933,12 +928,11 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
             progress.runtime.connection_id,
             progress.runtime.phase,
             progress.runtime.reason_code,
-            format_age(progress.runtime.max_checkpoint_age_seconds),
-            progress
-                .runtime
-                .last_sync_finished_at
-                .map(format_timestamp)
-                .unwrap_or_else(|| "-".to_string()),
+                format_age(progress.runtime.max_checkpoint_age_seconds),
+                progress
+                    .runtime
+                    .last_sync_finished_at
+                    .map_or_else(|| "-".to_string(), format_timestamp),
             progress.runtime.last_error.as_deref().unwrap_or("-"),
         ));
         if let Some(run) = &progress.current_run {
@@ -979,14 +973,16 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
                 table
                     .stats
                     .as_ref()
-                    .map(|stats| format!(
-                        "read={} written={} upserted={} deleted={}",
-                        stats.rows_read,
-                        stats.rows_written,
-                        stats.rows_upserted,
-                        stats.rows_deleted
-                    ))
-                    .unwrap_or_else(|| "-".to_string()),
+                    .map_or_else(
+                        || "-".to_string(),
+                        |stats| format!(
+                            "read={} written={} upserted={} deleted={}",
+                            stats.rows_read,
+                            stats.rows_written,
+                            stats.rows_upserted,
+                            stats.rows_deleted
+                        ),
+                    ),
             ));
         }
     }

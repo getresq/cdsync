@@ -294,13 +294,11 @@ async fn e2e_postgres_bigquery_custom_metadata_columns() -> Result<()> {
     let row = mapped.first().context("missing row")?;
     assert!(
         row.get("_synced_custom")
-            .map(|value| value.is_string())
-            .unwrap_or(false)
+            .is_some_and(serde_json::Value::is_string)
     );
     assert!(
         row.get("_deleted_custom")
-            .map(|value| value.is_string())
-            .unwrap_or(false)
+            .is_some_and(serde_json::Value::is_string)
     );
     Ok(())
 }

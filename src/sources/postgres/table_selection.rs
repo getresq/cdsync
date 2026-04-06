@@ -93,8 +93,8 @@ pub(super) fn filter_columns(
     selection: &ColumnSelection,
     required: &HashSet<String>,
 ) -> Vec<ColumnSchema> {
-    let include_set: HashSet<&str> = selection.include.iter().map(|s| s.as_str()).collect();
-    let exclude_set: HashSet<&str> = selection.exclude.iter().map(|s| s.as_str()).collect();
+    let include_set: HashSet<&str> = selection.include.iter().map(String::as_str).collect();
+    let exclude_set: HashSet<&str> = selection.exclude.iter().map(String::as_str).collect();
     let include_all = include_set.is_empty();
 
     let mut filtered = Vec::new();

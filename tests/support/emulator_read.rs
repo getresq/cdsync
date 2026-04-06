@@ -25,7 +25,7 @@ pub async fn fetch_table_fields(
             field
                 .get("name")
                 .and_then(|v| v.as_str())
-                .map(|v| v.to_string())
+                .map(std::string::ToString::to_string)
                 .context("schema field missing name")
         })
         .collect()

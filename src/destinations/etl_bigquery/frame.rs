@@ -279,11 +279,7 @@ fn array_to_json(array: &etl::types::ArrayCell) -> serde_json::Value {
         etl::types::ArrayCell::String(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |s| serde_json::Value::String(s.clone())))
                 .collect(),
         ),
         etl::types::ArrayCell::I16(values) => serde_json::Value::Array(
@@ -345,77 +341,57 @@ fn array_to_json(array: &etl::types::ArrayCell) -> serde_json::Value {
         etl::types::ArrayCell::Numeric(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|n| serde_json::Value::String(n.to_string()))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |n| serde_json::Value::String(n.to_string())))
                 .collect(),
         ),
         etl::types::ArrayCell::Date(values) => serde_json::Value::Array(
             values
                 .iter()
                 .map(|v| {
-                    v.as_ref()
-                        .map(|d| serde_json::Value::String(d.format("%Y-%m-%d").to_string()))
-                        .unwrap_or(serde_json::Value::Null)
+                    v.as_ref().map_or(serde_json::Value::Null, |d| {
+                        serde_json::Value::String(d.format("%Y-%m-%d").to_string())
+                    })
                 })
                 .collect(),
         ),
         etl::types::ArrayCell::Time(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|t| serde_json::Value::String(format_time(t)))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |t| serde_json::Value::String(format_time(t))))
                 .collect(),
         ),
         etl::types::ArrayCell::Timestamp(values) => serde_json::Value::Array(
             values
                 .iter()
                 .map(|v| {
-                    v.as_ref()
-                        .map(|t| serde_json::Value::String(Utc.from_utc_datetime(t).to_rfc3339()))
-                        .unwrap_or(serde_json::Value::Null)
+                    v.as_ref().map_or(serde_json::Value::Null, |t| {
+                        serde_json::Value::String(Utc.from_utc_datetime(t).to_rfc3339())
+                    })
                 })
                 .collect(),
         ),
         etl::types::ArrayCell::TimestampTz(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|t| serde_json::Value::String(t.to_rfc3339()))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |t| serde_json::Value::String(t.to_rfc3339())))
                 .collect(),
         ),
         etl::types::ArrayCell::Uuid(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|u| serde_json::Value::String(u.to_string()))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |u| serde_json::Value::String(u.to_string())))
                 .collect(),
         ),
         etl::types::ArrayCell::Json(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| v.as_ref().cloned().unwrap_or(serde_json::Value::Null))
+                .map(|v| v.clone().unwrap_or(serde_json::Value::Null))
                 .collect(),
         ),
         etl::types::ArrayCell::Bytes(values) => serde_json::Value::Array(
             values
                 .iter()
-                .map(|v| {
-                    v.as_ref()
-                        .map(|b| serde_json::Value::String(encode_base64(b)))
-                        .unwrap_or(serde_json::Value::Null)
-                })
+                .map(|v| v.as_ref().map_or(serde_json::Value::Null, |b| serde_json::Value::String(encode_base64(b))))
                 .collect(),
         ),
     }

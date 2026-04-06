@@ -452,7 +452,7 @@ pub(super) fn handle_cdc_apply_result(
     let ack = result?;
     info!(
         sequence_count = ack.sequences.len(),
-        released_table = ?ack.released_table.map(|table_id| table_id.into_inner()),
+        released_table = ?ack.released_table.map(TableId::into_inner),
         "cdc apply result received"
     );
     if let Some(table_id) = ack.released_table {
@@ -531,8 +531,7 @@ pub(super) async fn apply_cdc_watermark_advance(
         event = "cdc_coordinator_advanced_watermark",
         connection_id = runtime
             .state_handle
-            .map(|state_handle| state_handle.connection_id())
-            .unwrap_or("unknown"),
+            .map_or("unknown", StateHandle::connection_id),
         commit_lsn = %advance.commit_lsn,
         stats_tables = advance.stats.len(),
         extract_ms = advance.extract_ms,

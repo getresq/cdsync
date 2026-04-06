@@ -215,8 +215,8 @@ impl CdcBatchLoadManager {
                 Ok(Some(job)) => job,
                 Ok(None) => {
                     tokio::select! {
-                        _ = self.notify.notified() => {}
-                        _ = tokio::time::sleep(CDC_BATCH_LOAD_CLAIM_POLL_INTERVAL) => {}
+                        () = self.notify.notified() => {}
+                        () = tokio::time::sleep(CDC_BATCH_LOAD_CLAIM_POLL_INTERVAL) => {}
                     }
                     continue;
                 }
@@ -404,7 +404,7 @@ impl CdcBatchLoadManager {
             CdcBatchLoadJobStatus::Succeeded => {
                 if let Some(waiters) = self.waiters.lock().await.remove(&persisted_record.job_id) {
                     for waiter in waiters {
-                        let _ = waiter.send(Ok(()));
+                        let _ignored = waiter.send(Ok(()));
                     }
                 }
             }
@@ -476,7 +476,7 @@ impl CdcBatchLoadManager {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL) => {
+                        () = tokio::time::sleep(CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL) => {
                             if let Err(err) = state_handle.heartbeat_cdc_batch_load_job(&heartbeat_job_id).await {
                                 warn!(
                                     component = "consumer",
@@ -591,7 +591,7 @@ impl CdcBatchLoadManager {
                         err.to_string()
                     )),
                 };
-                let _ = waiter.send(waiter_result);
+                let _ignored = waiter.send(waiter_result);
             }
         }
         self.notify.notify_one();

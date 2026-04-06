@@ -24,7 +24,7 @@ struct RealCdcE2eEnv {
 }
 
 impl RealCdcE2eEnv {
-    async fn load() -> Result<Self> {
+    fn load() -> Result<Self> {
         if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
             anyhow::bail!("real BigQuery follow tests are disabled; set CDSYNC_RUN_REAL_BQ_TESTS=1");
         }
@@ -162,7 +162,7 @@ async fn run_cdc_once(
 
 #[tokio::test]
 async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() -> Result<()> {
-    let Ok(env) = RealCdcE2eEnv::load().await else {
+    let Ok(env) = RealCdcE2eEnv::load() else {
         return Ok(());
     };
     let suffix = Uuid::new_v4().simple().to_string();
@@ -269,7 +269,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
 #[tokio::test]
 async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigquery() -> Result<()>
 {
-    let Ok(env) = RealCdcE2eEnv::load().await else {
+    let Ok(env) = RealCdcE2eEnv::load() else {
         return Ok(());
     };
     let suffix = Uuid::new_v4().simple().to_string();
@@ -373,7 +373,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
 #[tokio::test]
 async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_bigquery(
 ) -> Result<()> {
-    let Ok(env) = RealCdcE2eEnv::load().await else {
+    let Ok(env) = RealCdcE2eEnv::load() else {
         return Ok(());
     };
     let suffix = Uuid::new_v4().simple().to_string();

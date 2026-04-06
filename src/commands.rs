@@ -34,7 +34,7 @@ pub(crate) fn spawn_stats_flush_task_with_interval(
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {
+                () = tokio::time::sleep(interval) => {
                     if let Err(err) = db.persist_run(&handle).await {
                         warn!(error = %err, "failed to persist live run stats");
                     }
@@ -268,7 +268,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         connection_state.last_sync_finished_at = Some(Utc::now());
         let error_string = result.as_ref().err().map(std::string::ToString::to_string);
         match &result {
-            Ok(_) => {
+            Ok(()) => {
                 connection_state.last_sync_status = Some("success".to_string());
                 info!(
                     connection = %connection.id,
@@ -298,8 +298,13 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         let duration_ms = connection_state
             .last_sync_started_at
             .zip(connection_state.last_sync_finished_at)
-            .map(|(started_at, finished_at)| (finished_at - started_at).num_milliseconds() as f64)
-            .unwrap_or(0.0);
+            .map_or(0.0, |(started_at, finished_at)| {
+                (finished_at - started_at)
+                    .num_milliseconds()
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+            });
         telemetry::record_sync_run(
             &connection.id,
             connection_state
@@ -388,7 +393,7 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                         .await
                         .with_context(|| "syncing postgres CDC");
                     match result {
-                        Ok(_) => break,
+                        Ok(()) => break,
                         Err(err) if follow || attempt < max_retries => {
                             telemetry::record_retry_attempt(&connection.id, "postgres_cdc");
                             warn!(
@@ -448,14 +453,11 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                     let connection_id = connection.id.clone();
                     let semaphore = Arc::clone(&semaphore);
                     tasks.push(async move {
-                        let permit = match semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                return (
-                                    table.name.clone(),
-                                    Err(anyhow::anyhow!("failed to acquire concurrency permit")),
-                                );
-                            }
+                        let Ok(permit) = semaphore.acquire_owned().await else {
+                            return (
+                                table.name.clone(),
+                                Err(anyhow::anyhow!("failed to acquire concurrency permit")),
+                            );
                         };
                         let _permit = permit;
                         let mut attempt = 0;

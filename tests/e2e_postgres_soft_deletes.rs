@@ -187,8 +187,7 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
     anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
     let has_deleted_at = deleted_rows.iter().any(|row| {
         row.get("_cdsync_deleted_at")
-            .map(|value| value.is_string())
-            .unwrap_or(false)
+            .is_some_and(serde_json::Value::is_string)
     });
     assert!(has_deleted_at, "expected _cdsync_deleted_at to be set");
     Ok(())
@@ -366,8 +365,7 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
     anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
     let has_deleted_at = deleted_rows.iter().any(|row| {
         row.get("_cdsync_deleted_at")
-            .map(|value| value.is_string())
-            .unwrap_or(false)
+            .is_some_and(serde_json::Value::is_string)
     });
     assert!(has_deleted_at, "expected _cdsync_deleted_at to be set");
     Ok(())
