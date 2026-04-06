@@ -1,85 +1,16 @@
 use super::*;
-
-pub(super) struct CdcIdleState {
-    pub(super) follow: bool,
-    pub(super) in_tx: bool,
-    pub(super) pending_events_empty: bool,
-    pub(super) queued_batches_empty: bool,
-    pub(super) pending_table_batches_empty: bool,
-    pub(super) inflight_apply_empty: bool,
-}
+pub(super) use super::cdc_loop::{
+    CdcIdleState, cdc_fill_deadline_reached, cdc_should_stop_after_idle,
+    next_cdc_wait_timeout,
+};
+#[cfg(test)]
+pub(super) use super::cdc_relation::relation_change_requires_destination_ensure;
 
 const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(super) fn relation_change_requires_destination_ensure(
-    prev_snapshot_exists: bool,
-    table_known: bool,
-    diff: Option<&SchemaDiff>,
-) -> bool {
-    !prev_snapshot_exists || !table_known || diff.is_some_and(|diff| !diff.is_empty())
-}
-
 impl PostgresSource {
-    pub(super) async fn load_etl_table_schema(&self, table_id: TableId) -> Result<EtlTableSchema> {
-        let row = sqlx::query(
-            r#"
-            select n.nspname as schema_name, c.relname as table_name
-            from pg_class c
-            join pg_namespace n on c.relnamespace = n.oid
-            where c.oid = $1
-            "#,
-        )
-        .bind(table_id.into_inner() as i32)
-        .fetch_one(&self.pool)
-        .await?;
-        let schema_name: String = row.try_get("schema_name")?;
-        let table_name: String = row.try_get("table_name")?;
-
-        let columns = sqlx::query(
-            r#"
-            select a.attname as column_name,
-                   a.atttypid::int as type_oid,
-                   a.atttypmod as type_modifier,
-                   a.attnotnull as not_null,
-                   coalesce(i.indisprimary, false) as is_primary
-            from pg_attribute a
-            left join pg_index i
-              on i.indrelid = a.attrelid
-             and a.attnum = any(i.indkey)
-             and i.indisprimary
-            where a.attrelid = $1
-              and a.attnum > 0
-              and not a.attisdropped
-            order by a.attnum
-            "#,
-        )
-        .bind(table_id.into_inner() as i32)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut column_schemas = Vec::with_capacity(columns.len());
-        for row in columns {
-            let name: String = row.try_get("column_name")?;
-            let type_oid: i32 = row.try_get("type_oid")?;
-            let type_modifier: i32 = row.try_get("type_modifier")?;
-            let not_null: bool = row.try_get("not_null")?;
-            let is_primary: bool = row.try_get("is_primary")?;
-            let typ = etl_postgres::types::convert_type_oid_to_type(type_oid as u32);
-            column_schemas.push(etl_postgres::types::ColumnSchema::new(
-                name,
-                typ,
-                type_modifier,
-                !not_null,
-                is_primary,
-            ));
-        }
-
-        let table_name = etl_postgres::types::TableName::new(schema_name, table_name);
-        Ok(EtlTableSchema::new(table_id, table_name, column_schemas))
-    }
-
     pub(super) async fn stream_cdc_changes(
         &self,
         replication_client: PgReplicationClient,
@@ -517,15 +448,12 @@ impl PostgresSource {
 
             let replication_idle_for = last_replication_message.elapsed();
             last_replication_message = Instant::now();
-            if replication_idle_for >= Duration::from_secs(30) {
-                info!(
-                    slot_name = slot_name,
-                    idle_secs = replication_idle_for.as_secs(),
-                    last_received_lsn = %last_received_lsn,
-                    last_flushed_lsn = %last_flushed_lsn,
-                    "received replication message after idle period"
-                );
-            }
+            log_replication_message_after_idle(
+                slot_name,
+                replication_idle_for,
+                last_received_lsn,
+                last_flushed_lsn,
+            );
 
             match message {
                 ReplicationMessage::PrimaryKeepAlive(keepalive) => {
@@ -534,41 +462,15 @@ impl PostgresSource {
                         last_received_lsn = wal_end;
                     }
                     if keepalive.reply() == 1 {
-                        info!(
-                            event = "cdc_keepalive_reply_requested",
-                            component = "coordinator",
-                            slot_name = slot_name,
-                            wal_end = %wal_end,
-                            last_received_lsn = %last_received_lsn,
-                            last_flushed_lsn = %last_flushed_lsn,
-                            "postgres requested logical replication keepalive reply"
-                        );
-                        await_cdc_timeout(
-                            format!("sending CDC keepalive status update for slot {}", slot_name),
-                            CDC_STATUS_UPDATE_TIMEOUT,
-                            stream.as_mut().send_status_update(
-                                last_received_lsn,
-                                last_flushed_lsn,
-                                true,
-                                StatusUpdateType::KeepAlive,
-                            ),
+                        handle_primary_keepalive_reply(
+                            slot_name,
+                            wal_end,
+                            last_received_lsn,
+                            last_flushed_lsn,
+                            stream.as_mut(),
+                            state_handle.as_ref(),
                         )
                         .await?;
-                        if let Some(state_handle) = state_handle.as_ref() {
-                            let mut watermark_state = state_handle
-                                .load_cdc_watermark_state()
-                                .await?
-                                .unwrap_or_default();
-                            let now = chrono::Utc::now();
-                            watermark_state.last_status_update_sent_at = Some(now);
-                            watermark_state.last_keepalive_reply_at = Some(now);
-                            watermark_state.last_slot_feedback_lsn =
-                                Some(last_flushed_lsn.to_string());
-                            watermark_state.updated_at = Some(now);
-                            state_handle
-                                .save_cdc_watermark_state(&watermark_state)
-                                .await?;
-                        }
                     }
                 }
                 ReplicationMessage::XLogData(xlog) => {
@@ -933,26 +835,22 @@ impl PostgresSource {
                 _ => {}
             }
 
-            if last_heartbeat_log.elapsed() >= Duration::from_secs(30) {
-                let coordinator_state = coordinator_state_rx.borrow().clone();
-                info!(
-                    slot_name = slot_name,
-                    last_received_lsn = %last_received_lsn,
-                    last_flushed_lsn = %last_flushed_lsn,
-                    pending_events = pending_events.len(),
-                    queued_batches = queued_batches.len(),
-                    pending_table_batches = pending_table_batches.len(),
-                    inflight_apply = inflight_dispatch.len() + inflight_apply.len(),
-                    active_table_applies = active_table_applies.len(),
-                    inflight_commits = coordinator_state.inflight_commits,
-                    next_sequence_to_ack = coordinator_state.next_sequence_to_ack,
-                    in_tx,
-                    expected_commit_lsn = ?expected_commit_lsn,
-                    last_xlog_activity_secs = last_xlog_activity.elapsed().as_secs(),
-                    "cdc loop heartbeat"
-                );
-                last_heartbeat_log = Instant::now();
-            }
+            let coordinator_state = coordinator_state_rx.borrow().clone();
+            maybe_log_cdc_loop_heartbeat(
+                slot_name,
+                &mut last_heartbeat_log,
+                last_received_lsn,
+                last_flushed_lsn,
+                pending_events.len(),
+                queued_batches.len(),
+                pending_table_batches.len(),
+                inflight_dispatch.len() + inflight_apply.len(),
+                active_table_applies.len(),
+                &coordinator_state,
+                in_tx,
+                expected_commit_lsn,
+                last_xlog_activity,
+            );
 
             while let Some(Some(result)) = inflight_dispatch.next().now_or_never() {
                 let acks = handle_cdc_dispatch_result(
@@ -1027,14 +925,17 @@ impl PostgresSource {
             }
         }
 
-        dispatch_cdc_batches_and_record(
+        finalize_cdc_runtime(
             slot_name,
             pending_events.len(),
             &mut queued_batches,
             &mut pending_table_batches,
             &mut inflight_dispatch,
-            &coordinator_tx,
+            &mut inflight_apply,
+            coordinator_tx,
+            &mut coordinator_advances_rx,
             &coordinator_state_rx,
+            coordinator_task,
             dest,
             &mut CdcApplyCoordination {
                 table_apply_locks: &mut table_apply_locks,
@@ -1044,411 +945,17 @@ impl PostgresSource {
                 max_active_applies,
                 apply_batch_size,
                 max_fill: apply_max_fill,
-                force_flush: true,
+                force_flush: false,
             },
-        )?;
-        while !inflight_dispatch.is_empty()
-            || !inflight_apply.is_empty()
-            || !pending_table_batches.is_empty()
-        {
-            while let Some(Some(result)) = inflight_dispatch.next().now_or_never() {
-                let acks = handle_cdc_dispatch_result(
-                    Some(result),
-                    &mut inflight_apply,
-                    &mut active_table_applies,
-                )?;
-                submit_cdc_apply_acks(&coordinator_tx, acks)?;
-            }
-            drain_ready_cdc_coordinator_advances(
-                &mut coordinator_advances_rx,
-                &stats,
-                table_configs,
-                state,
-                state_handle.as_ref(),
-                stream.as_mut(),
-                last_received_lsn,
-                &mut last_flushed_lsn,
-            )
-            .await?;
-            let acks = drain_one_cdc_work(
-                &mut inflight_dispatch,
-                &mut inflight_apply,
-                &mut active_table_applies,
-            )
-            .await?;
-            submit_cdc_apply_acks(&coordinator_tx, acks)?;
-            drain_ready_cdc_coordinator_advances(
-                &mut coordinator_advances_rx,
-                &stats,
-                table_configs,
-                state,
-                state_handle.as_ref(),
-                stream.as_mut(),
-                last_received_lsn,
-                &mut last_flushed_lsn,
-            )
-            .await?;
-            dispatch_cdc_batches_and_record(
-                slot_name,
-                pending_events.len(),
-                &mut queued_batches,
-                &mut pending_table_batches,
-                &mut inflight_dispatch,
-                &coordinator_tx,
-                &coordinator_state_rx,
-                dest,
-                &mut CdcApplyCoordination {
-                    table_apply_locks: &mut table_apply_locks,
-                    active_table_applies: &mut active_table_applies,
-                },
-                CdcDispatchConfig {
-                    max_active_applies,
-                    apply_batch_size,
-                    max_fill: apply_max_fill,
-                    force_flush: true,
-                },
-            )?;
-        }
-
-        drop(coordinator_tx);
-        while let Some(advance) = coordinator_advances_rx.recv().await {
-            apply_cdc_watermark_advance(
-                advance,
-                &mut CdcWatermarkRuntime {
-                    stats: &stats,
-                    table_configs,
-                    state,
-                    state_handle: state_handle.as_ref(),
-                },
-                stream.as_mut(),
-                last_received_lsn,
-                &mut last_flushed_lsn,
-            )
-            .await?;
-        }
-        coordinator_task.await.map_err(anyhow::Error::new)??;
-
-        Ok(last_flushed_lsn)
-    }
-
-    async fn handle_relation_change(
-        &self,
-        table_id: TableId,
-        runtime: &mut CdcRelationRuntime<'_>,
-    ) -> Result<()> {
-        let table_cfg = runtime
-            .table_configs
-            .get(&table_id)
-            .context("relation for unknown table")?;
-
-        let etl_schema = self.load_etl_table_schema(table_id).await?;
-        runtime.store.store_table_schema(etl_schema.clone()).await?;
-        let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
-        let new_hash = schema_fingerprint(&info.schema);
-        let current_primary_key = info.schema.primary_key.clone();
-        let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
-        let entry = runtime
-            .state
-            .postgres
-            .entry(table_cfg.name.clone())
-            .or_default();
-        let diff = schema_diff(prev_snapshot.as_deref(), &info.schema);
-        let default_diff = SchemaDiff::default();
-        let primary_key_changed_detected = primary_key_changed(
-            entry.schema_primary_key.as_deref(),
-            entry.schema_hash.as_deref(),
-            &info.schema,
-            &new_hash,
-            diff.as_ref().unwrap_or(&default_diff),
-        );
-        if let Some(ref diff) = diff
-            && !diff.is_empty()
-        {
-            if runtime.schema_diff_enabled {
-                log_schema_diff(&table_cfg.name, diff);
-            }
-            if primary_key_changed_detected {
-                warn!(
-                    table = %table_cfg.name,
-                    previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
-                    current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
-                    "schema change: primary key changed"
-                );
-            }
-            match runtime.schema_policy.clone() {
-                SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table_cfg.name
-                    );
-                }
-                SchemaChangePolicy::Auto => {
-                    if diff.has_incompatible() || primary_key_changed_detected {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table_cfg.name
-                        );
-                    }
-                    info!(
-                        table = %table_cfg.name,
-                        "schema change detected; updating destination schema"
-                    );
-                }
-            }
-        } else if primary_key_changed_detected {
-            warn!(
-                table = %table_cfg.name,
-                previous_primary_key = entry.schema_primary_key.as_deref().unwrap_or("unknown"),
-                current_primary_key = info.schema.primary_key.as_deref().unwrap_or("none"),
-                "schema change: primary key changed"
-            );
-            match runtime.schema_policy.clone() {
-                SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table_cfg.name
-                    );
-                }
-                SchemaChangePolicy::Auto => {
-                    anyhow::bail!(
-                        "incompatible schema change detected for {}; trigger a manual table resync",
-                        table_cfg.name
-                    );
-                }
-            }
-        }
-
-        let snapshot = schema_snapshot_from_schema(&info.schema);
-        if relation_change_requires_destination_ensure(
-            prev_snapshot.is_some(),
-            runtime.table_info_map.contains_key(&table_id),
-            diff.as_ref(),
-        ) {
-            runtime.dest.ensure_table_schema(&info.schema).await?;
-        }
-        runtime.dest.update_table_info(info.clone()).await?;
-        runtime.table_info_map.insert(table_id, info);
-        runtime.etl_schemas.insert(table_id, etl_schema);
-        runtime.table_hashes.insert(table_id, new_hash.clone());
-        runtime.table_snapshots.insert(table_id, snapshot.clone());
-
-        entry.schema_hash = Some(new_hash);
-        entry.schema_snapshot = Some(snapshot);
-        entry.schema_primary_key = current_primary_key;
-        if let Some(state_handle) = &runtime.state_handle {
-            state_handle
-                .save_postgres_checkpoint(&table_cfg.name, entry)
-                .await?;
-        }
-
-        Ok(())
-    }
-}
-
-pub(super) fn next_cdc_wait_timeout(
-    idle_timeout: Duration,
-    apply_max_fill: Duration,
-    pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
-    inflight_apply_count: usize,
-    max_active_applies: usize,
-) -> Duration {
-    if inflight_apply_count >= max_active_applies.max(1) {
-        return idle_timeout;
-    }
-
-    let now = Instant::now();
-    pending_table_batches
-        .values()
-        .map(|pending| {
-            pending
-                .first_buffered_at
-                .checked_add(apply_max_fill)
-                .map(|deadline| deadline.saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO)
-        })
-        .min()
-        .map(|pending_timeout| pending_timeout.min(idle_timeout))
-        .unwrap_or(idle_timeout)
-}
-
-pub(super) fn cdc_fill_deadline_reached(
-    apply_max_fill: Duration,
-    pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
-) -> bool {
-    let now = Instant::now();
-    pending_table_batches
-        .values()
-        .any(|pending| now.duration_since(pending.first_buffered_at) >= apply_max_fill)
-}
-
-pub(super) fn cdc_should_stop_after_idle(
-    state: &CdcIdleState,
-    last_xlog_activity: Instant,
-    idle_timeout: Duration,
-) -> bool {
-    !state.follow
-        && !state.in_tx
-        && state.pending_events_empty
-        && state.queued_batches_empty
-        && state.pending_table_batches_empty
-        && state.inflight_apply_empty
-        && last_xlog_activity.elapsed() >= idle_timeout
-}
-
-fn coordinator_inflight_commits(state_rx: &watch::Receiver<CdcCoordinatorRuntimeState>) -> usize {
-    state_rx.borrow().inflight_commits
-}
-
-fn submit_cdc_apply_acks(
-    coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
-    acks: Vec<CdcApplyFragmentAck>,
-) -> Result<()> {
-    for ack in acks {
-        coordinator_tx
-            .send(CdcCoordinatorCommand::CompleteFragments {
-                sequences: ack.sequences,
-            })
-            .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn drain_ready_cdc_coordinator_advances(
-    coordinator_advances_rx: &mut mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
-    stats: &Option<StatsHandle>,
-    table_configs: &HashMap<TableId, ResolvedPostgresTable>,
-    state: &mut ConnectionState,
-    state_handle: Option<&StateHandle>,
-    mut stream: Pin<&mut EventsStream>,
-    last_received_lsn: etl::types::PgLsn,
-    last_flushed_lsn: &mut etl::types::PgLsn,
-) -> Result<()> {
-    while let Ok(advance) = coordinator_advances_rx.try_recv() {
-        apply_cdc_watermark_advance(
-            advance,
-            &mut CdcWatermarkRuntime {
-                stats,
-                table_configs,
-                state,
-                state_handle,
-            },
+            &stats,
+            table_configs,
+            state,
+            state_handle.as_ref(),
             stream.as_mut(),
             last_received_lsn,
-            last_flushed_lsn,
+            &mut last_flushed_lsn,
         )
-        .await?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_cdc_batches_and_record(
-    slot_name: &str,
-    pending_events_len: usize,
-    queued_batches: &mut VecDeque<CommittedCdcBatch>,
-    pending_table_batches: &mut HashMap<TableId, PendingTableApplyBatch>,
-    inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
-    coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
-    coordinator_state_rx: &watch::Receiver<CdcCoordinatorRuntimeState>,
-    dest: &EtlBigQueryDestination,
-    coordination: &mut CdcApplyCoordination<'_>,
-    config: CdcDispatchConfig,
-) -> Result<()> {
-    dispatch_cdc_batches(
-        queued_batches,
-        pending_table_batches,
-        inflight_dispatch,
-        coordinator_tx,
-        dest,
-        coordination,
-        config,
-    )?;
-    crate::telemetry::record_cdc_pipeline_depths(
-        slot_name,
-        pending_events_len as u64,
-        (queued_batches.len() + pending_cdc_commit_count(pending_table_batches)) as u64,
-        coordinator_inflight_commits(coordinator_state_rx) as u64,
-    );
-    Ok(())
-}
-
-fn handle_cdc_connection_update(
-    changed: Result<(), tokio::sync::watch::error::RecvError>,
-    connection_updates_rx: &mut tokio::sync::watch::Receiver<
-        etl::replication::client::PostgresConnectionUpdate,
-    >,
-    slot_name: &str,
-) -> Result<()> {
-    if changed.is_err() {
-        anyhow::bail!(
-            "postgres replication connection updates ended unexpectedly for slot {}",
-            slot_name
-        );
+        .await
     }
 
-    let update = connection_updates_rx.borrow_and_update().clone();
-    match update {
-        etl::replication::client::PostgresConnectionUpdate::Running => {
-            info!(
-                slot_name = slot_name,
-                "postgres replication connection running"
-            );
-            Ok(())
-        }
-        etl::replication::client::PostgresConnectionUpdate::Terminated => {
-            anyhow::bail!(
-                "postgres replication connection terminated for slot {}",
-                slot_name
-            )
-        }
-        etl::replication::client::PostgresConnectionUpdate::Errored { error } => {
-            anyhow::bail!(
-                "postgres replication connection errored for slot {}: {}",
-                slot_name,
-                error
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_log_cdc_wait_timeout(
-    slot_name: &str,
-    last_heartbeat_log: &mut Instant,
-    last_replication_message: Instant,
-    last_xlog_activity: Instant,
-    last_received_lsn: etl::types::PgLsn,
-    last_flushed_lsn: etl::types::PgLsn,
-    pending_events: usize,
-    queued_batches: usize,
-    pending_table_batches: usize,
-    inflight_apply: usize,
-    active_table_applies: usize,
-    inflight_commits: usize,
-    in_tx: bool,
-    follow: bool,
-    reason: &'static str,
-) {
-    if last_heartbeat_log.elapsed() < Duration::from_secs(30) {
-        return;
-    }
-    info!(
-        slot_name = slot_name,
-        last_received_lsn = %last_received_lsn,
-        last_flushed_lsn = %last_flushed_lsn,
-        pending_events,
-        queued_batches,
-        pending_table_batches,
-        inflight_apply,
-        active_table_applies,
-        inflight_commits,
-        in_tx,
-        follow,
-        last_replication_message_secs = last_replication_message.elapsed().as_secs(),
-        last_xlog_activity_secs = last_xlog_activity.elapsed().as_secs(),
-        reason,
-        "waiting for replication message"
-    );
-    *last_heartbeat_log = Instant::now();
 }
