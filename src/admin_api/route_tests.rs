@@ -107,6 +107,8 @@ struct CountingStateBackend {
     state: SyncState,
     load_state_calls: Arc<AtomicUsize>,
     load_connection_state_calls: Arc<AtomicUsize>,
+    load_queue_summary_calls: Arc<AtomicUsize>,
+    load_coordinator_summary_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -133,6 +135,7 @@ impl AdminStateBackend for CountingStateBackend {
         &self,
         _connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
+        self.load_queue_summary_calls.fetch_add(1, Ordering::SeqCst);
         Ok(CdcBatchLoadQueueSummary::default())
     }
 
@@ -141,6 +144,8 @@ impl AdminStateBackend for CountingStateBackend {
         _connection_id: &str,
         _wal_bytes_behind_confirmed: Option<i64>,
     ) -> anyhow::Result<CdcCoordinatorSummary> {
+        self.load_coordinator_summary_calls
+            .fetch_add(1, Ordering::SeqCst);
         Ok(CdcCoordinatorSummary::default())
     }
 
@@ -504,20 +509,9 @@ async fn spawn_test_server(
 
 #[tokio::test]
 async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown() {
-    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::sampled(Some(
-        PostgresCdcSlotSnapshot {
-            slot_name: Some("slot_app".to_string()),
-            active: true,
-            restart_lsn: Some("0/16B6C40".to_string()),
-            confirmed_flush_lsn: Some("0/16B6C50".to_string()),
-            current_wal_lsn: Some("0/16B6C60".to_string()),
-            wal_bytes_retained_by_slot: Some(16),
-            wal_bytes_behind_confirmed: Some(16),
-            continuity_lost: false,
-        },
-    )));
-
-    super::publish_cached_postgres_cdc_slot_state(&tx, CachedPostgresCdcSlotState::unknown());
+    let cache = super::build_cdc_slot_sampler_cache(&test_config());
+    let tx = cache.get("app").expect("slot cache sender");
+    super::publish_cached_postgres_cdc_slot_state(tx, CachedPostgresCdcSlotState::unknown());
 
     let updated = tx.borrow().clone();
     assert_eq!(updated.sampler_status, "unknown");
@@ -537,6 +531,8 @@ async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_sca
         state: test_state(),
         load_state_calls: Arc::clone(&load_state_calls),
         load_connection_state_calls: Arc::clone(&load_connection_state_calls),
+        load_queue_summary_calls: Arc::new(AtomicUsize::new(0)),
+        load_coordinator_summary_calls: Arc::new(AtomicUsize::new(0)),
     });
     cfg.connections = vec![connection];
 
@@ -544,6 +540,35 @@ async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_sca
 
     assert_eq!(load_state_calls.load(Ordering::SeqCst), 0);
     assert_eq!(load_connection_state_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cdc_slot_sampler_samples_queue_and_coordinator_summaries_for_batch_load_connections() {
+    let cfg = test_config();
+    let mut connection = cfg.connections[0].clone();
+    let SourceConfig::Postgres(pg) = &mut connection.source;
+    pg.url = "postgres://127.0.0.1:1/postgres".to_string();
+    let DestinationConfig::BigQuery(bigquery) = &mut connection.destination;
+    bigquery.emulator_http = None;
+    bigquery.emulator_grpc = None;
+
+    let load_state_calls = Arc::new(AtomicUsize::new(0));
+    let load_connection_state_calls = Arc::new(AtomicUsize::new(0));
+    let load_queue_summary_calls = Arc::new(AtomicUsize::new(0));
+    let load_coordinator_summary_calls = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn AdminStateBackend> = Arc::new(CountingStateBackend {
+        state: test_state(),
+        load_state_calls,
+        load_connection_state_calls,
+        load_queue_summary_calls: Arc::clone(&load_queue_summary_calls),
+        load_coordinator_summary_calls: Arc::clone(&load_coordinator_summary_calls),
+    });
+    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::unknown());
+
+    super::sample_and_publish_postgres_cdc_state(&connection, &backend, &tx).await;
+
+    assert_eq!(load_queue_summary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(load_coordinator_summary_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

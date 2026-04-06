@@ -61,8 +61,53 @@ pub(super) fn publish_cached_postgres_cdc_slot_state(
     sender: &watch::Sender<CachedPostgresCdcSlotState>,
     next_state: CachedPostgresCdcSlotState,
 ) {
-    if let Err(err) = sender.send(next_state) {
-        warn!(error = %err, "failed to publish postgres CDC slot snapshot");
+    sender.send_replace(next_state);
+}
+
+pub(super) async fn sample_and_publish_postgres_cdc_state(
+    connection: &ConnectionConfig,
+    state_store: &Arc<dyn AdminStateBackend>,
+    sender: &watch::Sender<CachedPostgresCdcSlotState>,
+) {
+    let next_state = sample_cached_postgres_cdc_slot_state(connection, state_store).await;
+    if let Some(next_state) = next_state.as_ref() {
+        publish_cached_postgres_cdc_slot_state(sender, next_state.clone());
+    }
+
+    if !uses_cdc_batch_load_queue(connection) {
+        return;
+    }
+
+    match state_store
+        .load_cdc_batch_load_queue_summary(&connection.id)
+        .await
+    {
+        Ok(summary) => crate::telemetry::record_cdc_batch_load_queue_summary(&connection.id, &summary),
+        Err(err) => {
+            warn!(
+                connection = %connection.id,
+                error = %err,
+                "failed to load CDC batch-load queue summary for telemetry"
+            );
+        }
+    }
+
+    let wal_bytes_behind_confirmed = next_state
+        .as_ref()
+        .and_then(|state| state.snapshot.as_ref())
+        .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed);
+    match state_store
+        .load_cdc_coordinator_summary(&connection.id, wal_bytes_behind_confirmed)
+        .await
+    {
+        Ok(summary) => crate::telemetry::record_cdc_coordinator_summary(&connection.id, &summary),
+        Err(err) => {
+            warn!(
+                connection = %connection.id,
+                error = %err,
+                "failed to load CDC coordinator summary for telemetry"
+            );
+        }
     }
 }
 
@@ -88,11 +133,7 @@ pub(super) fn spawn_cdc_slot_sampler_tasks(
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Some(next_state) =
-                            sample_cached_postgres_cdc_slot_state(&connection, &state_store).await
-                        {
-                            publish_cached_postgres_cdc_slot_state(&sender, next_state);
-                        }
+                        sample_and_publish_postgres_cdc_state(&connection, &state_store, &sender).await;
                     }
                     changed = shutdown.changed() => {
                         if changed {

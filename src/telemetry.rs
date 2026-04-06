@@ -1,4 +1,5 @@
 use crate::config::{LoggingConfig, ObservabilityConfig};
+use crate::state::{CdcBatchLoadQueueSummary, CdcCoordinatorSummary};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
@@ -69,6 +70,19 @@ struct ReplicationMetrics {
     cdc_batch_load_jobs_total: Counter<u64>,
     cdc_batch_load_job_duration_ms: Histogram<f64>,
     cdc_batch_load_stage_duration_ms: Histogram<f64>,
+    cdc_batch_load_pending_jobs: Histogram<u64>,
+    cdc_batch_load_running_jobs: Histogram<u64>,
+    cdc_batch_load_failed_jobs: Histogram<u64>,
+    cdc_batch_load_oldest_pending_age_seconds: Histogram<u64>,
+    cdc_batch_load_oldest_running_age_seconds: Histogram<u64>,
+    cdc_batch_load_jobs_per_minute: Histogram<u64>,
+    cdc_batch_load_rows_per_minute: Histogram<u64>,
+    cdc_coordinator_pending_fragments: Histogram<u64>,
+    cdc_coordinator_failed_fragments: Histogram<u64>,
+    cdc_coordinator_oldest_pending_fragment_age_seconds: Histogram<u64>,
+    cdc_coordinator_next_sequence_to_ack: Histogram<u64>,
+    cdc_coordinator_last_enqueued_sequence: Histogram<u64>,
+    cdc_unattributed_wal_gap_bytes: Histogram<u64>,
 }
 
 static METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
@@ -288,6 +302,68 @@ pub fn record_cdc_batch_load_stage_duration(
     }
 }
 
+pub fn record_cdc_batch_load_queue_summary(
+    connection_id: &str,
+    summary: &CdcBatchLoadQueueSummary,
+) {
+    let metrics = metrics();
+    let attrs = [KeyValue::new("connection_id", connection_id.to_string())];
+    metrics
+        .cdc_batch_load_pending_jobs
+        .record(non_negative_i64_to_u64(summary.pending_jobs), &attrs);
+    metrics
+        .cdc_batch_load_running_jobs
+        .record(non_negative_i64_to_u64(summary.running_jobs), &attrs);
+    metrics
+        .cdc_batch_load_failed_jobs
+        .record(non_negative_i64_to_u64(summary.failed_jobs), &attrs);
+    metrics
+        .cdc_batch_load_jobs_per_minute
+        .record(non_negative_i64_to_u64(summary.jobs_per_minute), &attrs);
+    metrics
+        .cdc_batch_load_rows_per_minute
+        .record(non_negative_i64_to_u64(summary.rows_per_minute), &attrs);
+    if let Some(oldest_pending_age_seconds) = summary.oldest_pending_age_seconds {
+        metrics
+            .cdc_batch_load_oldest_pending_age_seconds
+            .record(non_negative_i64_to_u64(oldest_pending_age_seconds), &attrs);
+    }
+    if let Some(oldest_running_age_seconds) = summary.oldest_running_age_seconds {
+        metrics
+            .cdc_batch_load_oldest_running_age_seconds
+            .record(non_negative_i64_to_u64(oldest_running_age_seconds), &attrs);
+    }
+}
+
+pub fn record_cdc_coordinator_summary(connection_id: &str, summary: &CdcCoordinatorSummary) {
+    let metrics = metrics();
+    let attrs = [KeyValue::new("connection_id", connection_id.to_string())];
+    metrics
+        .cdc_coordinator_pending_fragments
+        .record(non_negative_i64_to_u64(summary.pending_fragments), &attrs);
+    metrics
+        .cdc_coordinator_failed_fragments
+        .record(non_negative_i64_to_u64(summary.failed_fragments), &attrs);
+    metrics
+        .cdc_coordinator_next_sequence_to_ack
+        .record(summary.next_sequence_to_ack, &attrs);
+    if let Some(last_enqueued_sequence) = summary.last_enqueued_sequence {
+        metrics
+            .cdc_coordinator_last_enqueued_sequence
+            .record(last_enqueued_sequence, &attrs);
+    }
+    if let Some(oldest_pending_age_seconds) = summary.oldest_pending_age_seconds {
+        metrics
+            .cdc_coordinator_oldest_pending_fragment_age_seconds
+            .record(non_negative_i64_to_u64(oldest_pending_age_seconds), &attrs);
+    }
+    if let Some(unattributed_wal_gap) = summary.wal_bytes_unattributed_or_idle {
+        metrics
+            .cdc_unattributed_wal_gap_bytes
+            .record(non_negative_i64_to_u64(unattributed_wal_gap), &attrs);
+    }
+}
+
 fn metrics() -> &'static ReplicationMetrics {
     METRICS.get_or_init(|| {
         let meter: Meter = global::meter("cdsync");
@@ -326,8 +402,51 @@ fn metrics() -> &'static ReplicationMetrics {
             cdc_batch_load_stage_duration_ms: meter
                 .f64_histogram("cdsync_cdc_batch_load_stage_duration_ms")
                 .build(),
+            cdc_batch_load_pending_jobs: meter
+                .u64_histogram("cdsync_cdc_batch_load_pending_jobs")
+                .build(),
+            cdc_batch_load_running_jobs: meter
+                .u64_histogram("cdsync_cdc_batch_load_running_jobs")
+                .build(),
+            cdc_batch_load_failed_jobs: meter
+                .u64_histogram("cdsync_cdc_batch_load_failed_jobs")
+                .build(),
+            cdc_batch_load_oldest_pending_age_seconds: meter
+                .u64_histogram("cdsync_cdc_batch_load_oldest_pending_age_seconds")
+                .build(),
+            cdc_batch_load_oldest_running_age_seconds: meter
+                .u64_histogram("cdsync_cdc_batch_load_oldest_running_age_seconds")
+                .build(),
+            cdc_batch_load_jobs_per_minute: meter
+                .u64_histogram("cdsync_cdc_batch_load_jobs_per_minute")
+                .build(),
+            cdc_batch_load_rows_per_minute: meter
+                .u64_histogram("cdsync_cdc_batch_load_rows_per_minute")
+                .build(),
+            cdc_coordinator_pending_fragments: meter
+                .u64_histogram("cdsync_cdc_coordinator_pending_fragments")
+                .build(),
+            cdc_coordinator_failed_fragments: meter
+                .u64_histogram("cdsync_cdc_coordinator_failed_fragments")
+                .build(),
+            cdc_coordinator_oldest_pending_fragment_age_seconds: meter
+                .u64_histogram("cdsync_cdc_coordinator_oldest_pending_fragment_age_seconds")
+                .build(),
+            cdc_coordinator_next_sequence_to_ack: meter
+                .u64_histogram("cdsync_cdc_coordinator_next_sequence_to_ack")
+                .build(),
+            cdc_coordinator_last_enqueued_sequence: meter
+                .u64_histogram("cdsync_cdc_coordinator_last_enqueued_sequence")
+                .build(),
+            cdc_unattributed_wal_gap_bytes: meter
+                .u64_histogram("cdsync_cdc_unattributed_wal_gap_bytes")
+                .build(),
         }
     })
+}
+
+fn non_negative_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }
 
 fn init_trace_provider(
