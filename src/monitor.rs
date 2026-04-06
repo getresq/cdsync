@@ -131,6 +131,9 @@ struct ProgressResponse {
     connection_id: String,
     runtime: ConnectionRuntime,
     current_run: Option<RunSummary>,
+    cdc: Option<ConnectionCdcSnapshot>,
+    batch_load_queue: Option<CdcBatchLoadQueueSummary>,
+    cdc_coordinator: Option<CdcCoordinatorSummary>,
     tables: Vec<TableProgress>,
 }
 
@@ -165,6 +168,45 @@ struct RunSummary {
     load_ms: i64,
     api_calls: i64,
     rate_limit_hits: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConnectionCdcSnapshot {
+    sampler_status: String,
+    sampled_at: Option<DateTime<Utc>>,
+    slot_name: Option<String>,
+    slot_active: Option<bool>,
+    current_wal_lsn: Option<String>,
+    restart_lsn: Option<String>,
+    confirmed_flush_lsn: Option<String>,
+    wal_bytes_retained_by_slot: Option<i64>,
+    wal_bytes_behind_confirmed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CdcBatchLoadQueueSummary {
+    pending_jobs: i64,
+    running_jobs: i64,
+    succeeded_jobs: i64,
+    failed_jobs: i64,
+    oldest_pending_age_seconds: Option<i64>,
+    oldest_running_age_seconds: Option<i64>,
+    jobs_per_minute: i64,
+    rows_per_minute: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CdcCoordinatorSummary {
+    next_sequence_to_ack: u64,
+    last_enqueued_sequence: Option<u64>,
+    pending_fragments: i64,
+    failed_fragments: i64,
+    oldest_pending_age_seconds: Option<i64>,
+    last_relevant_change_seen_at: Option<DateTime<Utc>>,
+    last_status_update_sent_at: Option<DateTime<Utc>>,
+    last_keepalive_reply_at: Option<DateTime<Utc>>,
+    last_slot_feedback_lsn: Option<String>,
+    wal_bytes_unattributed_or_idle: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -948,6 +990,58 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
                 run.error.as_deref().unwrap_or("-"),
             ));
         }
+        if let Some(cdc) = &progress.cdc {
+            lines.push(format!(
+                "CDC: sampler={} sampled_at={} slot={} active={} flush={} restart={} current={} behind={} retained={}",
+                cdc.sampler_status,
+                cdc.sampled_at.map_or_else(|| "-".to_string(), format_timestamp),
+                cdc.slot_name.as_deref().unwrap_or("-"),
+                cdc.slot_active.map_or_else(|| "-".to_string(), |value| value.to_string()),
+                cdc.confirmed_flush_lsn.as_deref().unwrap_or("-"),
+                cdc.restart_lsn.as_deref().unwrap_or("-"),
+                cdc.current_wal_lsn.as_deref().unwrap_or("-"),
+                cdc.wal_bytes_behind_confirmed.map_or_else(|| "-".to_string(), |value| value.to_string()),
+                cdc.wal_bytes_retained_by_slot.map_or_else(|| "-".to_string(), |value| value.to_string()),
+            ));
+        }
+        if let Some(queue) = &progress.batch_load_queue {
+            lines.push(format!(
+                "Queue: pending={} running={} failed={} succeeded={} jobs/min={} rows/min={} oldest_pending={} oldest_running={}",
+                queue.pending_jobs,
+                queue.running_jobs,
+                queue.failed_jobs,
+                queue.succeeded_jobs,
+                queue.jobs_per_minute,
+                queue.rows_per_minute,
+                format_age(queue.oldest_pending_age_seconds),
+                format_age(queue.oldest_running_age_seconds),
+            ));
+        }
+        if let Some(coordinator) = &progress.cdc_coordinator {
+            lines.push(format!(
+                "Coordinator: next_ack={} last_enqueued={} pending_fragments={} failed_fragments={} oldest_pending={} relevant_change={} status_update={} keepalive_reply={} feedback_lsn={} idle_gap={}",
+                coordinator.next_sequence_to_ack,
+                coordinator
+                    .last_enqueued_sequence
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                coordinator.pending_fragments,
+                coordinator.failed_fragments,
+                format_age(coordinator.oldest_pending_age_seconds),
+                coordinator
+                    .last_relevant_change_seen_at
+                    .map_or_else(|| "-".to_string(), format_timestamp),
+                coordinator
+                    .last_status_update_sent_at
+                    .map_or_else(|| "-".to_string(), format_timestamp),
+                coordinator
+                    .last_keepalive_reply_at
+                    .map_or_else(|| "-".to_string(), format_timestamp),
+                coordinator.last_slot_feedback_lsn.as_deref().unwrap_or("-"),
+                coordinator
+                    .wal_bytes_unattributed_or_idle
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            ));
+        }
         lines.push("Tables".to_string());
         for table in &progress.tables {
             lines.push(format!(
@@ -1193,6 +1287,39 @@ SwIDAQAB
                     last_restart_reason: "startup".to_string(),
                 },
                 current_run: None,
+                cdc: Some(ConnectionCdcSnapshot {
+                    sampler_status: "ok".to_string(),
+                    sampled_at: None,
+                    slot_name: Some("slot_app".to_string()),
+                    slot_active: Some(true),
+                    current_wal_lsn: Some("0/16B6C60".to_string()),
+                    restart_lsn: Some("0/16B6C40".to_string()),
+                    confirmed_flush_lsn: Some("0/16B6C50".to_string()),
+                    wal_bytes_retained_by_slot: Some(16),
+                    wal_bytes_behind_confirmed: Some(8),
+                }),
+                batch_load_queue: Some(CdcBatchLoadQueueSummary {
+                    pending_jobs: 2,
+                    running_jobs: 1,
+                    succeeded_jobs: 12,
+                    failed_jobs: 0,
+                    oldest_pending_age_seconds: Some(9),
+                    oldest_running_age_seconds: Some(4),
+                    jobs_per_minute: 3,
+                    rows_per_minute: 12,
+                }),
+                cdc_coordinator: Some(CdcCoordinatorSummary {
+                    next_sequence_to_ack: 41,
+                    last_enqueued_sequence: Some(44),
+                    pending_fragments: 3,
+                    failed_fragments: 0,
+                    oldest_pending_age_seconds: Some(7),
+                    last_relevant_change_seen_at: None,
+                    last_status_update_sent_at: None,
+                    last_keepalive_reply_at: None,
+                    last_slot_feedback_lsn: Some("0/16B6C50".to_string()),
+                    wal_bytes_unattributed_or_idle: Some(5),
+                }),
                 tables: vec![TableProgress {
                     table_name: "public.accounts".to_string(),
                     phase: "healthy".to_string(),
@@ -1213,6 +1340,9 @@ SwIDAQAB
         let rendered = render_plain(&snapshot);
         assert!(rendered.contains("Connections"));
         assert!(rendered.contains("Selected: app"));
+        assert!(rendered.contains("CDC: sampler=ok"));
+        assert!(rendered.contains("Queue: pending=2 running=1 failed=0 succeeded=12"));
+        assert!(rendered.contains("Coordinator: next_ack=41 last_enqueued=44"));
         assert!(rendered.contains("public.accounts"));
         assert!(rendered.contains("last_pk=42"));
     }

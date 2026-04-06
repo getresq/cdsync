@@ -572,6 +572,41 @@ async fn cdc_slot_sampler_samples_queue_and_coordinator_summaries_for_batch_load
 }
 
 #[tokio::test]
+async fn spawn_cdc_slot_sampler_tasks_samples_batch_load_summaries_on_interval() -> anyhow::Result<()>
+{
+    let mut cfg = test_config();
+    let mut connection = cfg.connections[0].clone();
+    let SourceConfig::Postgres(pg) = &mut connection.source;
+    pg.url = "postgres://127.0.0.1:1/postgres".to_string();
+    let DestinationConfig::BigQuery(bigquery) = &mut connection.destination;
+    bigquery.emulator_http = None;
+    bigquery.emulator_grpc = None;
+    cfg.connections = vec![connection];
+
+    let load_state_calls = Arc::new(AtomicUsize::new(0));
+    let load_connection_state_calls = Arc::new(AtomicUsize::new(0));
+    let load_queue_summary_calls = Arc::new(AtomicUsize::new(0));
+    let load_coordinator_summary_calls = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn AdminStateBackend> = Arc::new(CountingStateBackend {
+        state: test_state(),
+        load_state_calls,
+        load_connection_state_calls,
+        load_queue_summary_calls: Arc::clone(&load_queue_summary_calls),
+        load_coordinator_summary_calls: Arc::clone(&load_coordinator_summary_calls),
+    });
+    let cache = super::build_cdc_slot_sampler_cache(&cfg);
+    let (shutdown_controller, shutdown_signal) = crate::runner::ShutdownController::new();
+
+    super::spawn_cdc_slot_sampler_tasks(Arc::new(cfg), backend, cache, shutdown_signal);
+    sleep(CDC_SLOT_SAMPLER_INTERVAL + Duration::from_millis(200)).await;
+    shutdown_controller.shutdown();
+
+    assert!(load_queue_summary_calls.load(Ordering::SeqCst) >= 1);
+    assert!(load_coordinator_summary_calls.load(Ordering::SeqCst) >= 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn spawn_admin_server_thread_surfaces_bind_failures_before_returning() -> anyhow::Result<()> {
     let state = test_admin_state(
         Arc::new(FakeStateBackend {

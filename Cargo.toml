@@ -63,6 +63,7 @@ urlencoding = "2"
 overflow-checks = true
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic-messages", "trace", "metrics"] }
 tempfile = "3"
 temp-env = "0.3"
 wiremock = "0.6"
