@@ -128,8 +128,14 @@ async fn telemetry_emits_otlp_metrics_and_spans() -> Result<()> {
         .filter(|request| request.url.path().ends_with("/v1/metrics"))
         .collect();
 
-    anyhow::ensure!(!trace_requests.is_empty(), "expected OTLP trace export request");
-    anyhow::ensure!(!metric_requests.is_empty(), "expected OTLP metrics export request");
+    anyhow::ensure!(
+        !trace_requests.is_empty(),
+        "expected OTLP trace export request"
+    );
+    anyhow::ensure!(
+        !metric_requests.is_empty(),
+        "expected OTLP metrics export request"
+    );
 
     for request in &trace_requests {
         assert_eq!(
@@ -151,10 +157,16 @@ async fn telemetry_emits_otlp_metrics_and_spans() -> Result<()> {
     }
 
     let exported_spans = collect_exported_spans(&trace_requests)?;
-    assert!(exported_spans.iter().any(|span| span.name == "cdc_batch_load_job"));
-    assert!(exported_spans
-        .iter()
-        .any(|span| span.name == "cdc_batch_load_job.merge"));
+    assert!(
+        exported_spans
+            .iter()
+            .any(|span| span.name == "cdc_batch_load_job")
+    );
+    assert!(
+        exported_spans
+            .iter()
+            .any(|span| span.name == "cdc_batch_load_job.merge")
+    );
     let root_span = exported_spans
         .iter()
         .find(|span| span.name == "cdc_batch_load_job")
@@ -169,31 +181,15 @@ async fn telemetry_emits_otlp_metrics_and_spans() -> Result<()> {
     );
 
     let metrics = collect_exported_metrics(&metric_requests)?;
-    assert_metric_with_connection(
-        &metrics,
-        "cdsync_cdc_batch_load_pending_jobs",
-        "app",
-    );
-    assert_metric_with_connection(
-        &metrics,
-        "cdsync_cdc_batch_load_running_jobs",
-        "app",
-    );
-    assert_metric_with_connection(
-        &metrics,
-        "cdsync_cdc_coordinator_pending_fragments",
-        "app",
-    );
+    assert_metric_with_connection(&metrics, "cdsync_cdc_batch_load_pending_jobs", "app");
+    assert_metric_with_connection(&metrics, "cdsync_cdc_batch_load_running_jobs", "app");
+    assert_metric_with_connection(&metrics, "cdsync_cdc_coordinator_pending_fragments", "app");
     assert_metric_with_connection(
         &metrics,
         "cdsync_cdc_coordinator_next_sequence_to_ack",
         "app",
     );
-    assert_metric_with_connection(
-        &metrics,
-        "cdsync_cdc_batch_load_stage_duration_ms",
-        "app",
-    );
+    assert_metric_with_connection(&metrics, "cdsync_cdc_batch_load_stage_duration_ms", "app");
 
     Ok(())
 }
@@ -260,21 +256,21 @@ fn assert_metric_with_connection(
         .find(|metric| metric.name == name)
         .unwrap_or_else(|| panic!("missing metric {name}"));
     let has_attr = match metric.data.as_ref() {
-        Some(MetricData::Histogram(histogram)) => histogram
-            .data_points
-            .iter()
-            .any(|point| find_string_attr(&point.attributes, "connection_id") == Some(connection_id)),
-        Some(MetricData::Sum(sum)) => sum
-            .data_points
-            .iter()
-            .any(|point| find_string_attr(&point.attributes, "connection_id") == Some(connection_id)),
-        Some(MetricData::Gauge(gauge)) => gauge
-            .data_points
-            .iter()
-            .any(|point| find_string_attr(&point.attributes, "connection_id") == Some(connection_id)),
+        Some(MetricData::Histogram(histogram)) => histogram.data_points.iter().any(|point| {
+            find_string_attr(&point.attributes, "connection_id") == Some(connection_id)
+        }),
+        Some(MetricData::Sum(sum)) => sum.data_points.iter().any(|point| {
+            find_string_attr(&point.attributes, "connection_id") == Some(connection_id)
+        }),
+        Some(MetricData::Gauge(gauge)) => gauge.data_points.iter().any(|point| {
+            find_string_attr(&point.attributes, "connection_id") == Some(connection_id)
+        }),
         other => panic!("unexpected metric data for {name}: {other:?}"),
     };
-    assert!(has_attr, "metric {name} missing connection_id={connection_id}");
+    assert!(
+        has_attr,
+        "metric {name} missing connection_id={connection_id}"
+    );
 }
 
 fn find_string_attr<'a>(attributes: &'a [ProtoKeyValue], key: &str) -> Option<&'a str> {

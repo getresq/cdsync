@@ -82,7 +82,9 @@ pub(super) async fn sample_and_publish_postgres_cdc_state(
         .load_cdc_batch_load_queue_summary(&connection.id)
         .await
     {
-        Ok(summary) => crate::telemetry::record_cdc_batch_load_queue_summary(&connection.id, &summary),
+        Ok(summary) => {
+            crate::telemetry::record_cdc_batch_load_queue_summary(&connection.id, &summary)
+        }
         Err(err) => {
             warn!(
                 connection = %connection.id,

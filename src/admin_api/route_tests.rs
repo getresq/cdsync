@@ -572,8 +572,8 @@ async fn cdc_slot_sampler_samples_queue_and_coordinator_summaries_for_batch_load
 }
 
 #[tokio::test]
-async fn spawn_cdc_slot_sampler_tasks_samples_batch_load_summaries_on_interval() -> anyhow::Result<()>
-{
+async fn spawn_cdc_slot_sampler_tasks_samples_batch_load_summaries_on_interval()
+-> anyhow::Result<()> {
     let mut cfg = test_config();
     let mut connection = cfg.connections[0].clone();
     let SourceConfig::Postgres(pg) = &mut connection.source;
