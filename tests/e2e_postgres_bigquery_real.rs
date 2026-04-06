@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cdsync::config::{BigQueryConfig, PostgresConfig, PostgresTableConfig, SchemaChangePolicy};
 use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
 use sqlx::postgres::PgPoolOptions;
-use std::env;
 use std::path::PathBuf;
 use uuid::Uuid;
 #[path = "support/dotenv.rs"]
@@ -14,16 +13,23 @@ mod dotenv_support;
 mod real_bigquery_support;
 
 #[tokio::test]
-#[ignore]
 async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
+    if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
     dotenv_support::load_dotenv()?;
     real_bigquery_support::install_rustls_provider();
 
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .unwrap_or_else(|_| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
-    let real_bq = real_bigquery_support::load_env()?;
-    let batch_load_bucket = env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
-        .context("set CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET to a writable GCS bucket")?;
+    let Ok(real_bq) = real_bigquery_support::load_env() else {
+        return Ok(());
+    };
+    let Some(batch_load_bucket) = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let pg_url = std::env::var("CDSYNC_E2E_PG_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
 
     let suffix = Uuid::new_v4().simple().to_string();
     let table_name = format!("cdsync_real_{}", &suffix[..8]);

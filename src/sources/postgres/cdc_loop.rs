@@ -79,7 +79,6 @@ pub(super) fn submit_cdc_apply_acks(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_ready_cdc_coordinator_advances(
     coordinator_advances_rx: &mut mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
     stats: &Option<StatsHandle>,
@@ -108,7 +107,6 @@ pub(super) async fn drain_ready_cdc_coordinator_advances(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_cdc_batches_and_record(
     slot_name: &str,
     pending_events_len: usize,
@@ -178,7 +176,6 @@ pub(super) fn handle_cdc_connection_update(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn maybe_log_cdc_wait_timeout(
     slot_name: &str,
     last_heartbeat_log: &mut Instant,
@@ -279,7 +276,6 @@ pub(super) async fn handle_primary_keepalive_reply(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn maybe_log_cdc_loop_heartbeat(
     slot_name: &str,
     last_heartbeat_log: &mut Instant,
@@ -317,7 +313,6 @@ pub(super) fn maybe_log_cdc_loop_heartbeat(
     *last_heartbeat_log = Instant::now();
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_cdc_runtime(
     slot_name: &str,
     pending_events_len: usize,

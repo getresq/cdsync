@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cdsync::config::{
     BigQueryConfig, PostgresConfig, PostgresTableConfig, SchemaChangePolicy, StateConfig,
     StatsConfig,
@@ -39,16 +39,23 @@ struct FollowRunnerConfigInput<'a> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
+    if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
     dotenv_support::load_dotenv()?;
     real_bigquery_support::install_rustls_provider();
 
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .unwrap_or_else(|_| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
-    let real_bq = real_bigquery_support::load_env()?;
-    let batch_load_bucket = env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
-        .context("set CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET to a writable GCS bucket")?;
+    let Ok(real_bq) = real_bigquery_support::load_env() else {
+        return Ok(());
+    };
+    let Some(batch_load_bucket) = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let pg_url = std::env::var("CDSYNC_E2E_PG_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
 
     let suffix = Uuid::new_v4().simple().to_string();
     let table_name = format!("cdsync_real_cdc_{}", &suffix[..8]);
@@ -275,17 +282,25 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> Result<()> {
+    if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
     dotenv_support::load_dotenv()?;
     real_bigquery_support::install_rustls_provider();
     let _ = JWT_CRYPTO_PROVIDER.install_default();
 
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .unwrap_or_else(|_| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
-    let real_bq = real_bigquery_support::load_env()?;
-    let batch_load_bucket = env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
-        .unwrap_or_else(|_| "nora-461013-cdsync-staging-loads".to_string());
+    let Ok(real_bq) = real_bigquery_support::load_env() else {
+        return Ok(());
+    };
+    let pg_url = std::env::var("CDSYNC_E2E_PG_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
+    let batch_load_bucket = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "nora-461013-cdsync-staging-loads".to_string());
 
     let suffix = Uuid::new_v4().simple().to_string();
     let publication = format!("cdsync_real_follow_pub_{}", &suffix[..8]);

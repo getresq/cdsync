@@ -12,6 +12,18 @@ static STATS_MIGRATOR: Migrator = sqlx::migrate!("./migrations/stats");
 static LIVE_RUN_REGISTRY: OnceLock<Mutex<HashMap<String, watch::Sender<RunStatsSnapshot>>>> =
     OnceLock::new();
 
+fn saturating_usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn saturating_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn saturating_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct StatsHandle {
     inner: Arc<AsyncMutex<RunStatsState>>,
@@ -145,13 +157,13 @@ impl StatsHandle {
 
     pub async fn record_extract(&self, table: &str, rows: usize, elapsed_ms: u64) {
         let mut guard = self.inner.lock().await;
-        let rows = rows as i64;
+        let rows = saturating_usize_to_i64(rows);
         guard.rows_read += rows;
-        guard.extract_ms += elapsed_ms as i64;
+        guard.extract_ms += saturating_u64_to_i64(elapsed_ms);
         let table_stats = guard.tables.entry(table.to_string()).or_default();
         table_stats.rows_read += rows;
-        table_stats.extract_ms += elapsed_ms as i64;
-        crate::telemetry::record_rows_read(table, rows as u64);
+        table_stats.extract_ms += saturating_u64_to_i64(elapsed_ms);
+        crate::telemetry::record_rows_read(table, saturating_i64_to_u64(rows));
         self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
@@ -164,19 +176,19 @@ impl StatsHandle {
         elapsed_ms: u64,
     ) {
         let mut guard = self.inner.lock().await;
-        let rows = rows as i64;
-        let upserted = upserted as i64;
-        let deleted = deleted as i64;
+        let rows = saturating_usize_to_i64(rows);
+        let upserted = saturating_usize_to_i64(upserted);
+        let deleted = saturating_usize_to_i64(deleted);
         guard.rows_written += rows;
         guard.rows_upserted += upserted;
         guard.rows_deleted += deleted;
-        guard.load_ms += elapsed_ms as i64;
+        guard.load_ms += saturating_u64_to_i64(elapsed_ms);
         let table_stats = guard.tables.entry(table.to_string()).or_default();
         table_stats.rows_written += rows;
         table_stats.rows_upserted += upserted;
         table_stats.rows_deleted += deleted;
-        table_stats.load_ms += elapsed_ms as i64;
-        crate::telemetry::record_rows_written(table, rows as u64);
+        table_stats.load_ms += saturating_u64_to_i64(elapsed_ms);
+        crate::telemetry::record_rows_written(table, saturating_i64_to_u64(rows));
         self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 

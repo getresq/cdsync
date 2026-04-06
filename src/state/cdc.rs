@@ -55,7 +55,7 @@ impl SyncStateStore {
         .bind(connection_id)
         .bind(&job.job_id)
         .bind(&job.table_key)
-        .bind(job.first_sequence as i64)
+        .bind(saturating_u64_to_i64(job.first_sequence))
         .bind(job.status.as_str())
         .bind(&job.payload_json)
         .bind(job.attempt_count)
@@ -64,7 +64,7 @@ impl SyncStateStore {
         .bind(job.updated_at)
         .fetch_one(&self.pool)
         .await?;
-        cdc_batch_load_job_record_from_row(row)
+        cdc_batch_load_job_record_from_row(&row)
     }
 
     pub async fn load_cdc_batch_load_jobs(
@@ -89,7 +89,7 @@ impl SyncStateStore {
         .await?;
 
         rows.into_iter()
-            .map(cdc_batch_load_job_record_from_row)
+            .map(|row| cdc_batch_load_job_record_from_row(&row))
             .collect()
     }
 
@@ -151,7 +151,7 @@ impl SyncStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(cdc_batch_load_job_record_from_row).transpose()
+        row.as_ref().map(cdc_batch_load_job_record_from_row).transpose()
     }
 
     pub async fn heartbeat_cdc_batch_load_job(
@@ -513,7 +513,7 @@ impl SyncStateStore {
             .bind(connection_id)
             .bind(&fragment.fragment_id)
             .bind(&fragment.job_id)
-            .bind(fragment.sequence as i64)
+            .bind(saturating_u64_to_i64(fragment.sequence))
             .bind(&fragment.commit_lsn)
             .bind(&fragment.table_key)
             .bind(fragment.status.as_str())
@@ -553,10 +553,12 @@ impl SyncStateStore {
 
         rows.into_iter()
             .map(|row| {
+                let sequence = row.try_get::<i64, _>("sequence")?;
                 Ok(CdcCommitFragmentRecord {
                     fragment_id: row.try_get("fragment_id")?,
                     job_id: row.try_get("job_id")?,
-                    sequence: row.try_get::<i64, _>("sequence")? as u64,
+                    sequence: u64::try_from(sequence)
+                        .context("cdc commit fragment sequence must be non-negative")?,
                     commit_lsn: row.try_get("commit_lsn")?,
                     table_key: row.try_get("table_key")?,
                     status: CdcCommitFragmentStatus::from_str(row.try_get("status")?)?,
@@ -660,8 +662,8 @@ impl SyncStateStore {
             self.table("cdc_watermark_state")
         ))
         .bind(connection_id)
-        .bind(state.next_sequence_to_ack as i64)
-        .bind(state.last_enqueued_sequence.map(|value| value as i64))
+        .bind(saturating_u64_to_i64(state.next_sequence_to_ack))
+        .bind(state.last_enqueued_sequence.map(saturating_u64_to_i64))
         .bind(state.last_received_lsn.clone())
         .bind(state.last_flushed_lsn.clone())
         .bind(state.last_persisted_lsn.clone())
@@ -708,11 +710,17 @@ impl SyncStateStore {
         .await?;
 
         row.map(|row| {
+            let next_sequence_to_ack = row.try_get::<i64, _>("next_sequence_to_ack")?;
             Ok(CdcWatermarkState {
-                next_sequence_to_ack: row.try_get::<i64, _>("next_sequence_to_ack")? as u64,
+                next_sequence_to_ack: u64::try_from(next_sequence_to_ack)
+                    .context("cdc watermark next_sequence_to_ack must be non-negative")?,
                 last_enqueued_sequence: row
                     .try_get::<Option<i64>, _>("last_enqueued_sequence")?
-                    .map(|value| value as u64),
+                    .map(|value| {
+                        u64::try_from(value)
+                            .context("cdc watermark last_enqueued_sequence must be non-negative")
+                    })
+                    .transpose()?,
                 last_received_lsn: row.try_get("last_received_lsn")?,
                 last_flushed_lsn: row.try_get("last_flushed_lsn")?,
                 last_persisted_lsn: row.try_get("last_persisted_lsn")?,
@@ -764,8 +772,8 @@ impl SyncStateStore {
             last_enqueued_sequence: watermark
                 .as_ref()
                 .and_then(|state| state.last_enqueued_sequence),
-            pending_fragments: pending.len() as i64,
-            failed_fragments: failed.len() as i64,
+            pending_fragments: saturating_usize_to_i64(pending.len()),
+            failed_fragments: saturating_usize_to_i64(failed.len()),
             oldest_pending_sequence: oldest_pending.map(|fragment| fragment.sequence),
             oldest_pending_age_seconds: oldest_pending
                 .map(|fragment| ((now - fragment.created_at).max(0)) / 1000),

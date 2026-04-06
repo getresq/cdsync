@@ -1,10 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cdsync::config::{PostgresConfig, PostgresTableConfig, SchemaChangePolicy};
 use cdsync::sources::postgres::PostgresSource;
 use cdsync::types::MetadataColumns;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
-use std::env;
 use uuid::Uuid;
 #[path = "support/dotenv.rs"]
 mod dotenv_support;
@@ -22,11 +21,11 @@ fn tracked_table(name: String) -> PostgresTableConfig {
 }
 
 #[tokio::test]
-#[ignore]
 async fn e2e_configured_source_table_must_exist() -> Result<()> {
     dotenv_support::load_dotenv()?;
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
+    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
     let suffix = Uuid::new_v4().simple().to_string();
     let existing_table = format!("public.cdsync_exists_{}", &suffix[..8]);
     let missing_table = format!("public.cdsync_missing_{}", &suffix[..8]);

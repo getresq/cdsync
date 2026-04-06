@@ -16,16 +16,13 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
         .iter()
         .map(|col| {
             let data_type = match col.data_type {
-                DataType::String => TableFieldType::String,
+                DataType::String | DataType::Bytes | DataType::Json => TableFieldType::String,
                 DataType::Int64 => TableFieldType::Int64,
-                DataType::Float64 => TableFieldType::Float64,
+                DataType::Float64 | DataType::Interval => TableFieldType::Float64,
                 DataType::Bool => TableFieldType::Bool,
                 DataType::Timestamp => TableFieldType::Timestamp,
                 DataType::Date => TableFieldType::Date,
-                DataType::Interval => TableFieldType::Float64,
-                DataType::Bytes => TableFieldType::String,
                 DataType::Numeric => TableFieldType::Bignumeric,
-                DataType::Json => TableFieldType::String,
             };
             TableFieldSchema {
                 name: col.name.clone(),
@@ -67,21 +64,18 @@ pub(super) fn anyvalue_to_json(value: &AnyValue) -> Value {
         AnyValue::Null => Value::Null,
         AnyValue::Boolean(v) => Value::Bool(*v),
         AnyValue::Int64(v) => Value::Number((*v).into()),
-        AnyValue::Int32(v) => Value::Number((*v as i64).into()),
+        AnyValue::Int32(v) => Value::Number(i64::from(*v).into()),
         AnyValue::UInt64(v) => Value::Number((*v).into()),
-        AnyValue::UInt32(v) => Value::Number((*v as u64).into()),
-        AnyValue::Float64(v) => serde_json::Number::from_f64(*v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        AnyValue::Float32(v) => serde_json::Number::from_f64(f64::from(*v))
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        AnyValue::UInt32(v) => Value::Number(u64::from(*v).into()),
+        AnyValue::Float64(v) => serde_json::Number::from_f64(*v).map_or(Value::Null, Value::Number),
+        AnyValue::Float32(v) => serde_json::Number::from_f64(f64::from(*v)).map_or(Value::Null, Value::Number),
         AnyValue::String(v) => Value::String(v.to_string()),
         AnyValue::StringOwned(v) => Value::String(v.to_string()),
         AnyValue::Binary(bytes) => Value::String(encode_base64(bytes)),
         AnyValue::BinaryOwned(bytes) => Value::String(encode_base64(bytes)),
-        AnyValue::Datetime(ts, unit, _) => Value::String(datetime_to_rfc3339(*ts, *unit)),
-        AnyValue::DatetimeOwned(ts, unit, _) => Value::String(datetime_to_rfc3339(*ts, *unit)),
+        AnyValue::Datetime(ts, unit, _) | AnyValue::DatetimeOwned(ts, unit, _) => {
+            Value::String(datetime_to_rfc3339(*ts, *unit))
+        }
         AnyValue::Date(days) => Value::String(date_to_string(*days)),
         AnyValue::Decimal(v, _) => Value::String(v.to_string()),
         other => Value::String(other.to_string()),
@@ -95,7 +89,7 @@ pub(super) fn datetime_to_rfc3339(ts: i64, unit: polars::prelude::TimeUnit) -> S
         polars::prelude::TimeUnit::Milliseconds => ts * 1_000_000,
     };
     let seconds = nanos / 1_000_000_000;
-    let nanos_part = (nanos % 1_000_000_000) as u32;
+    let nanos_part = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos_part)
         .unwrap_or_else(chrono::Utc::now);
     dt.to_rfc3339()
@@ -139,21 +133,17 @@ pub(super) fn tuple_value_as_datetime(
             if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
                 return Ok(Some(parsed.with_timezone(&Utc)));
             }
-            let seconds = value
-                .parse::<f64>()
-                .with_context(|| format!("parsing datetime cell at index {}", index))?;
-            let whole_seconds = seconds.trunc() as i64;
-            let nanos =
-                ((seconds.fract() * 1_000_000_000.0).round() as i64).clamp(0, 999_999_999) as u32;
+            let (whole_seconds, nanos) =
+                parse_epoch_seconds(value).with_context(|| format!("parsing datetime cell at index {}", index))?;
             Ok(DateTime::<Utc>::from_timestamp(whole_seconds, nanos))
         }
-        Some(BqValue::Null) | None | Some(BqValue::String(_)) => Ok(None),
+        None | Some(BqValue::Null | BqValue::String(_)) => Ok(None),
         other => anyhow::bail!("unexpected datetime cell at index {}: {:?}", index, other),
     }
 }
 
-pub(super) fn anyvalue_to_owned_string(value: &AnyValue) -> Result<String> {
-    Ok(match value {
+pub(super) fn anyvalue_to_owned_string(value: &AnyValue) -> String {
+    match value {
         AnyValue::String(value) => value.to_string(),
         AnyValue::StringOwned(value) => value.to_string(),
         AnyValue::Date(value) => date_to_string(*value),
@@ -170,15 +160,15 @@ pub(super) fn anyvalue_to_owned_string(value: &AnyValue) -> Result<String> {
         AnyValue::Float32(value) => value.to_string(),
         AnyValue::Decimal(value, _) => value.to_string(),
         other => other.to_string(),
-    })
+    }
 }
 
 pub(super) fn anyvalue_to_i64(value: &AnyValue) -> Result<i64> {
     match value {
         AnyValue::Int64(value) => Ok(*value),
-        AnyValue::Int32(value) => Ok(*value as i64),
-        AnyValue::UInt64(value) => Ok(*value as i64),
-        AnyValue::UInt32(value) => Ok(*value as i64),
+        AnyValue::Int32(value) => Ok(i64::from(*value)),
+        AnyValue::UInt64(value) => i64::try_from(*value).context("uint64 value outside int64 range"),
+        AnyValue::UInt32(value) => Ok(i64::from(*value)),
         AnyValue::String(value) => value
             .parse::<i64>()
             .with_context(|| format!("parsing int64 value {}", value)),
@@ -194,8 +184,8 @@ pub(super) fn anyvalue_to_f64(value: &AnyValue) -> Result<f64> {
     match value {
         AnyValue::Float64(value) => Ok(*value),
         AnyValue::Float32(value) => Ok(f64::from(*value)),
-        AnyValue::Int64(value) => Ok(*value as f64),
-        AnyValue::Int32(value) => Ok(*value as f64),
+        AnyValue::Int64(value) => Ok(i64_to_f64(*value)),
+        AnyValue::Int32(value) => Ok(f64::from(*value)),
         AnyValue::String(value) => value
             .parse::<f64>()
             .with_context(|| format!("parsing float value {}", value)),
@@ -247,6 +237,40 @@ pub(super) fn anyvalue_to_date_days(value: &AnyValue) -> Result<i32> {
         AnyValue::StringOwned(value) => date_string_to_days(&value.to_string()),
         other => anyhow::bail!("unsupported date value {:?}", other),
     }
+}
+
+fn i64_to_f64(value: i64) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0)
+}
+
+fn parse_epoch_seconds(value: &str) -> Result<(i64, u32)> {
+    let trimmed = value.trim();
+    let negative = trimmed.starts_with('-');
+    let unsigned = trimmed.strip_prefix('-').unwrap_or(trimmed);
+    let (whole_str, frac_str) = unsigned.split_once('.').map_or((unsigned, ""), |parts| parts);
+    let mut whole_seconds = whole_str
+        .parse::<i64>()
+        .with_context(|| format!("parsing epoch seconds {}", value))?;
+    let frac_digits = &frac_str[..frac_str.len().min(9)];
+    let mut nanos_str = frac_digits.to_string();
+    while nanos_str.len() < 9 {
+        nanos_str.push('0');
+    }
+    let nanos = if nanos_str.is_empty() {
+        0
+    } else {
+        nanos_str
+            .parse::<u32>()
+            .with_context(|| format!("parsing epoch fraction {}", value))?
+    };
+    if negative && nanos > 0 {
+        whole_seconds = -whole_seconds - 1;
+        return Ok((whole_seconds, 1_000_000_000 - nanos));
+    }
+    if negative {
+        whole_seconds = -whole_seconds;
+    }
+    Ok((whole_seconds, nanos))
 }
 
 pub(super) fn date_string_to_days(value: &str) -> Result<i32> {

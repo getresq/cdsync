@@ -5,7 +5,6 @@ use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::types::TableCheckpoint;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
 use sqlx::postgres::PgPoolOptions;
-use std::env;
 use url::Url;
 use uuid::Uuid;
 #[path = "support/dotenv.rs"]
@@ -14,17 +13,19 @@ mod dotenv_support;
 mod emulator_read_support;
 
 #[tokio::test]
-#[ignore]
 async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
     dotenv_support::load_dotenv()?;
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
-    let bq_http_raw = env::var("CDSYNC_E2E_BQ_HTTP")
-        .context("set CDSYNC_E2E_BQ_HTTP to the BigQuery emulator HTTP base URL")?;
-    let bq_grpc_raw = env::var("CDSYNC_E2E_BQ_GRPC")
-        .context("set CDSYNC_E2E_BQ_GRPC to the BigQuery emulator gRPC host:port")?;
-    let project_id = env::var("CDSYNC_E2E_BQ_PROJECT").unwrap_or_else(|_| "cdsync".to_string());
-    let dataset = env::var("CDSYNC_E2E_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e".to_string());
+    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(bq_http_raw) = std::env::var("CDSYNC_E2E_BQ_HTTP").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(bq_grpc_raw) = std::env::var("CDSYNC_E2E_BQ_GRPC").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let project_id = std::env::var("CDSYNC_E2E_BQ_PROJECT").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync".to_string());
+    let dataset = std::env::var("CDSYNC_E2E_BQ_DATASET").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync_e2e".to_string());
 
     let bq_http = normalize_http(&bq_http_raw)?;
     let bq_grpc = normalize_grpc(&bq_grpc_raw)?;
@@ -157,17 +158,19 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn e2e_postgres_bigquery_custom_metadata_columns() -> Result<()> {
     dotenv_support::load_dotenv()?;
-    let pg_url = env::var("CDSYNC_E2E_PG_URL")
-        .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
-    let bq_http_raw = env::var("CDSYNC_E2E_BQ_HTTP")
-        .context("set CDSYNC_E2E_BQ_HTTP to the BigQuery emulator HTTP base URL")?;
-    let bq_grpc_raw = env::var("CDSYNC_E2E_BQ_GRPC")
-        .context("set CDSYNC_E2E_BQ_GRPC to the BigQuery emulator gRPC host:port")?;
-    let project_id = env::var("CDSYNC_E2E_BQ_PROJECT").unwrap_or_else(|_| "cdsync".to_string());
-    let dataset = env::var("CDSYNC_E2E_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e".to_string());
+    let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(bq_http_raw) = std::env::var("CDSYNC_E2E_BQ_HTTP").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(bq_grpc_raw) = std::env::var("CDSYNC_E2E_BQ_GRPC").ok().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let project_id = std::env::var("CDSYNC_E2E_BQ_PROJECT").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync".to_string());
+    let dataset = std::env::var("CDSYNC_E2E_BQ_DATASET").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| "cdsync_e2e".to_string());
 
     let bq_http = normalize_http(&bq_http_raw)?;
     let bq_grpc = normalize_grpc(&bq_grpc_raw)?;

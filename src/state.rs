@@ -104,7 +104,7 @@ impl SyncStateStore {
                 last_sync_status: row.try_get("last_sync_status")?,
                 last_error: row.try_get("last_error")?,
             };
-            latest_updated_at = max_updated_at(latest_updated_at, updated_at_ms);
+            latest_updated_at = Some(max_updated_at(latest_updated_at, updated_at_ms));
             connections.insert(connection_id, connection_state);
         }
 
@@ -415,7 +415,7 @@ impl SyncStateStore {
 
     async fn try_acquire_lock(&self, connection_id: &str, owner_id: &str) -> anyhow::Result<()> {
         let now = now_millis();
-        let stale_before = now - self.lock_ttl.as_millis() as i64;
+        let stale_before = now - saturating_u128_to_i64(self.lock_ttl.as_millis());
         let row = sqlx::query(&format!(
             r#"
             insert into {} (

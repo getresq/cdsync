@@ -18,7 +18,7 @@ impl PostgresSource {
             where c.oid = $1
             "#,
         )
-        .bind(table_id.into_inner() as i32)
+        .bind(table_id.into_inner().cast_signed())
         .fetch_one(&self.pool)
         .await?;
         let schema_name: String = row.try_get("schema_name")?;
@@ -42,7 +42,7 @@ impl PostgresSource {
             order by a.attnum
             "#,
         )
-        .bind(table_id.into_inner() as i32)
+        .bind(table_id.into_inner().cast_signed())
         .fetch_all(&self.pool)
         .await?;
 
@@ -53,7 +53,7 @@ impl PostgresSource {
             let type_modifier: i32 = row.try_get("type_modifier")?;
             let not_null: bool = row.try_get("not_null")?;
             let is_primary: bool = row.try_get("is_primary")?;
-            let typ = etl_postgres::types::convert_type_oid_to_type(type_oid as u32);
+            let typ = etl_postgres::types::convert_type_oid_to_type(type_oid.cast_unsigned());
             column_schemas.push(etl_postgres::types::ColumnSchema::new(
                 name,
                 typ,

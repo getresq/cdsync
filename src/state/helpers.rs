@@ -18,12 +18,14 @@ pub(super) fn quote_ident(value: &str) -> String {
 }
 
 pub(super) fn cdc_batch_load_job_record_from_row(
-    row: PgRow,
+    row: &PgRow,
 ) -> anyhow::Result<CdcBatchLoadJobRecord> {
+    let first_sequence = row.try_get::<i64, _>("first_sequence")?;
     Ok(CdcBatchLoadJobRecord {
         job_id: row.try_get("job_id")?,
         table_key: row.try_get("table_key")?,
-        first_sequence: row.try_get::<i64, _>("first_sequence")? as u64,
+        first_sequence: u64::try_from(first_sequence)
+            .context("cdc batch-load job first_sequence must be non-negative")?,
         status: CdcBatchLoadJobStatus::from_str(&row.try_get::<String, _>("status")?)?,
         payload_json: row.try_get("payload_json")?,
         attempt_count: row.try_get("attempt_count")?,
@@ -114,9 +116,18 @@ pub(super) fn datetime_from_millis(value: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(value)
 }
 
-pub(super) fn max_updated_at(current: Option<i64>, next: i64) -> Option<i64> {
-    match current {
-        Some(current) => Some(current.max(next)),
-        None => Some(next),
-    }
+pub(super) fn max_updated_at(current: Option<i64>, next: i64) -> i64 {
+    current.map_or(next, |current_value| current_value.max(next))
+}
+
+pub(super) fn saturating_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+pub(super) fn saturating_u128_to_i64(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+pub(super) fn saturating_usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }

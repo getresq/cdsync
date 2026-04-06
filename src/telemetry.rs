@@ -215,13 +215,15 @@ pub fn record_cdc_pipeline_depths(
 }
 
 pub fn record_cdc_backpressure_wait(slot_name: &str, queue_depth: u64, queue_capacity: u64) {
+    let queue_depth = i64::try_from(queue_depth).unwrap_or(i64::MAX);
+    let queue_capacity = i64::try_from(queue_capacity).unwrap_or(i64::MAX);
     let metrics = metrics();
     metrics.cdc_backpressure_waits_total.add(
         1,
         &[
             KeyValue::new("slot_name", slot_name.to_string()),
-            KeyValue::new("queue_depth", queue_depth as i64),
-            KeyValue::new("queue_capacity", queue_capacity as i64),
+            KeyValue::new("queue_depth", queue_depth),
+            KeyValue::new("queue_capacity", queue_capacity),
         ],
     );
 }
@@ -277,7 +279,7 @@ pub fn record_cdc_batch_load_stage_duration(
         KeyValue::new("connection_id", connection_id.to_string()),
         KeyValue::new("table", table.to_string()),
         KeyValue::new("stage", stage.to_string()),
-        KeyValue::new("rows", rows as i64),
+        KeyValue::new("rows", i64::try_from(rows).unwrap_or(i64::MAX)),
     ];
     if duration_ms.is_finite() && duration_ms >= 0.0 {
         metrics

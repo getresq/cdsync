@@ -40,9 +40,8 @@ impl BigQueryDestination {
             .batch_load_bucket
             .as_deref()
             .context("missing bigquery.batch_load_bucket")?;
-        let token_source = match &self.gcs_token_source {
-            Some(token_source) => token_source,
-            None => anyhow::bail!("GCS batch load requested but token source is unavailable"),
+        let Some(token_source) = &self.gcs_token_source else {
+            anyhow::bail!("GCS batch load requested but token source is unavailable");
         };
 
         let schema = with_metadata_schema(schema, &self.metadata);
@@ -248,7 +247,6 @@ pub(super) async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> 
         .map_err(|err| anyhow::anyhow!("failed to join batch-load parquet task: {}", err))?
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_load_job(
     project_id: &str,
     dataset_id: &str,
@@ -415,7 +413,7 @@ fn collect_parquet_string_values(series: &Series) -> Result<Vec<Option<String>>>
             if matches!(value, AnyValue::Null) {
                 Ok(None)
             } else {
-                anyvalue_to_owned_string(&value).map(Some)
+                Ok(Some(anyvalue_to_owned_string(&value)))
             }
         })
         .collect()

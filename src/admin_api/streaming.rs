@@ -249,28 +249,32 @@ fn build_connection_throughput_event(
     if let Some((previous_at, previous_snapshot)) = previous_run_snapshot.as_ref()
         && previous_snapshot.run_id == live_snapshot.run_id
     {
-        let elapsed_ms = (now - *previous_at).num_milliseconds().max(1) as f64;
+        let elapsed_ms = i64_to_f64((now - *previous_at).num_milliseconds().max(1));
         let elapsed_seconds = elapsed_ms / 1000.0;
         event.rows_read_per_sec = Some(
-            ((live_snapshot.rows_read - previous_snapshot.rows_read).max(0) as f64)
+            i64_to_f64((live_snapshot.rows_read - previous_snapshot.rows_read).max(0))
                 / elapsed_seconds,
         );
         event.rows_written_per_sec = Some(
-            ((live_snapshot.rows_written - previous_snapshot.rows_written).max(0) as f64)
+            i64_to_f64((live_snapshot.rows_written - previous_snapshot.rows_written).max(0))
                 / elapsed_seconds,
         );
         event.rows_deleted_per_sec = Some(
-            ((live_snapshot.rows_deleted - previous_snapshot.rows_deleted).max(0) as f64)
+            i64_to_f64((live_snapshot.rows_deleted - previous_snapshot.rows_deleted).max(0))
                 / elapsed_seconds,
         );
         event.rows_upserted_per_sec = Some(
-            ((live_snapshot.rows_upserted - previous_snapshot.rows_upserted).max(0) as f64)
+            i64_to_f64((live_snapshot.rows_upserted - previous_snapshot.rows_upserted).max(0))
                 / elapsed_seconds,
         );
     }
 
     *previous_run_snapshot = Some((now, live_snapshot.clone()));
     event
+}
+
+fn i64_to_f64(value: i64) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
 pub(super) fn select_active_tables(tables: &[TableProgress]) -> Vec<TableProgress> {

@@ -223,6 +223,9 @@ impl PostgresSource {
             info!("dry-run: skipping CDC sync");
             return Ok(());
         }
+        let connection_label = state_handle
+            .as_ref()
+            .map_or("postgres", StateHandle::connection_id);
 
         if !self.cdc_enabled() {
             anyhow::bail!("CDC is disabled for Postgres source");
@@ -415,10 +418,7 @@ impl PostgresSource {
         .await?;
 
         let slot_name = cdc_slot_name(
-            state_handle
-                .as_ref()
-                .map(|handle| handle.connection_id())
-                .unwrap_or("postgres"),
+            connection_label,
             pipeline_id,
         )?;
 
@@ -434,10 +434,7 @@ impl PostgresSource {
             initial_snapshot_table_ids(&table_ids, state, last_lsn.as_deref());
         let snapshot_progress_tables = snapshot_progress_table_ids(&table_ids, state);
         info!(
-            connection = %state_handle
-                .as_ref()
-                .map(|handle| handle.connection_id())
-                .unwrap_or("postgres"),
+            connection = %connection_label,
             include_table_count = include_tables.len(),
             resync_table_count = resync_tables.len(),
             manual_resync_table_count = manual_resync_table_names.len(),
@@ -493,10 +490,7 @@ impl PostgresSource {
             needs_snapshot = true;
         }
         info!(
-            connection = %state_handle
-                .as_ref()
-                .map(|handle| handle.connection_id())
-                .unwrap_or("postgres"),
+            connection = %connection_label,
             mode = ?mode,
             needs_snapshot,
             has_snapshot_progress,
@@ -517,10 +511,7 @@ impl PostgresSource {
                 preserve_existing_backlog,
             );
             info!(
-                connection = %state_handle
-                    .as_ref()
-                    .map(|handle| handle.connection_id())
-                    .unwrap_or("postgres"),
+                connection = %connection_label,
                 snapshot_table_count = snapshot_table_ids.len(),
                 snapshot_table_names = ?snapshot_table_ids
                     .iter()
@@ -579,7 +570,7 @@ impl PostgresSource {
                     if let Some(snapshot) = table_snapshots.get(table_id) {
                         entry.schema_snapshot = Some(snapshot.clone());
                     }
-                    entry.schema_primary_key = info.schema.primary_key.clone();
+                    entry.schema_primary_key.clone_from(&info.schema.primary_key);
                     let write_plan = snapshot_table_write_plan(
                         mode,
                         resume_snapshot_run,
@@ -782,10 +773,7 @@ impl PostgresSource {
                     state.postgres.insert(table_name.clone(), checkpoint);
                 }
                 info!(
-                    connection = %state_handle
-                        .as_ref()
-                        .map(|handle| handle.connection_id())
-                        .unwrap_or("postgres"),
+                    connection = %connection_label,
                     snapshot_table_count = snapshot_checkpoint_states.len(),
                     "shutdown requested during CDC snapshot; preserving resumable snapshot progress"
                 );
@@ -830,10 +818,7 @@ impl PostgresSource {
             }
         } else {
             info!(
-                connection = %state_handle
-                    .as_ref()
-                    .map(|handle| handle.connection_id())
-                    .unwrap_or("postgres"),
+                connection = %connection_label,
                 last_lsn = last_lsn.as_deref().unwrap_or("<none>"),
                 "skipping CDC snapshot planning because snapshot is not needed"
             );
@@ -976,7 +961,7 @@ impl PostgresSource {
             .fetch_optional(&self.pool)
             .await?;
             let oid = oid.context(format!("table {} not found", table.name))?;
-            table_ids.insert(TableId::new(oid as u32), table.clone());
+            table_ids.insert(TableId::new(oid.cast_unsigned()), table.clone());
         }
         Ok(table_ids)
     }
