@@ -869,8 +869,7 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state()
--> anyhow::Result<()> {
+async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state() -> anyhow::Result<()> {
     let mut cfg = test_config();
     let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source;
     pg.cdc = Some(false);
