@@ -137,45 +137,43 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Full,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1000,
-            retry_backoff_ms: 1_000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Full,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     sqlx::query(&format!("delete from {} where id = 1", qualified_table))
         .execute(&pool)
         .await?;
 
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Incremental,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1000,
-            retry_backoff_ms: 1_000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Incremental,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     let fields = emulator_read_support::fetch_table_fields(
         &http_client,

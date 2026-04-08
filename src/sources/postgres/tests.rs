@@ -977,11 +977,37 @@ fn snapshot_task_failure_disposition_retries_bigquery_dml_quota_errors() {
 }
 
 #[test]
-fn snapshot_task_failure_disposition_blocks_non_quota_errors() {
+fn snapshot_task_failure_disposition_retries_transient_transport_errors() {
+    let err = anyhow::anyhow!("pending bigquery future timed out after 120s");
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_blocks_permanent_schema_and_publication_errors() {
+    let schema_err = anyhow::anyhow!(
+        "schema change detected for public.accounts; trigger a manual table resync"
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&schema_err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+    );
+
+    let publication_err = anyhow::anyhow!("publication cdsync_app_pub does not exist");
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&publication_err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_retries_other_snapshot_copy_failures() {
     let err = anyhow::anyhow!("invalid field mapping for BigQuery merge");
     assert_eq!(
         super::cdc_sync::snapshot_task_failure_disposition(&err),
-        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
     );
 }
 
@@ -1073,6 +1099,12 @@ fn should_clear_snapshot_runtime_only_after_table_fully_drains() {
     assert!(super::cdc_sync::should_clear_snapshot_runtime_on_success(
         false, 0, false
     ));
+}
+
+#[test]
+fn snapshot_retry_is_suppressed_once_table_is_blocked() {
+    assert!(super::cdc_sync::should_suppress_snapshot_retry_for_blocked_table(true));
+    assert!(!super::cdc_sync::should_suppress_snapshot_retry_for_blocked_table(false));
 }
 
 #[test]

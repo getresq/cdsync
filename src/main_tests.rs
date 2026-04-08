@@ -73,8 +73,8 @@ mod retry_policy_tests {
             "Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table, pending + running"
         );
         assert_eq!(
-            crate::commands::classify_sync_retry(&err),
-            crate::commands::SyncRetryClass::Backpressure
+            crate::retry::classify_sync_retry(&err),
+            crate::retry::SyncRetryClass::Backpressure
         );
     }
 
@@ -84,14 +84,14 @@ mod retry_policy_tests {
             "schema change detected for public.accounts; trigger a manual table resync"
         );
         assert_eq!(
-            crate::commands::classify_sync_retry(&schema_err),
-            crate::commands::SyncRetryClass::Permanent
+            crate::retry::classify_sync_retry(&schema_err),
+            crate::retry::SyncRetryClass::Permanent
         );
 
         let publication_err = anyhow::anyhow!("publication cdsync_app_pub does not exist");
         assert_eq!(
-            crate::commands::classify_sync_retry(&publication_err),
-            crate::commands::SyncRetryClass::Permanent
+            crate::retry::classify_sync_retry(&publication_err),
+            crate::retry::SyncRetryClass::Permanent
         );
     }
 
@@ -99,25 +99,25 @@ mod retry_policy_tests {
     fn classify_sync_retry_defaults_other_errors_to_transient() {
         let err = anyhow::anyhow!("connection reset by peer");
         assert_eq!(
-            crate::commands::classify_sync_retry(&err),
-            crate::commands::SyncRetryClass::Transient
+            crate::retry::classify_sync_retry(&err),
+            crate::retry::SyncRetryClass::Transient
         );
     }
 
     #[test]
     fn compute_sync_retry_backoff_uses_floor_and_cap_without_wrapping() {
-        let first = crate::commands::compute_sync_retry_backoff("app:postgres_cdc", 1, 1_000);
+        let first = crate::retry::compute_sync_retry_backoff("app:postgres_cdc", 1, 1_000);
         assert!(first >= Duration::from_secs(16));
         assert!(first <= Duration::from_secs(16) * 64 / 50);
 
-        let later = crate::commands::compute_sync_retry_backoff("app:postgres_cdc", 30, 1_000);
+        let later = crate::retry::compute_sync_retry_backoff("app:postgres_cdc", 30, 1_000);
         assert!(later <= Duration::from_secs(1024));
         assert!(later >= Duration::from_secs(16));
     }
 
     #[test]
     fn compute_sync_retry_backoff_honors_higher_configured_floor() {
-        let backoff = crate::commands::compute_sync_retry_backoff(
+        let backoff = crate::retry::compute_sync_retry_backoff(
             "app:postgres_table:public.accounts",
             1,
             30_000,
@@ -461,7 +461,7 @@ connections:
 "#;
         fs::write(&config_path, raw).await?;
 
-        let result = cmd_run(RunCommandRequest {
+        let result = Box::pin(cmd_run(RunCommandRequest {
             config_path: config_path.clone(),
             connection_filter: None,
             once: false,
@@ -471,7 +471,7 @@ connections:
             schema_diff_enabled: false,
             follow: false,
             shutdown: None,
-        })
+        }))
         .await;
 
         let _ = fs::remove_file(&config_path).await;

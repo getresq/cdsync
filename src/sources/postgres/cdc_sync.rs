@@ -41,13 +41,11 @@ pub(super) fn snapshot_task_retry_backoff(attempts: u32, retry_backoff_ms: u64) 
 pub(super) fn snapshot_task_failure_disposition(
     error: &anyhow::Error,
 ) -> SnapshotTaskFailureDisposition {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("exceeded quota for total number of dml jobs writing to a table")
-        || message.contains("quota exceeded") && message.contains("dml jobs writing to a table")
-    {
-        SnapshotTaskFailureDisposition::Retry
-    } else {
-        SnapshotTaskFailureDisposition::Block
+    match crate::retry::classify_sync_retry(error) {
+        crate::retry::SyncRetryClass::Permanent => SnapshotTaskFailureDisposition::Block,
+        crate::retry::SyncRetryClass::Backpressure | crate::retry::SyncRetryClass::Transient => {
+            SnapshotTaskFailureDisposition::Retry
+        }
     }
 }
 
@@ -93,6 +91,10 @@ pub(super) fn should_clear_snapshot_runtime_on_success(
     is_blocked: bool,
 ) -> bool {
     !has_pending_tasks && active_task_count == 0 && !is_blocked
+}
+
+pub(super) fn should_suppress_snapshot_retry_for_blocked_table(is_blocked: bool) -> bool {
+    is_blocked
 }
 
 async fn clear_snapshot_task_runtime_state(
@@ -163,6 +165,373 @@ async fn wait_snapshot_task_backoff(duration: Duration, shutdown: Option<Shutdow
         tokio::time::sleep(duration).await;
         false
     }
+}
+
+struct SnapshotPhaseResult {
+    completed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cdc_snapshot_phase(
+    source: &PostgresSource,
+    connection_label: &str,
+    snapshot_tasks_to_run: Vec<CdcSnapshotTask>,
+    snapshot_checkpoint_states: HashMap<String, Arc<Mutex<TableCheckpoint>>>,
+    manual_resync_table_names: &HashSet<String>,
+    snapshot_name: Option<String>,
+    mut slot_guard: Option<ExportedSnapshotSlot>,
+    snapshot_slot_name: String,
+    preserve_existing_backlog: bool,
+    dest: &crate::destinations::bigquery::BigQueryDestination,
+    batch_size: usize,
+    snapshot_concurrency: usize,
+    retry_backoff_ms: u64,
+    stats: Option<StatsHandle>,
+    state_handle: Option<StateHandle>,
+    shutdown: Option<ShutdownSignal>,
+    follow: bool,
+) -> Result<SnapshotPhaseResult> {
+    let mut snapshot_task_queues: BTreeMap<String, VecDeque<SnapshotTaskQueueEntry>> =
+        BTreeMap::new();
+    let mut blocked_tables: BTreeMap<String, String> = BTreeMap::new();
+    for snapshot_task in snapshot_tasks_to_run {
+        let runtime = {
+            let checkpoint = snapshot_task.checkpoint_state.lock().await;
+            checkpoint.runtime.clone()
+        };
+        let manual_resync_requested =
+            manual_resync_table_names.contains(&snapshot_task.info.source_name);
+        match snapshot_task_queue_seed(runtime.as_ref(), manual_resync_requested) {
+            SnapshotTaskQueueSeed::Runnable { next_retry_at } => {
+                snapshot_task_queues
+                    .entry(snapshot_task.info.source_name.clone())
+                    .or_default()
+                    .push_back(SnapshotTaskQueueEntry {
+                        task: snapshot_task,
+                        next_retry_at,
+                    });
+            }
+            SnapshotTaskQueueSeed::Blocked { last_error } => {
+                blocked_tables.insert(
+                    snapshot_task.info.source_name.clone(),
+                    last_error.unwrap_or_else(|| "snapshot blocked".to_string()),
+                );
+            }
+        }
+    }
+
+    let mut active_serialized_tables = HashSet::new();
+    let mut active_task_counts: HashMap<String, usize> = HashMap::new();
+    let mut snapshot_tasks = FuturesUnordered::new();
+
+    let snapshot_result: Result<()> = loop {
+        let mut earliest_retry_at: Option<DateTime<Utc>> = None;
+        while snapshot_tasks.len() < snapshot_concurrency {
+            let mut selected_table_name: Option<String> = None;
+            let now = Utc::now();
+            for (table_name, queue) in &snapshot_task_queues {
+                let Some(entry) = queue.front() else {
+                    continue;
+                };
+                if snapshot_task_requires_table_serialization(entry.task.write_mode)
+                    && active_serialized_tables.contains(table_name)
+                {
+                    continue;
+                }
+                if let Some(next_retry_at) = entry.next_retry_at
+                    && next_retry_at > now
+                {
+                    earliest_retry_at = Some(match earliest_retry_at {
+                        Some(current) => current.min(next_retry_at),
+                        None => next_retry_at,
+                    });
+                    continue;
+                }
+                selected_table_name = Some(table_name.clone());
+                break;
+            }
+
+            let Some(table_name) = selected_table_name else {
+                break;
+            };
+            let entry = snapshot_task_queues
+                .get_mut(&table_name)
+                .and_then(VecDeque::pop_front)
+                .context("missing queued snapshot task for selected table")?;
+            if snapshot_task_requires_table_serialization(entry.task.write_mode) {
+                active_serialized_tables.insert(table_name.clone());
+            }
+            *active_task_counts.entry(table_name.clone()).or_default() += 1;
+            let task_snapshot_name = snapshot_name.clone();
+            let task_shutdown = shutdown.clone();
+            let task_stats = stats.clone();
+            let apply_dest = dest.clone();
+            snapshot_tasks.push(async move {
+                let SnapshotTaskQueueEntry {
+                    task: snapshot_task,
+                    next_retry_at,
+                } = entry;
+                info!(
+                    table = %snapshot_task.info.source_name,
+                    snapshot_name = task_snapshot_name.as_deref().unwrap_or("resume"),
+                    batch_size,
+                    snapshot_concurrency,
+                    chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
+                    chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
+                    write_mode = match snapshot_task.write_mode {
+                        WriteMode::Append => "append",
+                        WriteMode::Upsert => "upsert",
+                    },
+                    "starting exported CDC snapshot copy"
+                );
+                let result = source
+                    .run_snapshot_copy_with_exported_snapshot(
+                        &snapshot_task.table,
+                        &snapshot_task.info.schema,
+                        snapshot_task.chunk,
+                        SnapshotCopyContext {
+                            dest: &apply_dest,
+                            snapshot_name: task_snapshot_name.as_deref(),
+                            batch_size,
+                            stats: task_stats,
+                            checkpoint_state: snapshot_task.checkpoint_state.clone(),
+                            resume_from_primary_key: snapshot_task.resume_from_primary_key.clone(),
+                            write_mode: snapshot_task.write_mode,
+                            state_handle: snapshot_task.state_handle.clone(),
+                            shutdown: task_shutdown,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "copying exported snapshot for {}",
+                            snapshot_task.info.source_name
+                        )
+                    });
+                (
+                    table_name,
+                    SnapshotTaskQueueEntry {
+                        task: snapshot_task,
+                        next_retry_at,
+                    },
+                    result,
+                )
+            });
+        }
+
+        if snapshot_tasks.is_empty() {
+            let has_pending_tasks = snapshot_task_queues.values().any(|queue| !queue.is_empty());
+            if !has_pending_tasks {
+                if blocked_tables.is_empty() {
+                    break Ok(());
+                }
+                if follow {
+                    warn!(
+                        connection = %connection_label,
+                        blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
+                        "snapshot drained runnable tables and is now waiting on blocked tables"
+                    );
+                    if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone()).await {
+                        break Ok(());
+                    }
+                    continue;
+                }
+                break Err(anyhow::anyhow!(
+                    "snapshot blocked for table(s): {}",
+                    blocked_tables
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if let Some(next_retry_at) = earliest_retry_at {
+                let now = Utc::now();
+                let wait = (next_retry_at - now)
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_millis(0));
+                if wait_snapshot_task_backoff(wait, shutdown.clone()).await {
+                    break Ok(());
+                }
+                continue;
+            }
+            if blocked_tables.is_empty() {
+                break Ok(());
+            }
+            if follow {
+                warn!(
+                    connection = %connection_label,
+                    blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
+                    "snapshot has only blocked tables remaining and is waiting for operator action"
+                );
+                if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone()).await {
+                    break Ok(());
+                }
+                continue;
+            }
+            break Err(anyhow::anyhow!(
+                "snapshot blocked for table(s): {}",
+                blocked_tables
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let (table_name, mut entry, result) = snapshot_tasks
+            .next()
+            .await
+            .context("snapshot task scheduler stopped unexpectedly")?;
+        if snapshot_task_requires_table_serialization(entry.task.write_mode) {
+            active_serialized_tables.remove(&table_name);
+        }
+        let active_task_count = match active_task_counts.get_mut(&table_name) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                let remaining = *count;
+                if remaining == 0 {
+                    active_task_counts.remove(&table_name);
+                }
+                remaining
+            }
+            None => 0,
+        };
+        match result {
+            Ok(()) => {
+                let has_pending_tasks = snapshot_task_queues
+                    .get(&table_name)
+                    .is_some_and(|queue| !queue.is_empty());
+                let is_blocked = blocked_tables.contains_key(&table_name);
+                if should_clear_snapshot_runtime_on_success(
+                    has_pending_tasks,
+                    active_task_count,
+                    is_blocked,
+                ) {
+                    clear_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                    )
+                    .await?;
+                    blocked_tables.remove(&table_name);
+                }
+                if snapshot_task_queues
+                    .get(&table_name)
+                    .is_some_and(VecDeque::is_empty)
+                {
+                    snapshot_task_queues.remove(&table_name);
+                }
+            }
+            Err(err) => match snapshot_task_failure_disposition(&err) {
+                SnapshotTaskFailureDisposition::Retry => {
+                    if should_suppress_snapshot_retry_for_blocked_table(
+                        blocked_tables.contains_key(&table_name),
+                    ) {
+                        warn!(
+                            connection = %connection_label,
+                            table = %table_name,
+                            error = %format!("{err:#}"),
+                            "snapshot task failed retryably after table was already blocked; preserving blocked state"
+                        );
+                        continue;
+                    }
+                    let attempts = next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
+                    let backoff = snapshot_task_retry_backoff(attempts, retry_backoff_ms);
+                    let next_retry_at = Utc::now()
+                        + chrono::Duration::from_std(backoff)
+                            .context("invalid snapshot retry backoff duration")?;
+                    let _runtime = set_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                        TableRuntimeStatus::Retrying,
+                        attempts,
+                        &err,
+                        Some(next_retry_at),
+                    )
+                    .await?;
+                    warn!(
+                        connection = %connection_label,
+                        table = %table_name,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %format!("{err:#}"),
+                        "snapshot task failed; scheduling table-local retry"
+                    );
+                    entry.next_retry_at = Some(next_retry_at);
+                    snapshot_task_queues
+                        .entry(table_name)
+                        .or_default()
+                        .push_front(entry);
+                }
+                SnapshotTaskFailureDisposition::Block => {
+                    let attempts = next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
+                    let runtime = set_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                        TableRuntimeStatus::Blocked,
+                        attempts,
+                        &err,
+                        None,
+                    )
+                    .await?;
+                    warn!(
+                        connection = %connection_label,
+                        table = %table_name,
+                        attempts = runtime.attempts,
+                        error = %format!("{err:#}"),
+                        "snapshot task blocked; preserving table-local state and continuing other tables"
+                    );
+                    blocked_tables.insert(table_name.clone(), format!("{err:#}"));
+                    snapshot_task_queues.remove(&table_name);
+                }
+            },
+        }
+    };
+
+    let snapshot_completed = cdc_snapshot_completed(snapshot_result.is_ok(), shutdown.as_ref());
+    if let Some(slot_guard) = slot_guard.take() {
+        release_exported_snapshot_slot(slot_guard, snapshot_completed).await?;
+    }
+    if preserve_existing_backlog {
+        let client =
+            PgReplicationClient::connect(source.build_pg_connection_config().await?).await?;
+        if let Err(err) = client.delete_slot(&snapshot_slot_name).await
+            && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
+        {
+            return Err(err.into());
+        }
+    }
+    snapshot_result?;
+    if !snapshot_completed {
+        return Ok(SnapshotPhaseResult { completed: false });
+    }
+
+    let completed_at = Utc::now();
+    for (table_name, checkpoint_state) in snapshot_checkpoint_states {
+        let checkpoint = {
+            let mut checkpoint = checkpoint_state.lock().await;
+            checkpoint.last_synced_at = Some(completed_at);
+            checkpoint.last_primary_key = None;
+            checkpoint.snapshot_start_lsn = None;
+            checkpoint.snapshot_preserve_backlog = false;
+            checkpoint.snapshot_chunks.clear();
+            checkpoint.clone()
+        };
+        if let Some(state_handle) = &state_handle {
+            state_handle
+                .save_postgres_checkpoint(&table_name, &checkpoint)
+                .await?;
+            if manual_resync_table_names.contains(&table_name) {
+                state_handle
+                    .clear_postgres_table_resync_request(&table_name)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(SnapshotPhaseResult { completed: true })
 }
 
 pub(super) fn checkpoint_has_material_sync_progress(checkpoint: &TableCheckpoint) -> bool {
@@ -711,6 +1080,7 @@ impl PostgresSource {
                     .get(table_id)
                     .cloned()
                     .context("missing table config for CDC snapshot")?;
+                let manual_resync_requested = manual_resync_table_names.contains(&table.name);
                 let info = table_info_map
                     .get(table_id)
                     .cloned()
@@ -854,316 +1224,35 @@ impl PostgresSource {
                 }
             }
 
-            let mut snapshot_task_queues: BTreeMap<String, VecDeque<SnapshotTaskQueueEntry>> =
-                BTreeMap::new();
-            let mut blocked_tables: BTreeMap<String, String> = BTreeMap::new();
-            for snapshot_task in snapshot_tasks_to_run {
-                let runtime = {
-                    let checkpoint = snapshot_task.checkpoint_state.lock().await;
-                    checkpoint.runtime.clone()
-                };
-                let manual_resync_requested =
-                    manual_resync_table_names.contains(&snapshot_task.info.source_name);
-                match snapshot_task_queue_seed(runtime.as_ref(), manual_resync_requested) {
-                    SnapshotTaskQueueSeed::Runnable { next_retry_at } => {
-                        snapshot_task_queues
-                            .entry(snapshot_task.info.source_name.clone())
-                            .or_default()
-                            .push_back(SnapshotTaskQueueEntry {
-                                task: snapshot_task,
-                                next_retry_at,
-                            });
-                    }
-                    SnapshotTaskQueueSeed::Blocked { last_error } => {
-                        blocked_tables.insert(
-                            snapshot_task.info.source_name.clone(),
-                            last_error.unwrap_or_else(|| "snapshot blocked".to_string()),
-                        );
-                    }
-                }
-            }
-
-            let mut active_serialized_tables = HashSet::new();
-            let mut active_task_counts: HashMap<String, usize> = HashMap::new();
-            let mut snapshot_tasks = FuturesUnordered::new();
-
-            let snapshot_result: Result<()> = loop {
-                let mut earliest_retry_at: Option<DateTime<Utc>> = None;
-                while snapshot_tasks.len() < snapshot_concurrency {
-                    let mut selected_table_name: Option<String> = None;
-                    let now = Utc::now();
-                    for (table_name, queue) in &snapshot_task_queues {
-                        let Some(entry) = queue.front() else {
-                            continue;
-                        };
-                        if snapshot_task_requires_table_serialization(entry.task.write_mode)
-                            && active_serialized_tables.contains(table_name)
-                        {
-                            continue;
-                        }
-                        if let Some(next_retry_at) = entry.next_retry_at
-                            && next_retry_at > now
-                        {
-                            earliest_retry_at = Some(match earliest_retry_at {
-                                Some(current) => current.min(next_retry_at),
-                                None => next_retry_at,
-                            });
-                            continue;
-                        }
-                        selected_table_name = Some(table_name.clone());
-                        break;
-                    }
-
-                    let Some(table_name) = selected_table_name else {
-                        break;
-                    };
-                    let entry = snapshot_task_queues
-                        .get_mut(&table_name)
-                        .and_then(VecDeque::pop_front)
-                        .context("missing queued snapshot task for selected table")?;
-                    if snapshot_task_requires_table_serialization(entry.task.write_mode) {
-                        active_serialized_tables.insert(table_name.clone());
-                    }
-                    *active_task_counts.entry(table_name.clone()).or_default() += 1;
-                    let snapshot_name = snapshot_name.clone();
-                    let task_shutdown = shutdown.clone();
-                    let source = self;
-                    let dest = dest.clone();
-                    let stats = stats.clone();
-                    snapshot_tasks.push(async move {
-                        let SnapshotTaskQueueEntry {
-                            task: snapshot_task,
-                            next_retry_at,
-                        } = entry;
-                        info!(
-                            table = %snapshot_task.info.source_name,
-                            snapshot_name = snapshot_name.as_deref().unwrap_or("resume"),
-                            batch_size,
-                            snapshot_concurrency,
-                            chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
-                            chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
-                            write_mode = match snapshot_task.write_mode {
-                                WriteMode::Append => "append",
-                                WriteMode::Upsert => "upsert",
-                            },
-                            "starting exported CDC snapshot copy"
-                        );
-                        let result = source
-                            .run_snapshot_copy_with_exported_snapshot(
-                                &snapshot_task.table,
-                                &snapshot_task.info.schema,
-                                snapshot_task.chunk,
-                                SnapshotCopyContext {
-                                    dest: &dest,
-                                    snapshot_name: snapshot_name.as_deref(),
-                                    batch_size,
-                                    stats,
-                                    checkpoint_state: snapshot_task.checkpoint_state.clone(),
-                                    resume_from_primary_key: snapshot_task
-                                        .resume_from_primary_key
-                                        .clone(),
-                                    write_mode: snapshot_task.write_mode,
-                                    state_handle: snapshot_task.state_handle.clone(),
-                                    shutdown: task_shutdown,
-                                },
-                            )
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "copying exported snapshot for {}",
-                                    snapshot_task.info.source_name
-                                )
-                            });
-                        (
-                            table_name,
-                            SnapshotTaskQueueEntry {
-                                task: snapshot_task,
-                                next_retry_at,
-                            },
-                            result,
-                        )
-                    });
-                }
-
-                if snapshot_tasks.is_empty() {
-                    let has_pending_tasks =
-                        snapshot_task_queues.values().any(|queue| !queue.is_empty());
-                    if !has_pending_tasks {
-                        if blocked_tables.is_empty() {
-                            break Ok(());
-                        }
-                        if follow {
-                            warn!(
-                                connection = %connection_label,
-                                blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
-                                "snapshot drained runnable tables and is now waiting on blocked tables"
-                            );
-                            if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone())
-                                .await
-                            {
-                                break Ok(());
-                            }
-                            continue;
-                        }
-                        break Err(anyhow::anyhow!(
-                            "snapshot blocked for table(s): {}",
-                            blocked_tables
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ));
-                    }
-                    if let Some(next_retry_at) = earliest_retry_at {
-                        let now = Utc::now();
-                        let wait = (next_retry_at - now)
-                            .to_std()
-                            .unwrap_or_else(|_| Duration::from_millis(0));
-                        if wait_snapshot_task_backoff(wait, shutdown.clone()).await {
-                            break Ok(());
-                        }
-                        continue;
-                    }
-                    if blocked_tables.is_empty() {
-                        break Ok(());
-                    }
-                    if follow {
-                        warn!(
-                            connection = %connection_label,
-                            blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
-                            "snapshot has only blocked tables remaining and is waiting for operator action"
-                        );
-                        if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone())
-                            .await
-                        {
-                            break Ok(());
-                        }
-                        continue;
-                    }
-                    break Err(anyhow::anyhow!(
-                        "snapshot blocked for table(s): {}",
-                        blocked_tables
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-
-                let (table_name, mut entry, result) = snapshot_tasks
-                    .next()
-                    .await
-                    .context("snapshot task scheduler stopped unexpectedly")?;
-                if snapshot_task_requires_table_serialization(entry.task.write_mode) {
-                    active_serialized_tables.remove(&table_name);
-                }
-                let active_task_count = match active_task_counts.get_mut(&table_name) {
-                    Some(count) => {
-                        *count = count.saturating_sub(1);
-                        let remaining = *count;
-                        if remaining == 0 {
-                            active_task_counts.remove(&table_name);
-                        }
-                        remaining as usize
-                    }
-                    None => 0,
-                };
-                match result {
-                    Ok(()) => {
-                        let has_pending_tasks = snapshot_task_queues
-                            .get(&table_name)
-                            .is_some_and(|queue| !queue.is_empty());
-                        let is_blocked = blocked_tables.contains_key(&table_name);
-                        if should_clear_snapshot_runtime_on_success(
-                            has_pending_tasks,
-                            active_task_count,
-                            is_blocked,
-                        ) {
-                            clear_snapshot_task_runtime_state(
-                                &entry.task.checkpoint_state,
-                                &entry.task.table.name,
-                                entry.task.state_handle.as_ref(),
-                            )
-                            .await?;
-                            blocked_tables.remove(&table_name);
-                        }
-                        if snapshot_task_queues
-                            .get(&table_name)
-                            .is_some_and(VecDeque::is_empty)
-                        {
-                            snapshot_task_queues.remove(&table_name);
-                        }
-                    }
-                    Err(err) => match snapshot_task_failure_disposition(&err) {
-                        SnapshotTaskFailureDisposition::Retry => {
-                            let attempts =
-                                next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
-                            let backoff = snapshot_task_retry_backoff(attempts, retry_backoff_ms);
-                            let next_retry_at = Utc::now()
-                                + chrono::Duration::from_std(backoff)
-                                    .context("invalid snapshot retry backoff duration")?;
-                            let _runtime = set_snapshot_task_runtime_state(
-                                &entry.task.checkpoint_state,
-                                &entry.task.table.name,
-                                entry.task.state_handle.as_ref(),
-                                TableRuntimeStatus::Retrying,
-                                attempts,
-                                &err,
-                                Some(next_retry_at),
-                            )
-                            .await?;
-                            warn!(
-                                connection = %connection_label,
-                                table = %table_name,
-                                backoff_ms = backoff.as_millis() as u64,
-                                error = %format!("{err:#}"),
-                                "snapshot task failed; scheduling table-local retry"
-                            );
-                            entry.next_retry_at = Some(next_retry_at);
-                            snapshot_task_queues
-                                .entry(table_name)
-                                .or_default()
-                                .push_front(entry);
-                        }
-                        SnapshotTaskFailureDisposition::Block => {
-                            let attempts =
-                                next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
-                            let runtime = set_snapshot_task_runtime_state(
-                                &entry.task.checkpoint_state,
-                                &entry.task.table.name,
-                                entry.task.state_handle.as_ref(),
-                                TableRuntimeStatus::Blocked,
-                                attempts,
-                                &err,
-                                None,
-                            )
-                            .await?;
-                            warn!(
-                                connection = %connection_label,
-                                table = %table_name,
-                                attempts = runtime.attempts,
-                                error = %format!("{err:#}"),
-                                "snapshot task blocked; preserving table-local state and continuing other tables"
-                            );
-                            blocked_tables.insert(table_name.clone(), format!("{err:#}"));
-                            snapshot_task_queues.remove(&table_name);
-                        }
-                    },
-                }
+            let preferred_start_lsn = if preserve_existing_backlog {
+                None
+            } else {
+                Some(snapshot_start_lsn.parse().map_err(|_| {
+                    anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
+                })?)
             };
-            let snapshot_completed =
-                cdc_snapshot_completed(snapshot_result.is_ok(), shutdown.as_ref());
-            if let Some(slot_guard) = slot_guard {
-                release_exported_snapshot_slot(slot_guard, snapshot_completed).await?;
-            }
-            if preserve_existing_backlog
-                && let Err(err) = replication_client.delete_slot(&snapshot_slot_name).await
-                && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
-            {
-                return Err(err.into());
-            }
-            snapshot_result?;
-            if !snapshot_completed {
+
+            let snapshot_outcome = run_cdc_snapshot_phase(
+                self,
+                connection_label,
+                snapshot_tasks_to_run,
+                snapshot_checkpoint_states.clone(),
+                &manual_resync_table_names,
+                snapshot_name,
+                slot_guard,
+                snapshot_slot_name,
+                preserve_existing_backlog,
+                dest,
+                batch_size,
+                snapshot_concurrency,
+                retry_backoff_ms,
+                stats.clone(),
+                state_handle.clone(),
+                shutdown.clone(),
+                false,
+            )
+            .await?;
+            if !snapshot_outcome.completed {
                 for (table_name, checkpoint_state) in &snapshot_checkpoint_states {
                     let checkpoint = checkpoint_state.lock().await.clone();
                     state.postgres.insert(table_name.clone(), checkpoint);
@@ -1181,36 +1270,12 @@ impl PostgresSource {
                 if let Some(state_handle) = &state_handle {
                     state_handle.save_postgres_cdc_state(cdc_state).await?;
                 }
+                start_lsn = preferred_start_lsn;
+                last_lsn = Some(snapshot_start_lsn.clone());
             }
-            let completed_at = Utc::now();
             for (table_name, checkpoint_state) in snapshot_checkpoint_states {
-                let checkpoint = {
-                    let mut checkpoint = checkpoint_state.lock().await;
-                    checkpoint.last_synced_at = Some(completed_at);
-                    checkpoint.last_primary_key = None;
-                    checkpoint.snapshot_start_lsn = None;
-                    checkpoint.snapshot_preserve_backlog = false;
-                    checkpoint.snapshot_chunks.clear();
-                    checkpoint.clone()
-                };
-                if let Some(state_handle) = &state_handle {
-                    state_handle
-                        .save_postgres_checkpoint(&table_name, &checkpoint)
-                        .await?;
-                    if manual_resync_table_names.contains(&table_name) {
-                        state_handle
-                            .clear_postgres_table_resync_request(&table_name)
-                            .await?;
-                    }
-                }
+                let checkpoint = checkpoint_state.lock().await.clone();
                 state.postgres.insert(table_name, checkpoint);
-            }
-            if !preserve_existing_backlog {
-                let parsed_start_lsn = snapshot_start_lsn.parse().map_err(|_| {
-                    anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
-                })?;
-                start_lsn = Some(parsed_start_lsn);
-                last_lsn = Some(snapshot_start_lsn);
             }
         } else {
             info!(

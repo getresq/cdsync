@@ -83,6 +83,16 @@ impl PostgresSource {
         let new_hash = schema_fingerprint(&info.schema);
         let current_primary_key = info.schema.primary_key.clone();
         let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
+        if let Some(state_handle) = &runtime.state_handle
+            && let Some(latest_checkpoint) = state_handle
+                .load_postgres_checkpoint(&table_cfg.name)
+                .await?
+        {
+            runtime
+                .state
+                .postgres
+                .insert(table_cfg.name.clone(), latest_checkpoint);
+        }
         let entry = runtime
             .state
             .postgres

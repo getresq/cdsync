@@ -158,23 +158,22 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Full,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 200,
-            retry_backoff_ms: 1_000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Full,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 200,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     let initial_dest = dest.summarize_table(&dest_table).await?;
     assert_eq!(initial_dest.row_count, 1000);
@@ -221,23 +220,22 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
 
     let source = PostgresSource::new(pg_config, MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Incremental,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 200,
-            retry_backoff_ms: 1_000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Incremental,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 200,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     let final_source = source.summarize_table(&tables[0]).await?;
     let final_dest = dest.summarize_table(&dest_table).await?;
@@ -430,23 +428,22 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Full,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 200,
-            retry_backoff_ms: 1_000,
-            snapshot_concurrency: 4,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Full,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 200,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 4,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     let state_store = SyncStateStore::open_with_config(&StateConfig {
         url: pg_url.clone(),
