@@ -1,5 +1,7 @@
 use super::*;
-use crate::retry::{SyncRetryClass, classify_sync_retry, compute_sync_retry_backoff};
+use crate::retry::{
+    SyncRetryClass, classify_error_reason, classify_sync_retry, compute_sync_retry_backoff,
+};
 
 pub(crate) fn select_sync_connections<'a>(
     connections: &'a [crate::config::ConnectionConfig],
@@ -225,6 +227,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         let state_handle = state_store.handle(&connection.id);
         connection_state.last_sync_started_at = Some(Utc::now());
         connection_state.last_sync_status = Some("running".to_string());
+        connection_state.last_error_reason = None;
         connection_state.last_error = None;
         state_handle.save_connection_meta(connection_state).await?;
 
@@ -271,6 +274,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         match &result {
             Ok(()) => {
                 connection_state.last_sync_status = Some("success".to_string());
+                connection_state.last_error_reason = None;
                 info!(
                     connection = %connection.id,
                     run_id = run_id.as_deref().unwrap_or("none"),
@@ -279,6 +283,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
             }
             Err(err) => {
                 connection_state.last_sync_status = Some("failed".to_string());
+                connection_state.last_error_reason = Some(classify_error_reason(err));
                 connection_state.last_error = error_string.clone();
                 error!(
                     connection = %connection.id,

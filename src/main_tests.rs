@@ -80,15 +80,19 @@ mod retry_policy_tests {
 
     #[test]
     fn classify_sync_retry_marks_schema_and_publication_errors_permanent() {
-        let schema_err = anyhow::anyhow!(
-            "schema change detected for public.accounts; trigger a manual table resync"
-        );
+        let schema_err =
+            anyhow::Error::new(crate::retry::CdcSyncPolicyError::SchemaChangeDetected {
+                table: "public.accounts".to_string(),
+            });
         assert_eq!(
             crate::retry::classify_sync_retry(&schema_err),
             crate::retry::SyncRetryClass::Permanent
         );
 
-        let publication_err = anyhow::anyhow!("publication cdsync_app_pub does not exist");
+        let publication_err =
+            anyhow::Error::new(crate::retry::CdcSyncPolicyError::PublicationMissing {
+                publication: "cdsync_app_pub".to_string(),
+            });
         assert_eq!(
             crate::retry::classify_sync_retry(&publication_err),
             crate::retry::SyncRetryClass::Permanent

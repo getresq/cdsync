@@ -1,5 +1,6 @@
 use super::*;
 use crate::destinations::bigquery;
+use crate::retry::classify_sync_retry;
 
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
@@ -303,6 +304,7 @@ impl CdcBatchLoadManager {
                 )
             })?,
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -574,6 +576,7 @@ impl CdcBatchLoadManager {
                     .await;
             }
             Err(err) => {
+                let retry_class = classify_sync_retry(&anyhow::Error::new(err.clone()));
                 crate::telemetry::record_cdc_batch_load_job(
                     self.state_handle.connection_id(),
                     &table_key,
@@ -592,7 +595,7 @@ impl CdcBatchLoadManager {
                 );
                 let _ = self
                     .state_handle
-                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string())
+                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string(), retry_class)
                     .await;
                 let _ = self
                     .state_handle

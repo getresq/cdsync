@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::SyncRetryClass;
 
 impl StateHandle {
     pub async fn save_connection_state(
@@ -93,9 +94,10 @@ impl StateHandle {
         &self,
         job_id: &str,
         error: &str,
+        retry_class: SyncRetryClass,
     ) -> anyhow::Result<()> {
         self.store
-            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error)
+            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error, retry_class)
             .await
     }
 

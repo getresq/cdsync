@@ -6,6 +6,7 @@ mod models;
 mod tests;
 
 use crate::config::StateConfig;
+use crate::retry::{ConnectionLockError, ErrorReasonCode};
 use crate::types::TableCheckpoint;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -75,7 +76,7 @@ impl SyncStateStore {
 
     pub async fn load_state(&self) -> anyhow::Result<SyncState> {
         let rows = sqlx::query(&format!(
-            "select connection_id, last_sync_started_at, last_sync_finished_at, last_sync_status, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, updated_at from {}",
+            "select connection_id, last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, updated_at from {}",
             self.table("connection_state")
         ))
         .fetch_all(&self.pool)
@@ -102,6 +103,7 @@ impl SyncStateStore {
                     row.try_get("last_sync_finished_at")?,
                 ),
                 last_sync_status: row.try_get("last_sync_status")?,
+                last_error_reason: parse_optional_error_reason(row.try_get("last_error_reason")?)?,
                 last_error: row.try_get("last_error")?,
             };
             latest_updated_at = Some(max_updated_at(latest_updated_at, updated_at_ms));
@@ -134,7 +136,7 @@ impl SyncStateStore {
         connection_id: &str,
     ) -> anyhow::Result<Option<ConnectionState>> {
         let row = sqlx::query(&format!(
-            "select last_sync_started_at, last_sync_finished_at, last_sync_status, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name from {} where connection_id = $1",
+            "select last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name from {} where connection_id = $1",
             self.table("connection_state")
         ))
         .bind(connection_id)
@@ -151,6 +153,7 @@ impl SyncStateStore {
             last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
             last_sync_finished_at: parse_optional_rfc3339(row.try_get("last_sync_finished_at")?),
             last_sync_status: row.try_get("last_sync_status")?,
+            last_error_reason: parse_optional_error_reason(row.try_get("last_error_reason")?)?,
             last_error: row.try_get("last_error")?,
         }))
     }
@@ -188,15 +191,17 @@ impl SyncStateStore {
                 last_sync_started_at,
                 last_sync_finished_at,
                 last_sync_status,
+                last_error_reason,
                 last_error,
                 postgres_cdc_last_lsn,
                 postgres_cdc_slot_name,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             on conflict(connection_id) do update set
                 last_sync_started_at = excluded.last_sync_started_at,
                 last_sync_finished_at = excluded.last_sync_finished_at,
                 last_sync_status = excluded.last_sync_status,
+                last_error_reason = excluded.last_error_reason,
                 last_error = excluded.last_error,
                 postgres_cdc_last_lsn = excluded.postgres_cdc_last_lsn,
                 postgres_cdc_slot_name = excluded.postgres_cdc_slot_name,
@@ -216,6 +221,11 @@ impl SyncStateStore {
                 .map(|dt| dt.to_rfc3339()),
         )
         .bind(connection_state.last_sync_status.clone())
+        .bind(
+            connection_state
+                .last_error_reason
+                .map(ErrorReasonCode::as_str),
+        )
         .bind(connection_state.last_error.clone())
         .bind(cdc_state.and_then(|state| state.last_lsn.clone()))
         .bind(cdc_state.and_then(|state| state.slot_name.clone()))
@@ -444,7 +454,7 @@ impl SyncStateStore {
         .await?;
 
         if row.is_none() {
-            anyhow::bail!("connection {} is already locked", connection_id);
+            return Err(ConnectionLockError::new(connection_id).into());
         }
         Ok(())
     }

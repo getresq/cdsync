@@ -1,5 +1,6 @@
 use super::snapshot_sync::{release_exported_snapshot_slot, snapshot_shutdown_requested};
 use super::*;
+use crate::retry::CdcSyncPolicyError;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SnapshotTableWritePlan {
@@ -126,9 +127,15 @@ async fn set_snapshot_task_runtime_state(
 ) -> Result<TableRuntimeState> {
     let checkpoint = {
         let mut checkpoint = checkpoint_state.lock().await;
+        let blocked = matches!(status, TableRuntimeStatus::Blocked);
+        let retry_class = crate::retry::classify_sync_retry(error);
         checkpoint.runtime = Some(TableRuntimeState {
             status,
             attempts,
+            reason: Some(crate::retry::table_runtime_reason_for_retry_class(
+                retry_class,
+                blocked,
+            )),
             last_error: Some(format!("{error:#}")),
             next_retry_at,
             updated_at: Some(Utc::now()),
@@ -336,14 +343,10 @@ async fn run_cdc_snapshot_phase(
                     }
                     continue;
                 }
-                break Err(anyhow::anyhow!(
-                    "snapshot blocked for table(s): {}",
-                    blocked_tables
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                break Err(CdcSyncPolicyError::SnapshotBlocked {
+                    tables: blocked_tables.keys().cloned().collect(),
+                }
+                .into());
             }
             if let Some(next_retry_at) = earliest_retry_at {
                 let now = Utc::now();
@@ -369,14 +372,10 @@ async fn run_cdc_snapshot_phase(
                 }
                 continue;
             }
-            break Err(anyhow::anyhow!(
-                "snapshot blocked for table(s): {}",
-                blocked_tables
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            break Err(CdcSyncPolicyError::SnapshotBlocked {
+                tables: blocked_tables.keys().cloned().collect(),
+            }
+            .into());
         }
 
         let (table_name, mut entry, result) = snapshot_tasks
@@ -757,10 +756,10 @@ impl PostgresSource {
             .map_or("postgres", StateHandle::connection_id);
 
         if !self.cdc_enabled() {
-            anyhow::bail!("CDC is disabled for Postgres source");
+            return Err(CdcSyncPolicyError::CdcDisabled.into());
         }
         if tables.is_empty() {
-            anyhow::bail!("no postgres tables configured for CDC");
+            return Err(CdcSyncPolicyError::NoTablesConfigured.into());
         }
         let policy = self.config.schema_policy();
 
@@ -768,7 +767,7 @@ impl PostgresSource {
             .config
             .publication
             .as_deref()
-            .context("postgres.publication is required when CDC is enabled")?;
+            .ok_or(CdcSyncPolicyError::PublicationRequired)?;
         let publication_mode = self.config.publication_mode();
         let pipeline_id = self.config.cdc_pipeline_id;
         let stream_pipeline_id = pipeline_id.unwrap_or(1);
@@ -793,7 +792,10 @@ impl PostgresSource {
         match publication_mode {
             crate::config::PostgresPublicationMode::Validate => {
                 if !replication_client.publication_exists(publication).await? {
-                    anyhow::bail!("publication '{}' does not exist", publication);
+                    return Err(CdcSyncPolicyError::PublicationMissing {
+                        publication: publication.to_string(),
+                    }
+                    .into());
                 }
             }
             crate::config::PostgresPublicationMode::Manage => {
@@ -876,17 +878,17 @@ impl PostgresSource {
                 }
                 match policy {
                     SchemaChangePolicy::Fail => {
-                        anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                     SchemaChangePolicy::Auto => {
                         if diff.has_incompatible() || primary_key_changed_detected {
-                            anyhow::bail!(
-                                "incompatible schema change detected for {}; trigger a manual table resync",
-                                table_cfg.name
-                            );
+                            return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                                table: table_cfg.name.clone(),
+                            }
+                            .into());
                         }
                     }
                 }
@@ -914,16 +916,16 @@ impl PostgresSource {
                 );
                 match policy {
                     SchemaChangePolicy::Fail => {
-                        anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                     SchemaChangePolicy::Auto => {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -973,25 +975,28 @@ impl PostgresSource {
 
         let has_snapshot_progress = !snapshot_progress_tables.is_empty();
         let mut snapshot_progress_missing_lsn = false;
-        let snapshot_resume_lsn = tables.iter().try_fold(None, |current, table| {
-            let Some(checkpoint) = state.postgres.get(&table.name) else {
-                return Ok(current);
-            };
-            if !table_has_snapshot_progress(checkpoint) {
-                return Ok(current);
-            }
-            match (&current, checkpoint.snapshot_start_lsn.as_ref()) {
-                (None, Some(lsn)) => Ok(Some(lsn.clone())),
-                (Some(existing), Some(lsn)) if existing == lsn => Ok(current),
-                (Some(_), Some(_)) => {
-                    anyhow::bail!("snapshot progress checkpoints have mismatched start LSNs")
-                }
-                (_, None) => {
-                    snapshot_progress_missing_lsn = true;
-                    Ok(current)
-                }
-            }
-        })?;
+        let snapshot_resume_lsn =
+            tables
+                .iter()
+                .try_fold(None, |current, table| -> Result<Option<String>> {
+                    let Some(checkpoint) = state.postgres.get(&table.name) else {
+                        return Ok(current);
+                    };
+                    if !table_has_snapshot_progress(checkpoint) {
+                        return Ok(current);
+                    }
+                    match (&current, checkpoint.snapshot_start_lsn.as_ref()) {
+                        (None, Some(lsn)) => Ok(Some(lsn.clone())),
+                        (Some(existing), Some(lsn)) if existing == lsn => Ok(current),
+                        (Some(_), Some(_)) => {
+                            Err(CdcSyncPolicyError::SnapshotProgressCheckpointMismatch.into())
+                        }
+                        (_, None) => {
+                            snapshot_progress_missing_lsn = true;
+                            Ok(current)
+                        }
+                    }
+                })?;
         let force_snapshot_restart = has_snapshot_progress
             && (snapshot_resume_lsn.is_none() || snapshot_progress_missing_lsn);
         if force_snapshot_restart {
@@ -1249,7 +1254,7 @@ impl PostgresSource {
                 stats.clone(),
                 state_handle.clone(),
                 shutdown.clone(),
-                false,
+                follow,
             )
             .await?;
             if !snapshot_outcome.completed {
@@ -1366,17 +1371,17 @@ impl PostgresSource {
         verbose: bool,
     ) -> Result<()> {
         if !self.cdc_enabled() {
-            anyhow::bail!("CDC is disabled for Postgres source");
+            return Err(CdcSyncPolicyError::CdcDisabled.into());
         }
         if tables.is_empty() {
-            anyhow::bail!("no postgres tables configured for CDC");
+            return Err(CdcSyncPolicyError::NoTablesConfigured.into());
         }
 
         let publication = self
             .config
             .publication
             .as_deref()
-            .context("postgres.publication is required when CDC is enabled")?;
+            .ok_or(CdcSyncPolicyError::PublicationRequired)?;
         let publication_mode = self.config.publication_mode();
 
         self.validate_wal_level().await?;
@@ -1387,7 +1392,10 @@ impl PostgresSource {
         match publication_mode {
             crate::config::PostgresPublicationMode::Validate => {
                 if !replication_client.publication_exists(publication).await? {
-                    anyhow::bail!("publication '{}' does not exist", publication);
+                    return Err(CdcSyncPolicyError::PublicationMissing {
+                        publication: publication.to_string(),
+                    }
+                    .into());
                 }
             }
             crate::config::PostgresPublicationMode::Manage => {
@@ -1433,7 +1441,7 @@ impl PostgresSource {
             .await
             .context("checking wal_level")?;
         if wal_level != "logical" {
-            anyhow::bail!("wal_level must be logical for CDC (found '{}')", wal_level);
+            return Err(CdcSyncPolicyError::WalLevelNotLogical { wal_level }.into());
         }
         Ok(())
     }
@@ -1454,11 +1462,11 @@ impl PostgresSource {
 
         for table in tables {
             if !publication_set.contains(&table.name) {
-                anyhow::bail!(
-                    "table {} not found in publication {}",
-                    table.name,
-                    publication
-                );
+                return Err(CdcSyncPolicyError::TableNotInPublication {
+                    table: table.name.clone(),
+                    publication: publication.to_string(),
+                }
+                .into());
             }
         }
         Ok(())
@@ -1474,10 +1482,11 @@ impl PostgresSource {
         for table in tables {
             if let Some(where_clause) = &table.where_clause {
                 let actual = filters.get(&table.name).and_then(|v| v.as_ref());
-                let actual = actual.context(format!(
-                    "publication {} missing row filter for table {}",
-                    publication, table.name
-                ))?;
+                let actual =
+                    actual.ok_or_else(|| CdcSyncPolicyError::PublicationFilterMissing {
+                        publication: publication.to_string(),
+                        table: table.name.clone(),
+                    })?;
                 let expected_norm = normalize_filter(where_clause);
                 let actual_norm = normalize_filter(actual);
                 if expected_norm != actual_norm {
@@ -1489,13 +1498,13 @@ impl PostgresSource {
                             "publication row filter mismatch"
                         );
                     }
-                    anyhow::bail!(
-                        "publication {} row filter mismatch for {} (expected `{}`, got `{}`)",
-                        publication,
-                        table.name,
-                        where_clause,
-                        actual
-                    );
+                    return Err(CdcSyncPolicyError::PublicationFilterMismatch {
+                        publication: publication.to_string(),
+                        table: table.name.clone(),
+                        expected: where_clause.clone(),
+                        actual: actual.clone(),
+                    }
+                    .into());
                 }
             }
         }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::{ErrorReasonCode, SyncRetryClass};
 
 pub(super) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
     if schema.is_empty() {
@@ -29,6 +30,10 @@ pub(super) fn cdc_batch_load_job_record_from_row(
         status: CdcBatchLoadJobStatus::from_str(&row.try_get::<String, _>("status")?)?,
         payload_json: row.try_get("payload_json")?,
         attempt_count: row.try_get("attempt_count")?,
+        retry_class: row
+            .try_get::<Option<String>, _>("retry_class")?
+            .map(|value| value.parse::<SyncRetryClass>())
+            .transpose()?,
         last_error: row.try_get("last_error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -109,6 +114,12 @@ pub(super) fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<U
         .as_deref()
         .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+pub(super) fn parse_optional_error_reason(
+    value: Option<String>,
+) -> anyhow::Result<Option<ErrorReasonCode>> {
+    value.map(|raw| raw.parse::<ErrorReasonCode>()).transpose()
 }
 
 pub(super) fn now_millis() -> i64 {

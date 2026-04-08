@@ -1,6 +1,7 @@
 use super::snapshot_sync::save_snapshot_progress;
 use super::*;
 use crate::destinations::Destination;
+use crate::retry::ErrorReasonCode;
 use async_trait::async_trait;
 use polars::prelude::{NamedFrom, Series};
 use std::collections::HashMap;
@@ -987,15 +988,18 @@ fn snapshot_task_failure_disposition_retries_transient_transport_errors() {
 
 #[test]
 fn snapshot_task_failure_disposition_blocks_permanent_schema_and_publication_errors() {
-    let schema_err = anyhow::anyhow!(
-        "schema change detected for public.accounts; trigger a manual table resync"
-    );
+    let schema_err = anyhow::Error::new(crate::retry::CdcSyncPolicyError::SchemaChangeDetected {
+        table: "public.accounts".to_string(),
+    });
     assert_eq!(
         super::cdc_sync::snapshot_task_failure_disposition(&schema_err),
         super::cdc_sync::SnapshotTaskFailureDisposition::Block
     );
 
-    let publication_err = anyhow::anyhow!("publication cdsync_app_pub does not exist");
+    let publication_err =
+        anyhow::Error::new(crate::retry::CdcSyncPolicyError::PublicationMissing {
+            publication: "cdsync_app_pub".to_string(),
+        });
     assert_eq!(
         super::cdc_sync::snapshot_task_failure_disposition(&publication_err),
         super::cdc_sync::SnapshotTaskFailureDisposition::Block
@@ -1032,6 +1036,7 @@ fn snapshot_task_queue_seed_preserves_blocked_tables_until_manual_resync() {
     let runtime = TableRuntimeState {
         status: TableRuntimeStatus::Blocked,
         attempts: 2,
+        reason: Some(ErrorReasonCode::SnapshotBlocked),
         last_error: Some("permanent schema mismatch".to_string()),
         next_retry_at: None,
         updated_at: None,
@@ -1057,6 +1062,7 @@ fn snapshot_task_queue_seed_keeps_retry_schedule_for_retrying_tables() {
     let runtime = TableRuntimeState {
         status: TableRuntimeStatus::Retrying,
         attempts: 4,
+        reason: Some(ErrorReasonCode::BigqueryDmlQuota),
         last_error: Some("quota exceeded".to_string()),
         next_retry_at: Some(retry_at),
         updated_at: Some(retry_at),

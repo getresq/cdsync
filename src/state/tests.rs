@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::ErrorReasonCode;
 use crate::types::{TableRuntimeState, TableRuntimeStatus};
 
 fn test_state_config() -> Option<StateConfig> {
@@ -20,6 +21,7 @@ async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
 
     let mut state = ConnectionState {
         last_sync_status: Some("running".to_string()),
+        last_error_reason: Some(ErrorReasonCode::LastRunFailed),
         ..Default::default()
     };
     state.postgres.insert(
@@ -29,6 +31,7 @@ async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
             runtime: Some(TableRuntimeState {
                 status: TableRuntimeStatus::Retrying,
                 attempts: 3,
+                reason: Some(ErrorReasonCode::BigqueryDmlQuota),
                 last_error: Some("quota exceeded".to_string()),
                 next_retry_at: Some(Utc::now()),
                 updated_at: Some(Utc::now()),
@@ -49,6 +52,10 @@ async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
         .get("app")
         .context("missing connection")?;
     assert_eq!(connection.last_sync_status.as_deref(), Some("running"));
+    assert_eq!(
+        connection.last_error_reason,
+        Some(ErrorReasonCode::LastRunFailed)
+    );
     assert_eq!(
         connection
             .postgres
@@ -85,6 +92,7 @@ async fn state_store_load_connection_state_reads_single_connection_meta() -> any
 
     let mut state = ConnectionState {
         last_sync_status: Some("running".to_string()),
+        last_error_reason: Some(ErrorReasonCode::LastRunFailed),
         ..Default::default()
     };
     state.postgres.insert(
@@ -106,6 +114,10 @@ async fn state_store_load_connection_state_reads_single_connection_meta() -> any
         .await?
         .context("missing connection")?;
     assert_eq!(loaded.last_sync_status.as_deref(), Some("running"));
+    assert_eq!(
+        loaded.last_error_reason,
+        Some(ErrorReasonCode::LastRunFailed)
+    );
     assert!(loaded.postgres.is_empty());
     assert_eq!(
         loaded

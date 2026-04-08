@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::ErrorReasonCode;
 use crate::types::{TableRuntimeState, TableRuntimeStatus};
 
 pub(super) const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration =
@@ -224,22 +225,6 @@ pub(super) fn max_checkpoint_age_seconds(
     })
 }
 
-pub(super) fn classify_error_reason(error: Option<&str>) -> &'static str {
-    let Some(error) = error else {
-        return "healthy";
-    };
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("schema change") || normalized.contains("incompatible schema") {
-        "schema_blocked"
-    } else if normalized.contains("publication") {
-        "publication_blocked"
-    } else if normalized.contains("already locked") {
-        "lock_contention"
-    } else {
-        "last_run_failed"
-    }
-}
-
 pub(super) async fn load_postgres_cdc_slot_snapshot(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
@@ -402,7 +387,10 @@ pub(super) fn derive_connection_runtime(
             None => ("syncing", "sync_in_progress"),
         },
         Some("failed") => {
-            let reason = classify_error_reason(state.and_then(|state| state.last_error.as_deref()));
+            let reason = state
+                .and_then(|state| state.last_error_reason)
+                .unwrap_or(ErrorReasonCode::LastRunFailed)
+                .as_str();
             if matches!(reason, "schema_blocked" | "publication_blocked") {
                 ("blocked", reason)
             } else {
@@ -524,15 +512,12 @@ pub(super) fn build_table_progress(
 }
 
 fn table_runtime_phase_and_reason(runtime: &TableRuntimeState) -> (&'static str, &'static str) {
-    let quota_limited = runtime.last_error.as_deref().is_some_and(|error: &str| {
-        error
-            .to_ascii_lowercase()
-            .contains("exceeded quota for total number of dml jobs writing to a table")
+    let reason = runtime.reason.unwrap_or(match runtime.status {
+        TableRuntimeStatus::Retrying => ErrorReasonCode::SnapshotRetryScheduled,
+        TableRuntimeStatus::Blocked => ErrorReasonCode::SnapshotBlocked,
     });
     match runtime.status {
-        TableRuntimeStatus::Retrying if quota_limited => ("retrying", "bigquery_dml_quota"),
-        TableRuntimeStatus::Retrying => ("retrying", "snapshot_retry_scheduled"),
-        TableRuntimeStatus::Blocked if quota_limited => ("blocked", "bigquery_dml_quota"),
-        TableRuntimeStatus::Blocked => ("blocked", "snapshot_blocked"),
+        TableRuntimeStatus::Retrying => ("retrying", reason.as_str()),
+        TableRuntimeStatus::Blocked => ("blocked", reason.as_str()),
     }
 }

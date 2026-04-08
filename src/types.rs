@@ -1,3 +1,4 @@
+use crate::retry::ErrorReasonCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,7 @@ pub enum TableRuntimeStatus {
 pub struct TableRuntimeState {
     pub status: TableRuntimeStatus,
     pub attempts: u32,
+    pub reason: Option<ErrorReasonCode>,
     pub last_error: Option<String>,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,

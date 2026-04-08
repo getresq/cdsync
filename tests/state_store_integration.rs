@@ -1,4 +1,5 @@
 use cdsync::config::StateConfig;
+use cdsync::retry::SyncRetryClass;
 use cdsync::state::{
     CdcBatchLoadJobRecord, CdcBatchLoadJobStatus, CdcCommitFragmentRecord, CdcCommitFragmentStatus,
     CdcWatermarkState, ConnectionState, PostgresCdcState, SyncStateStore,
@@ -259,6 +260,7 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -270,6 +272,7 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now + 1,
             updated_at: now + 1,
@@ -281,6 +284,7 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now + 2,
             updated_at: now + 2,
@@ -358,6 +362,7 @@ async fn postgres_state_store_requeues_running_jobs() -> anyhow::Result<()> {
             status: CdcBatchLoadJobStatus::Running,
             payload_json: "{}".to_string(),
             attempt_count: 1,
+            retry_class: None,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -394,6 +399,7 @@ async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result
             status: CdcBatchLoadJobStatus::Failed,
             payload_json: "{}".to_string(),
             attempt_count: 2,
+            retry_class: Some(SyncRetryClass::Transient),
             last_error: Some(
                 "[DestinationError] failed to process CDC batch-load job: merging staging BigQuery table foo into bar".to_string(),
             ),
@@ -417,6 +423,45 @@ async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn postgres_state_store_does_not_requeue_permanent_failed_jobs() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    handle
+        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
+            job_id: "job-failed-perm".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: CdcBatchLoadJobStatus::Failed,
+            payload_json: "{}".to_string(),
+            attempt_count: 2,
+            retry_class: Some(SyncRetryClass::Permanent),
+            last_error: Some("permanent failure".to_string()),
+            created_at: now,
+            updated_at: now,
+        })
+        .await?;
+
+    let requeued = handle
+        .requeue_retryable_failed_cdc_batch_load_jobs()
+        .await?;
+    assert_eq!(requeued, 0);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Failed])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, "job-failed-perm");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());
@@ -433,6 +478,7 @@ async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow
         status: CdcBatchLoadJobStatus::Pending,
         payload_json: "{\"v\":1}".to_string(),
         attempt_count: 0,
+        retry_class: None,
         last_error: None,
         created_at: now,
         updated_at: now,
@@ -475,6 +521,7 @@ async fn postgres_state_store_enqueue_dedup_revives_failed_jobs() -> anyhow::Res
         status: CdcBatchLoadJobStatus::Pending,
         payload_json: "{\"v\":1}".to_string(),
         attempt_count: 0,
+        retry_class: None,
         last_error: None,
         created_at: now,
         updated_at: now,
@@ -482,7 +529,7 @@ async fn postgres_state_store_enqueue_dedup_revives_failed_jobs() -> anyhow::Res
 
     handle.enqueue_cdc_batch_load_job(&base).await?;
     handle
-        .mark_cdc_batch_load_job_failed(&base.job_id, "boom")
+        .mark_cdc_batch_load_job_failed(&base.job_id, "boom", SyncRetryClass::Permanent)
         .await?;
 
     let replayed = handle

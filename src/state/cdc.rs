@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::SyncRetryClass;
 
 impl SyncStateStore {
     pub async fn enqueue_cdc_batch_load_job(
@@ -17,10 +18,11 @@ impl SyncStateStore {
                 status,
                 payload_json,
                 attempt_count,
+                retry_class,
                 last_error,
                 created_at,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             on conflict(job_id) do update set
                 table_key = case
                     when {table}.status = 'failed' then excluded.table_key
@@ -39,6 +41,10 @@ impl SyncStateStore {
                     else {table}.payload_json
                 end,
                 attempt_count = {table}.attempt_count,
+                retry_class = case
+                    when {table}.status = 'failed' then excluded.retry_class
+                    else {table}.retry_class
+                end,
                 last_error = case
                     when {table}.status = 'failed' then null
                     else {table}.last_error
@@ -48,7 +54,7 @@ impl SyncStateStore {
                     else {table}.updated_at
                 end
             returning job_id, table_key, first_sequence, status, payload_json, attempt_count,
-                      last_error, created_at, updated_at
+                      retry_class, last_error, created_at, updated_at
             "#,
             table = table,
         ))
@@ -59,6 +65,7 @@ impl SyncStateStore {
         .bind(job.status.as_str())
         .bind(&job.payload_json)
         .bind(job.attempt_count)
+        .bind(job.retry_class.map(SyncRetryClass::as_str))
         .bind(job.last_error.clone())
         .bind(job.created_at)
         .bind(job.updated_at)
@@ -75,7 +82,7 @@ impl SyncStateStore {
         let status_values: Vec<&str> = statuses.iter().map(|status| status.as_str()).collect();
         let rows = sqlx::query(&format!(
             r#"
-            select job_id, table_key, first_sequence, status, payload_json, attempt_count, last_error, created_at, updated_at
+            select job_id, table_key, first_sequence, status, payload_json, attempt_count, retry_class, last_error, created_at, updated_at
             from {}
             where connection_id = $1
               and status = any($2)
@@ -129,13 +136,14 @@ impl SyncStateStore {
             update {} jobs
             set status = $3,
                 attempt_count = jobs.attempt_count + 1,
+                retry_class = jobs.retry_class,
                 last_error = null,
                 updated_at = $6
             from candidate
             where jobs.connection_id = $1
               and jobs.job_id = candidate.job_id
             returning jobs.job_id, jobs.table_key, jobs.first_sequence, jobs.status,
-                      jobs.payload_json, jobs.attempt_count, jobs.last_error,
+                      jobs.payload_json, jobs.attempt_count, jobs.retry_class, jobs.last_error,
                       jobs.created_at, jobs.updated_at
             "#,
             self.table("cdc_batch_load_jobs"),
@@ -188,6 +196,7 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $2,
+                retry_class = retry_class,
                 updated_at = $3
             where connection_id = $1
               and status = $4
@@ -211,15 +220,12 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $2,
+                retry_class = retry_class,
                 last_error = null,
                 updated_at = $3
             where connection_id = $1
               and status = $4
-              and (
-                last_error ilike '%failed to process CDC batch-load job%'
-                or last_error ilike '%merging staging BigQuery table%'
-                or last_error ilike '%BigQuery query returned errors%'
-              )
+              and retry_class = any($5)
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -227,6 +233,10 @@ impl SyncStateStore {
         .bind(CdcBatchLoadJobStatus::Pending.as_str())
         .bind(now_millis())
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind([
+            SyncRetryClass::Backpressure.as_str(),
+            SyncRetryClass::Transient.as_str(),
+        ])
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -241,6 +251,7 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $3,
+                retry_class = null,
                 last_error = null,
                 updated_at = $4
             where connection_id = $1 and job_id = $2
@@ -261,13 +272,15 @@ impl SyncStateStore {
         connection_id: &str,
         job_id: &str,
         error: &str,
+        retry_class: SyncRetryClass,
     ) -> anyhow::Result<()> {
         sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
-                last_error = $4,
-                updated_at = $5
+                retry_class = $4,
+                last_error = $5,
+                updated_at = $6
             where connection_id = $1 and job_id = $2
             "#,
             self.table("cdc_batch_load_jobs")
@@ -275,6 +288,7 @@ impl SyncStateStore {
         .bind(connection_id)
         .bind(job_id)
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind(retry_class.as_str())
         .bind(error)
         .bind(now_millis())
         .execute(&self.pool)

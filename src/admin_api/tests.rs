@@ -4,6 +4,7 @@ use crate::config::{
     DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
     PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
+use crate::retry::ErrorReasonCode;
 use crate::types::{TableCheckpoint, TableRuntimeState, TableRuntimeStatus};
 use chrono::TimeZone;
 use std::collections::HashMap;
@@ -333,6 +334,7 @@ fn build_table_progress_prefers_table_runtime_retry_state() {
             runtime: Some(TableRuntimeState {
                 status: TableRuntimeStatus::Retrying,
                 attempts: 4,
+                reason: Some(ErrorReasonCode::BigqueryDmlQuota),
                 last_error: Some("Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table".to_string()),
                 next_retry_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 5, 0).unwrap()),
                 updated_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap()),
@@ -375,6 +377,7 @@ fn build_table_progress_prefers_table_runtime_blocked_state() {
             runtime: Some(TableRuntimeState {
                 status: TableRuntimeStatus::Blocked,
                 attempts: 1,
+                reason: Some(ErrorReasonCode::SnapshotBlocked),
                 last_error: Some("permanent schema mismatch".to_string()),
                 next_retry_at: None,
                 updated_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap()),
@@ -467,6 +470,7 @@ fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
         runtime: Some(TableRuntimeState {
             status: TableRuntimeStatus::Blocked,
             attempts: 1,
+            reason: Some(ErrorReasonCode::SchemaBlocked),
             last_error: Some("schema blocked".to_string()),
             next_retry_at: None,
             updated_at: None,
