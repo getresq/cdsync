@@ -371,68 +371,28 @@ impl CdcBatchLoadManager {
                 updated_at: now,
             })
             .collect();
-        let persisted_record = self
-            .state_handle
-            .enqueue_cdc_batch_load_job(&record)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to persist CDC batch-load job",
-                    err.to_string()
-                )
-            })?;
-        self.state_handle
-            .upsert_cdc_commit_fragments(&fragment_records)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to persist CDC commit fragments",
-                    err.to_string()
-                )
-            })?;
-        if let Some(last_fragment) = fragment_records.last() {
-            let mut watermark = self
-                .state_handle
-                .load_cdc_watermark_state()
-                .await
-                .map_err(|err| {
-                    etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to load CDC watermark state",
-                        err.to_string()
-                    )
-                })?
-                .unwrap_or_default();
-            watermark.last_enqueued_sequence = Some(
-                watermark
-                    .last_enqueued_sequence
-                    .unwrap_or_default()
-                    .max(last_fragment.sequence),
-            );
-            watermark.last_received_lsn = Some(last_fragment.commit_lsn.clone());
-            watermark.last_relevant_change_seen_at = Some(Utc::now());
-            watermark.updated_at = Some(Utc::now());
-            self.state_handle
-                .save_cdc_watermark_state(&watermark)
-                .await
-                .map_err(|err| {
-                    etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to persist CDC watermark enqueue state",
-                        err.to_string()
-                    )
-                })?;
-        }
-
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .await
-            .entry(persisted_record.job_id.clone())
+            .entry(record.job_id.clone())
             .or_default()
             .push(tx);
+        let persisted_record = match self
+            .state_handle
+            .enqueue_cdc_batch_load_bundle(&record, &fragment_records)
+            .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                let _ = self.waiters.lock().await.remove(&record.job_id);
+                return Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to persist CDC batch-load job",
+                    err.to_string()
+                ));
+            }
+        };
         match persisted_record.status {
             CdcBatchLoadJobStatus::Succeeded => {
                 if let Some(waiters) = self.waiters.lock().await.remove(&persisted_record.job_id) {

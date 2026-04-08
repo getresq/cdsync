@@ -39,12 +39,13 @@ impl StateHandle {
             .await
     }
 
-    pub async fn enqueue_cdc_batch_load_job(
+    pub async fn enqueue_cdc_batch_load_bundle(
         &self,
         job: &CdcBatchLoadJobRecord,
+        fragments: &[CdcCommitFragmentRecord],
     ) -> anyhow::Result<CdcBatchLoadJobRecord> {
         self.store
-            .enqueue_cdc_batch_load_job(&self.connection_id, job)
+            .enqueue_cdc_batch_load_bundle(&self.connection_id, job, fragments)
             .await
     }
 
@@ -104,15 +105,6 @@ impl StateHandle {
     ) -> anyhow::Result<()> {
         self.store
             .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error, retry_class)
-            .await
-    }
-
-    pub async fn upsert_cdc_commit_fragments(
-        &self,
-        fragments: &[CdcCommitFragmentRecord],
-    ) -> anyhow::Result<()> {
-        self.store
-            .upsert_cdc_commit_fragments(&self.connection_id, fragments)
             .await
     }
 

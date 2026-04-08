@@ -32,12 +32,6 @@ pub(super) struct SnapshotTaskQueueEntry {
 
 const SNAPSHOT_TASK_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
-fn emit_sync_probe(connection_label: &str, phase: &str) {
-    if std::env::var("CDSYNC_TEST_SYNC_PROBE").ok().as_deref() == Some("1") {
-        eprintln!("CDSYNC_SYNC_PROBE connection={connection_label} phase={phase}");
-    }
-}
-
 pub(super) fn snapshot_task_retry_backoff(attempts: u32, retry_backoff_ms: u64) -> Duration {
     let exponent = attempts.saturating_sub(1).min(20);
     let multiplier = 1_u128 << exponent;
@@ -1391,7 +1385,6 @@ impl PostgresSource {
             }
         };
 
-        emit_sync_probe(connection_label, "before_stream_cdc");
         let last_flushed = self
             .stream_cdc_changes(
                 replication_client.clone(),
@@ -1425,7 +1418,6 @@ impl PostgresSource {
                 },
             )
             .await?;
-        emit_sync_probe(connection_label, "after_stream_cdc");
 
         if let Ok(slot) = replication_client.get_slot(&slot_name).await {
             last_lsn = Some(slot.confirmed_flush_lsn.to_string());
@@ -1439,7 +1431,6 @@ impl PostgresSource {
                 state_handle.save_postgres_cdc_state(cdc_state).await?;
             }
         }
-        emit_sync_probe(connection_label, "after_cdc_state_save");
 
         for (table_id, hash) in table_hashes {
             if let Some(info) = table_info_map.get(&table_id) {

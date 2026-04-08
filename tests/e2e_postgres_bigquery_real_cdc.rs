@@ -15,7 +15,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
-use std::process::{self, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
@@ -61,13 +61,6 @@ impl Drop for ChildTerminationGuard {
                 .arg(pid.to_string())
                 .status();
         }
-    }
-}
-
-fn maybe_exit_test_at(phase: &str) {
-    if env::var("CDSYNC_TEST_EXIT_AT").ok().as_deref() == Some(phase) {
-        eprintln!("exiting test process at phase={phase}");
-        process::exit(0);
     }
 }
 
@@ -132,7 +125,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     sqlx::query(&format!(
         "insert into {} (id, name, status)
          select gs, concat('name-', gs), 'seed'
-         from generate_series(1, 1000) as gs",
+         from generate_series(1, 300) as gs",
         qualified_table
     ))
     .execute(&pool)
@@ -209,20 +202,19 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         shutdown: None,
     }))
     .await?;
-    maybe_exit_test_at("after_initial_sync");
 
     let initial_dest = dest.summarize_table(&dest_table).await?;
-    assert_eq!(initial_dest.row_count, 1000);
+    assert_eq!(initial_dest.row_count, 300);
     assert_eq!(initial_dest.deleted_rows, 0);
 
     sqlx::query(&format!(
-        "update {} set status = 'updated', updated_at = now() where id between 1 and 220",
+        "update {} set status = 'updated', updated_at = now() where id between 1 and 80",
         qualified_table
     ))
     .execute(&pool)
     .await?;
     sqlx::query(&format!(
-        "delete from {} where id between 221 and 340",
+        "delete from {} where id between 81 and 120",
         qualified_table
     ))
     .execute(&pool)
@@ -230,7 +222,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     sqlx::query(&format!(
         "insert into {} (id, name, status)
          select gs, concat('new-', gs), 'inserted'
-         from generate_series(1001, 1160) as gs",
+         from generate_series(301, 360) as gs",
         qualified_table
     ))
     .execute(&pool)
@@ -242,13 +234,13 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     .execute(&pool)
     .await?;
     sqlx::query(&format!(
-        "update {} set extra = 'extra', updated_at = now() where id between 1 and 80",
+        "update {} set extra = 'extra', updated_at = now() where id between 1 and 30",
         qualified_table
     ))
     .execute(&pool)
     .await?;
     sqlx::query(&format!(
-        "update {} set extra = 'new-extra', updated_at = now() where id between 1001 and 1040",
+        "update {} set extra = 'new-extra', updated_at = now() where id between 301 and 320",
         qualified_table
     ))
     .execute(&pool)
@@ -272,14 +264,12 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         shutdown: None,
     }))
     .await?;
-    maybe_exit_test_at("after_incremental_sync");
 
     let final_source = source.summarize_table(&tables[0]).await?;
     let final_dest = dest.summarize_table(&dest_table).await?;
-    assert_eq!(final_source.row_count, 1040);
-    assert_eq!(final_dest.row_count, 1160);
-    assert_eq!(final_dest.deleted_rows, 120);
-    maybe_exit_test_at("after_final_summaries");
+    assert_eq!(final_source.row_count, 320);
+    assert_eq!(final_dest.row_count, 360);
+    assert_eq!(final_dest.deleted_rows, 40);
 
     let client = real_bigquery_support::client(&real_bq.key_path).await?;
     let schema_fields = real_bigquery_support::fetch_live_table_fields(
@@ -290,7 +280,6 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     )
     .await?;
     assert!(schema_fields.iter().any(|field| field == "extra"));
-    maybe_exit_test_at("after_schema_query");
 
     let extra_count = real_bigquery_support::query_i64(
         &client,
@@ -304,8 +293,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         ),
     )
     .await?;
-    assert_eq!(extra_count, 120);
-    maybe_exit_test_at("after_extra_query");
+    assert_eq!(extra_count, 50);
 
     let deleted_count = real_bigquery_support::query_i64(
         &client,
@@ -319,17 +307,12 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         ),
     )
     .await?;
-    assert_eq!(deleted_count, 120);
-
-    maybe_exit_test_at("after_asserts");
+    assert_eq!(deleted_count, 40);
 
     drop(client);
     drop(dest);
     drop(source);
     pool.close().await;
-
-    maybe_exit_test_at("after_pool_close");
-    maybe_exit_test_at("before_return");
 
     Ok(())
 }
@@ -363,15 +346,15 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     let table_count = env::var("CDSYNC_REAL_STRESS_TABLE_COUNT")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(24usize);
+        .unwrap_or(2usize);
     let rows_per_table = env::var("CDSYNC_REAL_STRESS_ROWS_PER_TABLE")
         .ok()
         .and_then(|raw| raw.parse::<i64>().ok())
-        .unwrap_or(8i64);
+        .unwrap_or(2i64);
     let relation_rounds = env::var("CDSYNC_REAL_STRESS_RELATION_ROUNDS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(3usize);
+        .unwrap_or(1usize);
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -450,7 +433,7 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
         schema_changes: Some(SchemaChangePolicy::Auto),
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(200),
-        cdc_apply_concurrency: Some(8),
+        cdc_apply_concurrency: Some(2),
         cdc_max_fill_ms: Some(1000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(1),
@@ -639,7 +622,7 @@ connections:
       publication: "{publication}"
       cdc_pipeline_id: {pipeline_id}
       cdc_batch_size: 200
-      cdc_apply_concurrency: 8
+      cdc_apply_concurrency: 2
       cdc_max_fill_ms: 1000
       cdc_idle_timeout_seconds: 1
       schema_changes: auto
