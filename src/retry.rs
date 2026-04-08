@@ -29,6 +29,10 @@ impl SyncRetryClass {
             Self::Permanent => "permanent",
         }
     }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Backpressure | Self::Transient)
+    }
 }
 
 impl FromStr for SyncRetryClass {

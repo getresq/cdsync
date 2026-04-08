@@ -4,6 +4,7 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
+use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
     }
     dotenv_support::load_dotenv()?;
     real_bigquery_support::install_rustls_provider();
+    let _ = JWT_CRYPTO_PROVIDER.install_default();
 
     let Ok(real_bq) = real_bigquery_support::load_env() else {
         return Ok(());

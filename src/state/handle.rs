@@ -84,6 +84,12 @@ impl StateHandle {
             .await
     }
 
+    pub async fn requeue_cdc_batch_load_job(&self, job_id: &str) -> anyhow::Result<bool> {
+        self.store
+            .requeue_cdc_batch_load_job(&self.connection_id, job_id)
+            .await
+    }
+
     pub async fn mark_cdc_batch_load_job_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
             .mark_cdc_batch_load_job_succeeded(&self.connection_id, job_id)

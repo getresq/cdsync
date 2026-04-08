@@ -545,3 +545,48 @@ async fn postgres_state_store_enqueue_dedup_revives_failed_jobs() -> anyhow::Res
 
     Ok(())
 }
+
+#[tokio::test]
+async fn postgres_state_store_requeues_retryable_batch_load_job_by_id() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let base = CdcBatchLoadJobRecord {
+        job_id: "job-retry".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        payload_json: "{\"v\":1}".to_string(),
+        attempt_count: 0,
+        retry_class: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    handle.enqueue_cdc_batch_load_job(&base).await?;
+    handle
+        .mark_cdc_batch_load_job_failed(
+            &base.job_id,
+            "quota exceeded",
+            SyncRetryClass::Backpressure,
+        )
+        .await?;
+
+    assert!(handle.requeue_cdc_batch_load_job(&base.job_id).await?);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, base.job_id);
+    assert_eq!(jobs[0].retry_class, Some(SyncRetryClass::Backpressure));
+    assert_eq!(jobs[0].last_error, None);
+
+    Ok(())
+}

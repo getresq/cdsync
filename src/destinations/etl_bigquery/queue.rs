@@ -1,6 +1,6 @@
 use super::*;
 use crate::destinations::bigquery;
-use crate::retry::classify_sync_retry;
+use crate::retry::{SyncRetryClass, classify_sync_retry, compute_sync_retry_backoff};
 
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
@@ -40,6 +40,22 @@ fn stable_cdc_batch_load_object_name(
 ) -> String {
     let suffix = format!("{}_{}", step_kind.as_str(), job_id);
     bigquery::stable_cdc_batch_load_object_name(prefix, target_table, &suffix)
+}
+
+fn should_resolve_cdc_batch_load_waiters(retry_class: SyncRetryClass) -> bool {
+    !retry_class.is_retryable()
+}
+
+fn should_mark_cdc_batch_load_fragments_failed(retry_class: SyncRetryClass) -> bool {
+    !retry_class.is_retryable()
+}
+
+fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
+    compute_sync_retry_backoff(
+        &format!("cdc_batch_load:{table_key}"),
+        attempt_count.max(1) as u32,
+        1_000,
+    )
 }
 
 impl EtlBigQueryDestination {
@@ -597,14 +613,56 @@ impl CdcBatchLoadManager {
                     .state_handle
                     .mark_cdc_batch_load_job_failed(&job_id, &err.to_string(), retry_class)
                     .await;
-                let _ = self
-                    .state_handle
-                    .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
-                    .await;
+                if should_mark_cdc_batch_load_fragments_failed(retry_class) {
+                    let _ = self
+                        .state_handle
+                        .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
+                        .await;
+                } else {
+                    let state_handle = self.state_handle.clone();
+                    let notify = Arc::clone(&self.notify);
+                    let retry_job_id = job_id.clone();
+                    let retry_table = table_key.clone();
+                    let retry_delay =
+                        cdc_batch_load_retry_delay(job.record.attempt_count, &retry_table);
+                    info!(
+                        component = "consumer",
+                        event = "cdc_consumer_job_retry_scheduled",
+                        connection_id = self.state_handle.connection_id(),
+                        job_id = %retry_job_id,
+                        table = %retry_table,
+                        retry_class = retry_class.as_str(),
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        "scheduled queued CDC batch-load job for local retry"
+                    );
+                    tokio::spawn(async move {
+                        tokio::time::sleep(retry_delay).await;
+                        match state_handle.requeue_cdc_batch_load_job(&retry_job_id).await {
+                            Ok(true) => notify.notify_one(),
+                            Ok(false) => {}
+                            Err(err) => warn!(
+                                component = "consumer",
+                                event = "cdc_consumer_job_retry_requeue_failed",
+                                connection_id = state_handle.connection_id(),
+                                job_id = %retry_job_id,
+                                table = %retry_table,
+                                error = %err,
+                                "failed to requeue queued CDC batch-load job for retry"
+                            ),
+                        }
+                    });
+                }
             }
         }
 
-        if let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
+        let resolve_waiters = match &result {
+            Ok(()) => true,
+            Err(err) => should_resolve_cdc_batch_load_waiters(classify_sync_retry(
+                &anyhow::Error::new(err.clone()),
+            )),
+        };
+
+        if resolve_waiters && let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
             for waiter in waiters {
                 let waiter_result = match &result {
                     Ok(()) => Ok(()),
@@ -618,5 +676,37 @@ impl CdcBatchLoadManager {
             }
         }
         self.notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_batch_load_failures_keep_waiters_and_fragments_open() {
+        assert!(!should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Backpressure
+        ));
+        assert!(!should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Transient
+        ));
+    }
+
+    #[test]
+    fn permanent_batch_load_failures_resolve_waiters_and_fail_fragments() {
+        assert!(should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Permanent
+        ));
+        assert!(should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Permanent
+        ));
+    }
+
+    #[test]
+    fn batch_load_retry_delay_uses_bounded_retry_backoff() {
+        let delay = cdc_batch_load_retry_delay(1, "public.accounts");
+        assert!(delay >= Duration::from_secs(16));
+        assert!(delay <= Duration::from_secs(20));
     }
 }

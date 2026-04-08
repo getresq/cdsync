@@ -242,6 +242,39 @@ impl SyncStateStore {
         Ok(result.rows_affected())
     }
 
+    pub async fn requeue_cdc_batch_load_job(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                retry_class = retry_class,
+                last_error = null,
+                updated_at = $4
+            where connection_id = $1
+              and job_id = $2
+              and status = $5
+              and retry_class = any($6)
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(now_millis())
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind([
+            SyncRetryClass::Backpressure.as_str(),
+            SyncRetryClass::Transient.as_str(),
+        ])
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn mark_cdc_batch_load_job_succeeded(
         &self,
         connection_id: &str,

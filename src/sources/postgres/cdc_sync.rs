@@ -1,6 +1,7 @@
 use super::snapshot_sync::{release_exported_snapshot_slot, snapshot_shutdown_requested};
 use super::*;
 use crate::retry::CdcSyncPolicyError;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SnapshotTableWritePlan {
@@ -24,9 +25,9 @@ pub(super) enum SnapshotTaskQueueSeed {
     },
 }
 
-struct SnapshotTaskQueueEntry {
-    task: CdcSnapshotTask,
-    next_retry_at: Option<DateTime<Utc>>,
+pub(super) struct SnapshotTaskQueueEntry {
+    pub(super) task: CdcSnapshotTask,
+    pub(super) next_retry_at: Option<DateTime<Utc>>,
 }
 
 const SNAPSHOT_TASK_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
@@ -176,6 +177,59 @@ async fn wait_snapshot_task_backoff(duration: Duration, shutdown: Option<Shutdow
 
 struct SnapshotPhaseResult {
     completed: bool,
+    blocked_tables: BTreeSet<String>,
+}
+
+pub(super) fn snapshot_phase_should_proceed_to_cdc(
+    follow: bool,
+    blocked_table_count: usize,
+) -> bool {
+    follow && blocked_table_count > 0
+}
+
+pub(super) fn next_snapshot_task_table(
+    table_order: &[String],
+    next_cursor: usize,
+    snapshot_task_queues: &BTreeMap<String, VecDeque<SnapshotTaskQueueEntry>>,
+    active_serialized_tables: &HashSet<String>,
+    now: DateTime<Utc>,
+) -> (Option<String>, Option<DateTime<Utc>>, usize) {
+    let mut earliest_retry_at: Option<DateTime<Utc>> = None;
+    if table_order.is_empty() {
+        return (None, None, next_cursor);
+    }
+
+    for offset in 0..table_order.len() {
+        let index = (next_cursor + offset) % table_order.len();
+        let table_name = &table_order[index];
+        let Some(queue) = snapshot_task_queues.get(table_name) else {
+            continue;
+        };
+        let Some(entry) = queue.front() else {
+            continue;
+        };
+        if snapshot_task_requires_table_serialization(entry.task.write_mode)
+            && active_serialized_tables.contains(table_name)
+        {
+            continue;
+        }
+        if let Some(next_retry_at) = entry.next_retry_at
+            && next_retry_at > now
+        {
+            earliest_retry_at = Some(match earliest_retry_at {
+                Some(current) => current.min(next_retry_at),
+                None => next_retry_at,
+            });
+            continue;
+        }
+        return (
+            Some(table_name.clone()),
+            earliest_retry_at,
+            (index + 1) % table_order.len(),
+        );
+    }
+
+    (None, earliest_retry_at, next_cursor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,33 +284,27 @@ async fn run_cdc_snapshot_phase(
     let mut active_serialized_tables = HashSet::new();
     let mut active_task_counts: HashMap<String, usize> = HashMap::new();
     let mut snapshot_tasks = FuturesUnordered::new();
+    let table_order = snapshot_task_queues.keys().cloned().collect::<Vec<_>>();
+    let mut next_table_cursor = 0usize;
 
     let snapshot_result: Result<()> = loop {
         let mut earliest_retry_at: Option<DateTime<Utc>> = None;
         while snapshot_tasks.len() < snapshot_concurrency {
-            let mut selected_table_name: Option<String> = None;
             let now = Utc::now();
-            for (table_name, queue) in &snapshot_task_queues {
-                let Some(entry) = queue.front() else {
-                    continue;
-                };
-                if snapshot_task_requires_table_serialization(entry.task.write_mode)
-                    && active_serialized_tables.contains(table_name)
-                {
-                    continue;
-                }
-                if let Some(next_retry_at) = entry.next_retry_at
-                    && next_retry_at > now
-                {
-                    earliest_retry_at = Some(match earliest_retry_at {
-                        Some(current) => current.min(next_retry_at),
-                        None => next_retry_at,
-                    });
-                    continue;
-                }
-                selected_table_name = Some(table_name.clone());
-                break;
-            }
+            let (selected_table_name, selection_retry_at, updated_cursor) =
+                next_snapshot_task_table(
+                    &table_order,
+                    next_table_cursor,
+                    &snapshot_task_queues,
+                    &active_serialized_tables,
+                    now,
+                );
+            earliest_retry_at = match (earliest_retry_at, selection_retry_at) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, Some(candidate)) => Some(candidate),
+                (current, None) => current,
+            };
+            next_table_cursor = updated_cursor;
 
             let Some(table_name) = selected_table_name else {
                 break;
@@ -332,16 +380,13 @@ async fn run_cdc_snapshot_phase(
                 if blocked_tables.is_empty() {
                     break Ok(());
                 }
-                if follow {
+                if snapshot_phase_should_proceed_to_cdc(follow, blocked_tables.len()) {
                     warn!(
                         connection = %connection_label,
                         blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
-                        "snapshot drained runnable tables and is now waiting on blocked tables"
+                        "snapshot drained runnable tables; continuing CDC for ready tables while blocked tables wait for manual resync"
                     );
-                    if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone()).await {
-                        break Ok(());
-                    }
-                    continue;
+                    break Ok(());
                 }
                 break Err(CdcSyncPolicyError::SnapshotBlocked {
                     tables: blocked_tables.keys().cloned().collect(),
@@ -361,16 +406,13 @@ async fn run_cdc_snapshot_phase(
             if blocked_tables.is_empty() {
                 break Ok(());
             }
-            if follow {
+            if snapshot_phase_should_proceed_to_cdc(follow, blocked_tables.len()) {
                 warn!(
                     connection = %connection_label,
                     blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
-                    "snapshot has only blocked tables remaining and is waiting for operator action"
+                    "snapshot has only blocked tables remaining; continuing CDC for ready tables while blocked tables wait for manual resync"
                 );
-                if wait_snapshot_task_backoff(Duration::from_secs(15), shutdown.clone()).await {
-                    break Ok(());
-                }
-                continue;
+                break Ok(());
             }
             break Err(CdcSyncPolicyError::SnapshotBlocked {
                 tables: blocked_tables.keys().cloned().collect(),
@@ -504,7 +546,10 @@ async fn run_cdc_snapshot_phase(
     }
     snapshot_result?;
     if !snapshot_completed {
-        return Ok(SnapshotPhaseResult { completed: false });
+        return Ok(SnapshotPhaseResult {
+            completed: false,
+            blocked_tables: blocked_tables.keys().cloned().collect(),
+        });
     }
 
     let completed_at = Utc::now();
@@ -530,7 +575,10 @@ async fn run_cdc_snapshot_phase(
         }
     }
 
-    Ok(SnapshotPhaseResult { completed: true })
+    Ok(SnapshotPhaseResult {
+        completed: true,
+        blocked_tables: blocked_tables.keys().cloned().collect(),
+    })
 }
 
 pub(super) fn checkpoint_has_material_sync_progress(checkpoint: &TableCheckpoint) -> bool {
@@ -1268,6 +1316,32 @@ impl PostgresSource {
                     "shutdown requested during CDC snapshot; preserving resumable snapshot progress"
                 );
                 return Ok(());
+            }
+            if !snapshot_outcome.blocked_tables.is_empty() {
+                let blocked_table_ids: HashSet<TableId> = table_ids
+                    .iter()
+                    .filter_map(|(table_id, table_cfg)| {
+                        snapshot_outcome
+                            .blocked_tables
+                            .contains(&table_cfg.name)
+                            .then_some(*table_id)
+                    })
+                    .collect();
+                if blocked_table_ids.len() == include_tables.len() {
+                    return Err(CdcSyncPolicyError::SnapshotBlocked {
+                        tables: snapshot_outcome.blocked_tables.iter().cloned().collect(),
+                    }
+                    .into());
+                }
+                for blocked_table_id in blocked_table_ids {
+                    include_tables.remove(&blocked_table_id);
+                }
+                warn!(
+                    connection = %connection_label,
+                    blocked_tables = ?snapshot_outcome.blocked_tables,
+                    remaining_cdc_tables = include_tables.len(),
+                    "starting CDC while excluding blocked snapshot tables until manual resync"
+                );
             }
             if !preserve_existing_backlog {
                 let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);

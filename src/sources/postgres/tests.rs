@@ -1114,6 +1114,113 @@ fn snapshot_retry_is_suppressed_once_table_is_blocked() {
 }
 
 #[test]
+fn snapshot_phase_proceeds_to_cdc_only_in_follow_mode_with_blocked_tables() {
+    assert!(super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        true, 1
+    ));
+    assert!(!super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        false, 1
+    ));
+    assert!(!super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        true, 0
+    ));
+}
+
+#[test]
+fn snapshot_scheduler_round_robins_runnable_tables() {
+    let now = Utc::now();
+    let checkpoint = Arc::new(Mutex::new(TableCheckpoint::default()));
+    let make_info = |table_name: &str| {
+        CdcTableInfo::new(
+            crate::destinations::etl_bigquery::CdcTableSpec {
+                table_id: TableId::new(1),
+                source_name: table_name.to_string(),
+                dest_name: table_name.replace('.', "__"),
+                schema: TableSchema {
+                    name: table_name.replace('.', "__"),
+                    columns: vec![ColumnSchema {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    }],
+                    primary_key: Some("id".to_string()),
+                },
+                metadata: MetadataColumns::default(),
+                primary_key: "id".to_string(),
+                soft_delete: false,
+                soft_delete_column: None,
+            },
+            &EtlTableSchema::new(
+                TableId::new(1),
+                etl::types::TableName::new("public".to_string(), "items".to_string()),
+                vec![etl::types::ColumnSchema::new(
+                    "id".to_string(),
+                    etl::types::Type::INT8,
+                    -1,
+                    false,
+                    false,
+                )],
+            ),
+        )
+        .expect("cdc table info")
+    };
+    let make_entry = |table_name: &str| super::cdc_sync::SnapshotTaskQueueEntry {
+        task: CdcSnapshotTask {
+            table: ResolvedPostgresTable {
+                name: table_name.to_string(),
+                primary_key: "id".to_string(),
+                updated_at_column: None,
+                soft_delete: false,
+                soft_delete_column: None,
+                where_clause: None,
+                columns: ColumnSelection {
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                },
+            },
+            info: make_info(table_name),
+            checkpoint_state: Arc::clone(&checkpoint),
+            resume_from_primary_key: None,
+            chunk: Some(SnapshotChunkRange {
+                start_pk: 1,
+                end_pk: 10,
+            }),
+            write_mode: WriteMode::Append,
+            state_handle: None,
+        },
+        next_retry_at: None,
+    };
+
+    let mut queues = BTreeMap::new();
+    queues.insert(
+        "public.a_big".to_string(),
+        VecDeque::from(vec![make_entry("public.a_big"), make_entry("public.a_big")]),
+    );
+    queues.insert(
+        "public.z_small".to_string(),
+        VecDeque::from(vec![make_entry("public.z_small")]),
+    );
+
+    let (first, _, cursor) = super::cdc_sync::next_snapshot_task_table(
+        &["public.a_big".to_string(), "public.z_small".to_string()],
+        0,
+        &queues,
+        &HashSet::new(),
+        now,
+    );
+    assert_eq!(first.as_deref(), Some("public.a_big"));
+
+    let (second, _, _) = super::cdc_sync::next_snapshot_task_table(
+        &["public.a_big".to_string(), "public.z_small".to_string()],
+        cursor,
+        &queues,
+        &HashSet::new(),
+        now,
+    );
+    assert_eq!(second.as_deref(), Some("public.z_small"));
+}
+
+#[test]
 fn manual_resync_request_overrides_incompatible_startup_schema_checks() {
     let mut diff = SchemaDiff::default();
     diff.type_changed

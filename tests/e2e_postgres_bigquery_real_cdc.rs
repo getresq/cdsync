@@ -9,6 +9,7 @@ use cdsync::state::{ConnectionState, SyncState, SyncStateStore};
 use cdsync::stats::StatsDb;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
 use chrono::Utc;
+use etl_postgres::replication::slots::APPLY_WORKER_PREFIX;
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
@@ -38,13 +39,39 @@ struct FollowRunnerConfigInput<'a> {
     bq_config: &'a BigQueryConfig,
 }
 
-#[tokio::test]
+struct ChildTerminationGuard {
+    pid: Option<u32>,
+}
+
+impl ChildTerminationGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ChildTerminationGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
         return Ok(());
     }
     dotenv_support::load_dotenv()?;
     real_bigquery_support::install_rustls_provider();
+    let _ = JWT_CRYPTO_PROVIDER.install_default();
 
     let Ok(real_bq) = real_bigquery_support::load_env() else {
         return Ok(());
@@ -70,6 +97,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         .max_connections(5)
         .connect(&pg_url)
         .await?;
+    cleanup_stale_apply_slots(&pool).await?;
     sqlx::query(&format!("drop table if exists {}", qualified_table))
         .execute(&pool)
         .await?;
@@ -281,10 +309,15 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     .await?;
     assert_eq!(deleted_count, 120);
 
+    drop(client);
+    drop(dest);
+    drop(source);
+    pool.close().await;
+
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> Result<()> {
     if std::env::var("CDSYNC_RUN_REAL_BQ_TESTS").ok().as_deref() != Some("1") {
         return Ok(());
@@ -303,7 +336,7 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     let batch_load_bucket = std::env::var("CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "nora-461013-cdsync-staging-loads".to_string());
+        .unwrap_or_else(|| "cdsync-e2e-test-loads".to_string());
 
     let suffix = Uuid::new_v4().simple().to_string();
     let publication = format!("cdsync_real_follow_pub_{}", &suffix[..8]);
@@ -327,6 +360,7 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
         .max_connections(8)
         .connect(&pg_url)
         .await?;
+    cleanup_stale_apply_slots(&pool).await?;
 
     let mut table_names = Vec::with_capacity(table_count);
     let mut table_configs = Vec::with_capacity(table_count);
@@ -481,7 +515,10 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     )
     .await?;
 
+    cleanup_stale_follow_runners(connection_id).await?;
     let mut child = runner_process_with_logs(&config_path, connection_id, &log_path)?;
+    let child_pid = child.id().ok_or_else(|| anyhow::anyhow!("runner pid"))?;
+    let mut child_guard = ChildTerminationGuard::new(child_pid);
     wait_for_log_line(
         &log_path,
         "starting logical replication",
@@ -520,8 +557,8 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     )
     .await;
 
-    terminate_child(child.id().ok_or_else(|| anyhow::anyhow!("runner pid"))?).await?;
-    let _ = child.wait().await;
+    terminate_and_wait_child(&mut child, child_pid).await?;
+    child_guard.disarm();
 
     let advanced_lsn = match advanced_lsn {
         Ok(lsn) => lsn,
@@ -537,6 +574,10 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     };
 
     assert_ne!(advanced_lsn, baseline_lsn);
+    drop(state_store);
+    drop(dest);
+    drop(source);
+    pool.close().await;
     Ok(())
 }
 
@@ -664,6 +705,51 @@ async fn terminate_child(pid: u32) -> Result<()> {
     Ok(())
 }
 
+async fn terminate_and_wait_child(child: &mut Child, pid: u32) -> Result<()> {
+    terminate_child(pid).await?;
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(wait_result) => {
+            let _ = wait_result?;
+            Ok(())
+        }
+        Err(_) => {
+            let kill_status = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .status()
+                .await?;
+            anyhow::ensure!(kill_status.success(), "failed to send SIGKILL");
+            let _ = child.wait().await?;
+            Ok(())
+        }
+    }
+}
+
+async fn cleanup_stale_follow_runners(connection_id: &str) -> Result<()> {
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg(format!("--connection {}", connection_id))
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    for pid in String::from_utf8_lossy(&output.stdout).lines() {
+        let pid = pid.trim();
+        if pid.is_empty() {
+            continue;
+        }
+        let status = Command::new("kill").arg("-TERM").arg(pid).status().await?;
+        anyhow::ensure!(
+            status.success(),
+            "failed to terminate stale runner pid {pid}"
+        );
+    }
+    sleep(Duration::from_secs(1)).await;
+    Ok(())
+}
+
 async fn wait_for_log_line(
     log_path: &PathBuf,
     needle: &str,
@@ -716,4 +802,27 @@ async fn tail_log(log_path: &PathBuf, lines: usize) -> String {
     let all = contents.lines().collect::<Vec<_>>();
     let start = all.len().saturating_sub(lines);
     all[start..].join("\n")
+}
+
+async fn cleanup_stale_apply_slots(pool: &sqlx::PgPool) -> Result<()> {
+    let slot_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        select slot_name
+        from pg_replication_slots
+        where slot_type = 'logical'
+          and active = false
+          and slot_name like $1
+        "#,
+    )
+    .bind(format!("{APPLY_WORKER_PREFIX}_%"))
+    .fetch_all(pool)
+    .await?;
+
+    for slot_name in slot_names {
+        sqlx::query("select pg_drop_replication_slot($1)")
+            .bind(slot_name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
