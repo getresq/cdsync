@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::CdcSyncPolicyError;
 use rustls::pki_types::pem::PemObject;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,17 +196,17 @@ impl PostgresSource {
             }
             match policy {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
                     if diff.has_incompatible() || primary_key_changed_detected {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table.name
-                        );
+                        return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                            table: table.name.clone(),
+                        }
+                        .into());
                     }
                     info!(table = %table.name, "schema change detected; auto-altering destination");
                 }
@@ -225,16 +226,16 @@ impl PostgresSource {
             );
             match policy {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
-                    anyhow::bail!(
-                        "incompatible schema change detected for {}; trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
             }
         }
