@@ -15,7 +15,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{self, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
@@ -61,6 +61,13 @@ impl Drop for ChildTerminationGuard {
                 .arg(pid.to_string())
                 .status();
         }
+    }
+}
+
+fn maybe_exit_test_at(phase: &str) {
+    if env::var("CDSYNC_TEST_EXIT_AT").ok().as_deref() == Some(phase) {
+        eprintln!("exiting test process at phase={phase}");
+        process::exit(0);
     }
 }
 
@@ -202,6 +209,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         shutdown: None,
     }))
     .await?;
+    maybe_exit_test_at("after_initial_sync");
 
     let initial_dest = dest.summarize_table(&dest_table).await?;
     assert_eq!(initial_dest.row_count, 1000);
@@ -264,12 +272,14 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         shutdown: None,
     }))
     .await?;
+    maybe_exit_test_at("after_incremental_sync");
 
     let final_source = source.summarize_table(&tables[0]).await?;
     let final_dest = dest.summarize_table(&dest_table).await?;
     assert_eq!(final_source.row_count, 1040);
     assert_eq!(final_dest.row_count, 1160);
     assert_eq!(final_dest.deleted_rows, 120);
+    maybe_exit_test_at("after_final_summaries");
 
     let client = real_bigquery_support::client(&real_bq.key_path).await?;
     let schema_fields = real_bigquery_support::fetch_live_table_fields(
@@ -280,6 +290,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     )
     .await?;
     assert!(schema_fields.iter().any(|field| field == "extra"));
+    maybe_exit_test_at("after_schema_query");
 
     let extra_count = real_bigquery_support::query_i64(
         &client,
@@ -294,6 +305,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     )
     .await?;
     assert_eq!(extra_count, 120);
+    maybe_exit_test_at("after_extra_query");
 
     let deleted_count = real_bigquery_support::query_i64(
         &client,
@@ -309,10 +321,15 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     .await?;
     assert_eq!(deleted_count, 120);
 
+    maybe_exit_test_at("after_asserts");
+
     drop(client);
     drop(dest);
     drop(source);
     pool.close().await;
+
+    maybe_exit_test_at("after_pool_close");
+    maybe_exit_test_at("before_return");
 
     Ok(())
 }

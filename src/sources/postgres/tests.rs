@@ -4,7 +4,7 @@ use crate::destinations::Destination;
 use crate::retry::ErrorReasonCode;
 use async_trait::async_trait;
 use polars::prelude::{NamedFrom, Series};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1104,6 +1104,55 @@ fn should_clear_snapshot_runtime_only_after_table_fully_drains() {
     ));
     assert!(super::cdc_sync::should_clear_snapshot_runtime_on_success(
         false, 0, false
+    ));
+}
+
+#[test]
+fn blocked_tables_are_excluded_from_snapshot_finalization() {
+    let completed_at = Utc::now();
+    let mut blocked_tables = BTreeMap::new();
+    blocked_tables.insert(
+        "public.accounts".to_string(),
+        "permanent schema mismatch".to_string(),
+    );
+    let mut checkpoint = TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_preserve_backlog: true,
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("5".to_string()),
+            complete: false,
+        }],
+        runtime: Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            attempts: 2,
+            reason: Some(ErrorReasonCode::SnapshotBlocked),
+            last_error: Some("permanent schema mismatch".to_string()),
+            next_retry_at: None,
+            updated_at: Some(completed_at),
+        }),
+        ..Default::default()
+    };
+
+    if super::cdc_sync::should_finalize_snapshot_checkpoint("public.accounts", &blocked_tables) {
+        checkpoint.last_synced_at = Some(completed_at);
+        checkpoint.last_primary_key = None;
+        checkpoint.snapshot_start_lsn = None;
+        checkpoint.snapshot_preserve_backlog = false;
+        checkpoint.snapshot_chunks.clear();
+    }
+
+    assert!(checkpoint.last_synced_at.is_none());
+    assert_eq!(checkpoint.snapshot_start_lsn.as_deref(), Some("0/ABC"));
+    assert!(checkpoint.snapshot_preserve_backlog);
+    assert_eq!(checkpoint.snapshot_chunks.len(), 1);
+    assert!(matches!(
+        checkpoint
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.status.clone()),
+        Some(TableRuntimeStatus::Blocked)
     ));
 }
 

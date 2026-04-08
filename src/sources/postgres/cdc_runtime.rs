@@ -9,6 +9,38 @@ const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn emit_runtime_probe(slot_name: &str, phase: &str) {
+    if std::env::var("CDSYNC_TEST_SYNC_PROBE").ok().as_deref() == Some("1") {
+        eprintln!("CDSYNC_RUNTIME_PROBE slot={slot_name} phase={phase}");
+    }
+}
+
+fn emit_runtime_idle_blocked_probe(
+    slot_name: &str,
+    state: &CdcIdleState,
+    last_xlog_activity: Instant,
+    idle_timeout: Duration,
+) {
+    if std::env::var("CDSYNC_TEST_SYNC_PROBE").ok().as_deref() != Some("1") || state.follow {
+        return;
+    }
+    if last_xlog_activity.elapsed() < idle_timeout {
+        return;
+    }
+    if cdc_should_stop_after_idle(state, last_xlog_activity, idle_timeout) {
+        return;
+    }
+    eprintln!(
+        "CDSYNC_RUNTIME_PROBE slot={slot_name} phase=idle_blocked in_tx={} pending_events_empty={} queued_batches_empty={} pending_table_batches_empty={} inflight_apply_empty={} last_xlog_idle_ms={}",
+        state.in_tx,
+        state.pending_events_empty,
+        state.queued_batches_empty,
+        state.pending_table_batches_empty,
+        state.inflight_apply_empty,
+        last_xlog_activity.elapsed().as_millis()
+    );
+}
+
 impl PostgresSource {
     pub(super) async fn stream_cdc_changes(
         &self,
@@ -908,22 +940,27 @@ impl PostgresSource {
                 },
             )?;
 
-            if cdc_should_stop_after_idle(
-                &CdcIdleState {
-                    follow,
-                    in_tx,
-                    pending_events_empty: pending_events.is_empty(),
-                    queued_batches_empty: queued_batches.is_empty(),
-                    pending_table_batches_empty: pending_table_batches.is_empty(),
-                    inflight_apply_empty: inflight_dispatch.is_empty() && inflight_apply.is_empty(),
-                },
+            let idle_state = CdcIdleState {
+                follow,
+                in_tx,
+                pending_events_empty: pending_events.is_empty(),
+                queued_batches_empty: queued_batches.is_empty(),
+                pending_table_batches_empty: pending_table_batches.is_empty(),
+                inflight_apply_empty: inflight_dispatch.is_empty() && inflight_apply.is_empty(),
+            };
+            emit_runtime_idle_blocked_probe(
+                slot_name,
+                &idle_state,
                 last_xlog_activity,
                 idle_timeout,
-            ) {
+            );
+            if cdc_should_stop_after_idle(&idle_state, last_xlog_activity, idle_timeout) {
+                emit_runtime_probe(slot_name, "stop_after_idle");
                 break;
             }
         }
 
+        emit_runtime_probe(slot_name, "before_finalize_cdc_runtime");
         finalize_cdc_runtime(
             slot_name,
             pending_events.len(),
@@ -955,5 +992,6 @@ impl PostgresSource {
             &mut last_flushed_lsn,
         )
         .await
+        .inspect(|_| emit_runtime_probe(slot_name, "after_finalize_cdc_runtime"))
     }
 }
