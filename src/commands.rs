@@ -1,4 +1,60 @@
 use super::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+const SYNC_RETRY_INITIAL_BACKOFF_FLOOR_MS: u64 = 16_000;
+const SYNC_RETRY_MAX_BACKOFF_MS: u64 = 1_024_000;
+const SYNC_RETRY_JITTER_PERCENT: i64 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRetryClass {
+    Backpressure,
+    Transient,
+    Permanent,
+}
+
+pub(crate) fn classify_sync_retry(error: &anyhow::Error) -> SyncRetryClass {
+    let message = format!("{error:#}").to_ascii_lowercase();
+
+    if message.contains("quota exceeded") && message.contains("dml jobs writing to a table") {
+        return SyncRetryClass::Backpressure;
+    }
+
+    if message.contains("schema change detected")
+        || message.contains("incompatible schema change detected")
+        || message.contains("trigger a manual table resync")
+        || message.contains("postgres.publication is required when cdc is enabled")
+        || (message.contains("publication") && message.contains("does not exist"))
+        || (message.contains("publication") && message.contains("not found"))
+    {
+        return SyncRetryClass::Permanent;
+    }
+
+    SyncRetryClass::Transient
+}
+
+pub(crate) fn compute_sync_retry_backoff(
+    retry_key: &str,
+    attempt: u32,
+    configured_ms: u64,
+) -> Duration {
+    let initial_ms = configured_ms.max(SYNC_RETRY_INITIAL_BACKOFF_FLOOR_MS);
+    let exponent = attempt.saturating_sub(1).min(20);
+    let base_ms = (u128::from(initial_ms) * (1_u128 << exponent))
+        .min(u128::from(SYNC_RETRY_MAX_BACKOFF_MS)) as u64;
+
+    let mut hasher = DefaultHasher::new();
+    retry_key.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let jitter_bucket = (hasher.finish() % ((SYNC_RETRY_JITTER_PERCENT as u64 * 2) + 1)) as i64
+        - SYNC_RETRY_JITTER_PERCENT;
+    let jittered_ms = i128::from(base_ms) + (i128::from(base_ms) * i128::from(jitter_bucket) / 100);
+    let bounded_ms = jittered_ms
+        .max(i128::from(initial_ms))
+        .min(i128::from(SYNC_RETRY_MAX_BACKOFF_MS)) as u64;
+
+    Duration::from_millis(bounded_ms)
+}
 
 pub(crate) fn select_sync_connections<'a>(
     connections: &'a [crate::config::ConnectionConfig],
@@ -372,7 +428,6 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                     "syncing postgres via CDC"
                 );
                 let mut attempt = 0;
-                let mut backoff = Duration::from_millis(retry_backoff_ms);
                 loop {
                     attempt += 1;
                     let result = source
@@ -384,6 +439,7 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                             dry_run,
                             follow,
                             default_batch_size,
+                            retry_backoff_ms,
                             snapshot_concurrency: max_concurrency,
                             tables: &tables,
                             schema_diff_enabled,
@@ -394,12 +450,25 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                         .with_context(|| "syncing postgres CDC");
                     match result {
                         Ok(()) => break,
-                        Err(err) if follow || attempt < max_retries => {
+                        Err(err)
+                            if (follow || attempt < max_retries)
+                                && !matches!(
+                                    classify_sync_retry(&err),
+                                    SyncRetryClass::Permanent
+                                ) =>
+                        {
+                            let retry_class = classify_sync_retry(&err);
+                            let backoff = compute_sync_retry_backoff(
+                                &format!("{}:postgres_cdc", connection.id),
+                                attempt,
+                                retry_backoff_ms,
+                            );
                             telemetry::record_retry_attempt(&connection.id, "postgres_cdc");
                             warn!(
                                 connection = %connection.id,
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
+                                retry_class = ?retry_class,
                                 backoff_ms = backoff.as_millis() as u64,
                                 error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed; retrying"
@@ -413,13 +482,14 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                 );
                                 return Ok(());
                             }
-                            backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                         }
                         Err(err) => {
+                            let retry_class = classify_sync_retry(&err);
                             error!(
                                 connection = %connection.id,
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
+                                retry_class = ?retry_class,
                                 error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed permanently"
                             );
@@ -461,7 +531,6 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                         };
                         let _permit = permit;
                         let mut attempt = 0;
-                        let mut backoff = Duration::from_millis(retry_backoff_ms);
                         let result = loop {
                             attempt += 1;
                             let attempt_result = source
@@ -480,13 +549,26 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                 .with_context(|| format!("syncing postgres table {}", table.name));
                             match attempt_result {
                                 Ok(next_checkpoint) => break Ok(next_checkpoint),
-                                Err(err) if attempt < max_retries => {
+                                Err(err)
+                                    if attempt < max_retries
+                                        && !matches!(
+                                            classify_sync_retry(&err),
+                                            SyncRetryClass::Permanent
+                                        ) =>
+                                {
+                                    let retry_class = classify_sync_retry(&err);
+                                    let backoff = compute_sync_retry_backoff(
+                                        &format!("{}:postgres_table:{}", connection_id, table.name),
+                                        attempt,
+                                        retry_backoff_ms,
+                                    );
                                     telemetry::record_retry_attempt(&connection_id, "postgres_table");
                                     warn!(
                                         connection = %connection_id,
                                         run_id = run_id.as_deref().unwrap_or("none"),
                                         table = %table.name,
                                         attempt,
+                                        retry_class = ?retry_class,
                                         backoff_ms = backoff.as_millis() as u64,
                                         last_synced_at = ?checkpoint.last_synced_at,
                                         last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
@@ -510,14 +592,15 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                             .await,
                                         );
                                     }
-                                    backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                                 }
                                 Err(err) => {
+                                    let retry_class = classify_sync_retry(&err);
                                     error!(
                                         connection = %connection_id,
                                         run_id = run_id.as_deref().unwrap_or("none"),
                                         table = %table.name,
                                         attempt,
+                                        retry_class = ?retry_class,
                                         last_synced_at = ?checkpoint.last_synced_at,
                                         last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
                                         error = %err,

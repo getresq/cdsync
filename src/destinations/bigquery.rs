@@ -21,7 +21,7 @@ use polars::prelude::DataFrame;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +47,7 @@ pub struct BigQueryDestination {
     dry_run: bool,
     metadata: MetadataColumns,
     cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    merge_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,7 +174,16 @@ impl BigQueryDestination {
             dry_run,
             metadata,
             cleanup_tasks: Arc::new(Mutex::new(Vec::new())),
+            merge_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    async fn table_merge_lock(&self, table: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut guard = self.merge_locks.lock().await;
+        guard
+            .entry(table.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -859,6 +869,12 @@ impl BigQueryDestination {
             .iter()
             .map(|col| format!("S.{}", bq_ident(col)))
             .collect();
+
+        let merge_lock = self.table_merge_lock(target).await;
+        let _merge_permit = merge_lock
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to acquire BigQuery merge lock for {}", target))?;
 
         let sql = format!(
             "MERGE `{project}.{dataset}.{target}` T USING `{project}.{dataset}.{staging}` S ON T.{pk} = S.{pk} \

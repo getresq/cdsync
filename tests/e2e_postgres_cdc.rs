@@ -134,6 +134,7 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
             dry_run: false,
             follow: false,
             default_batch_size: 1000,
+            retry_backoff_ms: 1_000,
             snapshot_concurrency: 1,
             tables: &tables,
             schema_diff_enabled: false,

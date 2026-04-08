@@ -1,79 +1,72 @@
 # Next
 
-## After Staging Stabilization
+## Milestone 3: Partial Snapshot + CDC Overlap
 
-### Realtime Operator Stream
+Goal:
+- let already-snapshotted tables consume CDC while other tables are still snapshotting
+- avoid one hot snapshot table freezing the whole connection
+- preserve correct WAL acknowledgement semantics
 
-Add a realtime admin stream after the live staging situation is understood and stable.
+Why this is separate:
+- Milestones 1 and 2 are safe hardening work
+  - per-table merge serialization
+  - table-local retry / blocked state during snapshot
+- Milestone 3 changes the correctness boundary between snapshot completion and CDC follow
+- that means more risk around duplicates, gaps, and watermark advancement
 
-Recommendation:
-- Start with `SSE`, not WebSocket.
-- Keep it server-to-client only for the first slice.
-- Preserve the existing HTTP admin endpoints as the source of truth.
+Required runtime model:
+- snapshot state becomes table-local instead of connection-global
+- each table needs an explicit lifecycle:
+  - `never_started`
+  - `snapshotting`
+  - `snapshot_retrying`
+  - `snapshot_blocked`
+  - `cdc_ready`
+  - `cdc_following`
+- CDC producer may read WAL for the connection before every table is `cdc_ready`
+- coordinator must only advance WAL when every fragment up to the head-of-line sequence is safe
 
-Primary goal:
-- Answer "is this connection healthy, making progress, idle, or stuck right now?"
+Design constraints:
+- a table may not receive CDC apply before its snapshot start LSN and snapshot completeness rules are satisfied
+- table promotion from snapshot to CDC must be explicit and durable
+- WAL acknowledgement cannot depend on vague "connection is mostly healthy" logic
+- backpressure must remain table-aware, not only connection-aware
 
-Proposed stream shape:
-- `GET /v1/stream?connection=<id>`
-- Send a snapshot on connect, then small delta events.
-- Include `seq` and `at` on every event.
+State required:
+- durable per-table runtime state
+  - phase
+  - attempts
+  - last error
+  - next retry time
+  - snapshot start LSN
+  - snapshot completion marker
+  - CDC-ready marker
+- durable per-fragment / coordinator state remains the source of truth for WAL advancement
 
-First event types:
-- `service.heartbeat`
-  version, deploy revision, uptime, server time
-- `connection.runtime`
-  phase, reason, mode, run id, last error summary, last successful apply time
-- `connection.throughput`
-  rows read/written/upserted/deleted totals and rolling rates, extract/load ms
-- `connection.cdc`
-  slot active, last received/flushed LSN, pending events, queued commits, inflight applies, backpressure state, last xlog activity time
-- `snapshot.progress`
-  current table, chunks complete/total, rows copied, rows/sec, estimated remaining if cheap to compute
-- `table.progress`
-  only for active/hot tables, not the full table set every tick
+Implementation sketch:
+1. Keep the current exported snapshot planning, but mark tables `cdc_ready` as soon as their snapshot chunks complete.
+2. Start the WAL producer once the exported snapshot slot is established.
+3. For tables not yet `cdc_ready`, producer persists CDC fragments but apply is deferred.
+4. For tables that are `cdc_ready`, consumer may claim and apply fragments immediately.
+5. Coordinator advances only when contiguous fragments are complete, regardless of how many tables are still snapshoting.
+6. Dashboard/admin API must show mixed-mode reality:
+   - some tables snapshotting
+   - some tables retrying
+   - some tables following CDC
+   - coordinator pending / blocked sequences
 
-Do not include:
-- per-row CDC payloads
-- raw WAL / decoded tuples
-- full config blobs
-- full checkpoint maps every second
-- giant full-table snapshots on every tick
-- secrets, auth material, SQL text
+Main risks:
+- duplicate apply if a table is promoted to CDC too early
+- gaps if snapshot completion and first CDC LSN are not stitched together exactly
+- coordinator head-of-line blocking if one non-ready table owns early sequences
+- WAL retention growth if blocked tables accumulate fragments faster than operators resolve them
 
-Implementation notes:
-- Stream from in-memory runtime state and live stats handles, not by polling only the stats DB.
-- Keep DB persistence for durability/history.
-- Use low-frequency heartbeats plus change-driven events where possible.
-- Make the stream connection-scoped to avoid unnecessary fanout.
-
-### WAL / Slot Visibility
-
-Add explicit source-side WAL / replication-slot visibility to the admin surface and dashboard so operators can distinguish:
-- no new source WAL
-- source WAL is advancing and CDSync is following
-- source WAL is advancing but CDSync is not advancing
-- slot is retaining WAL and creating storage risk
-
-Do not show only a generic "WAL size" number. The useful signals are:
-- `current_wal_lsn`
-- `confirmed_flush_lsn`
-- `restart_lsn`
-- `slot_active`
-- `wal_bytes_behind_confirmed = pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)`
-- `wal_bytes_retained_by_slot = pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`
-- `last_xlog_activity_at` or equivalent recent source activity signal
-
-Desired dashboard/operator questions:
-- Is Postgres producing new WAL right now?
-- Is CDSync acknowledging and flushing WAL?
-- Is slot retention growing?
-- Is the source idle, or is CDSync stale?
-
-Good first UI fields:
-- source WAL advancing: yes/no
-- CDSync flush advancing: yes/no
-- bytes behind confirmed flush
-- bytes retained by slot
-- slot active: yes/no
-- last WAL activity age
+Suggested rollout path:
+1. Prove Milestones 1 and 2 in staging.
+2. Add Milestone 3 behind an explicit feature flag.
+3. Run restart/resume tests with mixed table states.
+4. Force one table into retry/block while others keep moving.
+5. Verify:
+   - CDC continues for `cdc_ready` tables
+   - blocked table does not duplicate or lose rows after recovery
+   - coordinator never advances beyond unsafe contiguous state

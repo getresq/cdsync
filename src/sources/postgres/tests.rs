@@ -966,6 +966,116 @@ fn snapshot_table_write_plan_truncates_new_bootstrap_tables_on_resume() {
 }
 
 #[test]
+fn snapshot_task_failure_disposition_retries_bigquery_dml_quota_errors() {
+    let err = anyhow::anyhow!(
+        "merging staging BigQuery table public__foo into public__bar: Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table, pending + running"
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_blocks_non_quota_errors() {
+    let err = anyhow::anyhow!("invalid field mapping for BigQuery merge");
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+    );
+}
+
+#[test]
+fn snapshot_task_retry_backoff_caps_at_fifteen_minutes() {
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(1, 1_000),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(6, 1_000),
+        Duration::from_secs(32)
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(20, 1_000),
+        Duration::from_secs(15 * 60)
+    );
+}
+
+#[test]
+fn snapshot_task_queue_seed_preserves_blocked_tables_until_manual_resync() {
+    let runtime = TableRuntimeState {
+        status: TableRuntimeStatus::Blocked,
+        attempts: 2,
+        last_error: Some("permanent schema mismatch".to_string()),
+        next_retry_at: None,
+        updated_at: None,
+    };
+
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), false),
+        super::cdc_sync::SnapshotTaskQueueSeed::Blocked {
+            last_error: Some("permanent schema mismatch".to_string())
+        }
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), true),
+        super::cdc_sync::SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: None
+        }
+    );
+}
+
+#[test]
+fn snapshot_task_queue_seed_keeps_retry_schedule_for_retrying_tables() {
+    let retry_at = Utc::now();
+    let runtime = TableRuntimeState {
+        status: TableRuntimeStatus::Retrying,
+        attempts: 4,
+        last_error: Some("quota exceeded".to_string()),
+        next_retry_at: Some(retry_at),
+        updated_at: Some(retry_at),
+    };
+
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), false),
+        super::cdc_sync::SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: Some(retry_at)
+        }
+    );
+}
+
+#[test]
+fn snapshot_task_requires_table_serialization_only_for_upserts() {
+    assert!(!super::cdc_sync::snapshot_task_requires_table_serialization(WriteMode::Append));
+    assert!(super::cdc_sync::snapshot_task_requires_table_serialization(
+        WriteMode::Upsert
+    ));
+}
+
+#[test]
+fn should_reset_snapshot_runtime_for_fresh_or_manual_snapshots() {
+    assert!(super::cdc_sync::should_reset_snapshot_runtime(false, false));
+    assert!(super::cdc_sync::should_reset_snapshot_runtime(true, true));
+    assert!(!super::cdc_sync::should_reset_snapshot_runtime(true, false));
+}
+
+#[test]
+fn should_clear_snapshot_runtime_only_after_table_fully_drains() {
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        true, 0, false
+    ));
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 1, false
+    ));
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 0, true
+    ));
+    assert!(super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 0, false
+    ));
+}
+
+#[test]
 fn manual_resync_request_overrides_incompatible_startup_schema_checks() {
     let mut diff = SchemaDiff::default();
     diff.type_changed

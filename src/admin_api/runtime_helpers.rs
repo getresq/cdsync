@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::{TableRuntimeState, TableRuntimeStatus};
 
 pub(super) const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -471,37 +472,45 @@ pub(super) fn build_table_progress(
                     .filter(|chunk| chunk.complete)
                     .count()
             });
-            let (phase, reason_code) = match state
-                .and_then(|state| state.last_sync_status.as_deref())
-            {
-                Some("failed")
-                    if matches!(
-                        connection_reason_code,
-                        "schema_blocked" | "publication_blocked"
-                    ) =>
-                {
-                    ("blocked", connection_reason_code)
-                }
-                Some("failed") => ("error", connection_reason_code),
-                Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
-                    ("snapshotting", "snapshot_in_progress")
-                }
-                Some("running") => match cdc_runtime_state {
-                    Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
-                    Some(PostgresCdcRuntimeState::ContinuityLost) => {
-                        ("blocked", "cdc_continuity_lost")
+            let runtime = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.runtime.clone());
+            let (phase, reason_code) = if let Some(runtime) = runtime.as_ref() {
+                table_runtime_phase_and_reason(runtime)
+            } else {
+                match state.and_then(|state| state.last_sync_status.as_deref()) {
+                    Some("failed")
+                        if matches!(
+                            connection_reason_code,
+                            "schema_blocked" | "publication_blocked"
+                        ) =>
+                    {
+                        ("blocked", connection_reason_code)
                     }
-                    Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
-                    Some(PostgresCdcRuntimeState::Initializing) => ("pending", "cdc_initializing"),
-                    None => ("syncing", "sync_in_progress"),
-                },
-                Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
-                _ => ("pending", "never_synced"),
+                    Some("failed") => ("error", connection_reason_code),
+                    Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
+                        ("snapshotting", "snapshot_in_progress")
+                    }
+                    Some("running") => match cdc_runtime_state {
+                        Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
+                        Some(PostgresCdcRuntimeState::ContinuityLost) => {
+                            ("blocked", "cdc_continuity_lost")
+                        }
+                        Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
+                        Some(PostgresCdcRuntimeState::Initializing) => {
+                            ("pending", "cdc_initializing")
+                        }
+                        None => ("syncing", "sync_in_progress"),
+                    },
+                    Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
+                    _ => ("pending", "never_synced"),
+                }
             };
 
             TableProgress {
                 table_name,
                 checkpoint,
+                runtime,
                 stats: table_stats,
                 phase,
                 reason_code,
@@ -512,4 +521,18 @@ pub(super) fn build_table_progress(
             }
         })
         .collect()
+}
+
+fn table_runtime_phase_and_reason(runtime: &TableRuntimeState) -> (&'static str, &'static str) {
+    let quota_limited = runtime.last_error.as_deref().is_some_and(|error: &str| {
+        error
+            .to_ascii_lowercase()
+            .contains("exceeded quota for total number of dml jobs writing to a table")
+    });
+    match runtime.status {
+        TableRuntimeStatus::Retrying if quota_limited => ("retrying", "bigquery_dml_quota"),
+        TableRuntimeStatus::Retrying => ("retrying", "snapshot_retry_scheduled"),
+        TableRuntimeStatus::Blocked if quota_limited => ("blocked", "bigquery_dml_quota"),
+        TableRuntimeStatus::Blocked => ("blocked", "snapshot_blocked"),
+    }
 }

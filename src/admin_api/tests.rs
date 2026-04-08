@@ -4,7 +4,7 @@ use crate::config::{
     DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
     PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
-use crate::types::TableCheckpoint;
+use crate::types::{TableCheckpoint, TableRuntimeState, TableRuntimeStatus};
 use chrono::TimeZone;
 use std::collections::HashMap;
 
@@ -321,6 +321,86 @@ fn build_table_progress_requires_real_cdc_follow_state() {
 }
 
 #[test]
+fn build_table_progress_prefers_table_runtime_retry_state() {
+    let connection = test_postgres_cdc_connection();
+    let mut state = ConnectionState {
+        last_sync_status: Some("running".to_string()),
+        ..Default::default()
+    };
+    state.postgres.insert(
+        "public.accounts".to_string(),
+        TableCheckpoint {
+            runtime: Some(TableRuntimeState {
+                status: TableRuntimeStatus::Retrying,
+                attempts: 4,
+                last_error: Some("Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table".to_string()),
+                next_retry_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 5, 0).unwrap()),
+                updated_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let tables = build_table_progress(
+        &connection,
+        Some(&state),
+        &[],
+        Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+        "cdc_initializing",
+        Some(PostgresCdcRuntimeState::Initializing),
+    );
+
+    let table = tables
+        .iter()
+        .find(|table| table.table_name == "public.accounts")
+        .expect("runtime table present");
+    assert_eq!(table.phase, "retrying");
+    assert_eq!(table.reason_code, "bigquery_dml_quota");
+    assert!(matches!(
+        table.runtime.as_ref().map(|runtime| (&runtime.status, runtime.attempts)),
+        Some((TableRuntimeStatus::Retrying, 4))
+    ));
+}
+
+#[test]
+fn build_table_progress_prefers_table_runtime_blocked_state() {
+    let connection = test_postgres_cdc_connection();
+    let mut state = ConnectionState {
+        last_sync_status: Some("running".to_string()),
+        ..Default::default()
+    };
+    state.postgres.insert(
+        "public.accounts".to_string(),
+        TableCheckpoint {
+            runtime: Some(TableRuntimeState {
+                status: TableRuntimeStatus::Blocked,
+                attempts: 1,
+                last_error: Some("permanent schema mismatch".to_string()),
+                next_retry_at: None,
+                updated_at: Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let tables = build_table_progress(
+        &connection,
+        Some(&state),
+        &[],
+        Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+        "cdc_initializing",
+        Some(PostgresCdcRuntimeState::Initializing),
+    );
+
+    let table = tables
+        .iter()
+        .find(|table| table.table_name == "public.accounts")
+        .expect("runtime table present");
+    assert_eq!(table.phase, "blocked");
+    assert_eq!(table.reason_code, "snapshot_blocked");
+}
+
+#[test]
 fn derive_connection_runtime_surfaces_unknown_cdc_probe_state() {
     let connection = test_postgres_cdc_connection();
     let state = ConnectionState {
@@ -350,6 +430,7 @@ fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
     let idle = TableProgress {
         table_name: "public.a_idle".to_string(),
         checkpoint: None,
+        runtime: None,
         stats: None,
         phase: "running",
         reason_code: "cdc_following",
@@ -361,6 +442,7 @@ fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
     let busy = TableProgress {
         table_name: "public.z_busy".to_string(),
         checkpoint: None,
+        runtime: None,
         stats: Some(TableStatsSnapshot {
             run_id: "run-1".to_string(),
             connection_id: "app".to_string(),
@@ -382,6 +464,13 @@ fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
     let blocked = TableProgress {
         table_name: "public.m_blocked".to_string(),
         checkpoint: None,
+        runtime: Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            attempts: 1,
+            last_error: Some("schema blocked".to_string()),
+            next_retry_at: None,
+            updated_at: None,
+        }),
         stats: None,
         phase: "blocked",
         reason_code: "schema_blocked",
@@ -393,6 +482,7 @@ fn select_active_tables_prefers_busy_snapshot_or_blocked_tables() {
     let snapshotting = TableProgress {
         table_name: "public.n_snapshot".to_string(),
         checkpoint: None,
+        runtime: None,
         stats: None,
         phase: "snapshotting",
         reason_code: "snapshot_in_progress",

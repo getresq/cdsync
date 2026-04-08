@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::TableRuntimeState;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -67,6 +68,7 @@ pub(super) struct ProgressResponse {
 pub(super) struct TableProgress {
     pub(super) table_name: String,
     pub(super) checkpoint: Option<TableCheckpoint>,
+    pub(super) runtime: Option<TableRuntimeState>,
     pub(super) stats: Option<TableStatsSnapshot>,
     pub(super) phase: &'static str,
     pub(super) reason_code: &'static str,

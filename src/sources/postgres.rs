@@ -10,7 +10,7 @@ use crate::stats::StatsHandle;
 use crate::tls::MakeNativeTlsConnect;
 use crate::types::{
     ColumnSchema, DataType, MetadataColumns, SchemaFieldSnapshot, SnapshotChunkCheckpoint,
-    TableCheckpoint, TableSchema,
+    TableCheckpoint, TableRuntimeState, TableRuntimeStatus, TableSchema,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -180,6 +180,7 @@ pub struct CdcSyncRequest<'a> {
     pub dry_run: bool,
     pub follow: bool,
     pub default_batch_size: usize,
+    pub retry_backoff_ms: u64,
     pub snapshot_concurrency: usize,
     pub tables: &'a [ResolvedPostgresTable],
     pub schema_diff_enabled: bool,
