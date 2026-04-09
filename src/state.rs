@@ -31,16 +31,27 @@ static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/state");
 
 impl SyncState {
     pub async fn load_with_config(config: &StateConfig) -> anyhow::Result<Self> {
-        let store = SyncStateStore::open_with_config(config).await?;
+        let store = SyncStateStore::open_with_config(config, 16).await?;
+        store.load_state().await
+    }
+
+    pub async fn load_with_config_and_pool(
+        config: &StateConfig,
+        max_connections: u32,
+    ) -> anyhow::Result<Self> {
+        let store = SyncStateStore::open_with_config(config, max_connections).await?;
         store.load_state().await
     }
 }
 
 impl SyncStateStore {
-    pub async fn migrate_with_config(config: &StateConfig) -> anyhow::Result<()> {
+    pub async fn migrate_with_config(
+        config: &StateConfig,
+        max_connections: u32,
+    ) -> anyhow::Result<()> {
         validate_schema_name(config.schema_name())?;
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .connect(&config.url)
             .await?;
         let store = Self {
@@ -51,13 +62,19 @@ impl SyncStateStore {
         store.migrate().await
     }
 
-    pub async fn open_with_config(config: &StateConfig) -> anyhow::Result<Self> {
-        Self::open(&config.url, config.schema_name()).await
+    pub async fn open_with_config(
+        config: &StateConfig,
+        max_connections: u32,
+    ) -> anyhow::Result<Self> {
+        Self::open(&config.url, config.schema_name(), max_connections).await
     }
 
-    pub async fn open(url: &str, schema: &str) -> anyhow::Result<Self> {
+    pub async fn open(url: &str, schema: &str, max_connections: u32) -> anyhow::Result<Self> {
         validate_schema_name(schema)?;
-        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(url)
+            .await?;
         let store = Self {
             pool,
             schema: schema.to_string(),

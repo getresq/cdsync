@@ -20,8 +20,8 @@ async fn postgres_state_store_persists_public_api_state() -> anyhow::Result<()> 
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     let mut connection = ConnectionState {
@@ -69,8 +69,8 @@ async fn postgres_state_store_releases_lock_for_next_owner() -> anyhow::Result<(
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
 
     let lease = store.acquire_connection_lock("app").await?;
     assert!(store.acquire_connection_lock("app").await.is_err());
@@ -86,8 +86,8 @@ async fn postgres_state_store_round_trips_snapshot_resume_checkpoint_metadata() 
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     let mut connection = ConnectionState::default();
@@ -168,8 +168,8 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     handle
@@ -262,8 +262,8 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -333,8 +333,8 @@ async fn postgres_state_store_round_trips_manual_table_resync_requests() -> anyh
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
 
     store
         .request_postgres_table_resync("app", "public.accounts")
@@ -364,8 +364,8 @@ async fn postgres_state_store_requeues_running_jobs() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -404,8 +404,8 @@ async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -445,8 +445,8 @@ async fn postgres_state_store_does_not_requeue_permanent_failed_jobs() -> anyhow
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -487,8 +487,8 @@ async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -533,8 +533,8 @@ async fn postgres_state_store_enqueue_dedup_revives_failed_jobs() -> anyhow::Res
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 

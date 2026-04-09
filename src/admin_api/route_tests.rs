@@ -304,6 +304,7 @@ fn test_config() -> Config {
                 cdc_pipeline_id: Some(1),
                 cdc_batch_size: Some(1000),
                 cdc_apply_concurrency: Some(8),
+                cdc_batch_load_worker_count: Some(8),
                 cdc_max_fill_ms: Some(2000),
                 cdc_max_pending_events: Some(100_000),
                 cdc_idle_timeout_seconds: Some(10),

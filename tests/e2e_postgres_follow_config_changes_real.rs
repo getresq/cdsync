@@ -76,6 +76,7 @@ impl RealCdcE2eEnv {
             cdc_pipeline_id: Some(pipeline_id),
             cdc_batch_size: Some(1_000),
             cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: Some(8),
             cdc_max_fill_ms: Some(200),
             cdc_max_pending_events: Some(20_000),
             cdc_idle_timeout_seconds: Some(1),
@@ -423,8 +424,8 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
         url: env.pg_url.clone(),
         schema: Some(format!("cdsync_state_resync_{}", &suffix[..8])),
     };
-    SyncStateStore::migrate_with_config(&state_config).await?;
-    let state_store = SyncStateStore::open_with_config(&state_config).await?;
+    SyncStateStore::migrate_with_config(&state_config, 16).await?;
+    let state_store = SyncStateStore::open_with_config(&state_config, 16).await?;
     let state_handle = state_store.handle("app");
     let mut state = ConnectionState::default();
     let tracked = vec![

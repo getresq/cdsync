@@ -158,6 +158,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(200),
         cdc_apply_concurrency: Some(8),
+        cdc_batch_load_worker_count: Some(8),
         cdc_max_fill_ms: Some(2000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(1),
@@ -434,6 +435,7 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(200),
         cdc_apply_concurrency: Some(2),
+        cdc_batch_load_worker_count: Some(2),
         cdc_max_fill_ms: Some(1000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(1),
@@ -479,10 +481,13 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
     }))
     .await?;
 
-    let state_store = SyncStateStore::open_with_config(&StateConfig {
-        url: pg_url.clone(),
-        schema: Some(state_schema.clone()),
-    })
+    let state_store = SyncStateStore::open_with_config(
+        &StateConfig {
+            url: pg_url.clone(),
+            schema: Some(state_schema.clone()),
+        },
+        16,
+    )
     .await?;
     state_store
         .handle(connection_id)
@@ -679,10 +684,13 @@ fn runner_process_with_logs(
 }
 
 async fn prepare_runner_state(pg_url: &str, state_schema: &str, stats_schema: &str) -> Result<()> {
-    SyncStateStore::migrate_with_config(&StateConfig {
-        url: pg_url.to_string(),
-        schema: Some(state_schema.to_string()),
-    })
+    SyncStateStore::migrate_with_config(
+        &StateConfig {
+            url: pg_url.to_string(),
+            schema: Some(state_schema.to_string()),
+        },
+        16,
+    )
     .await?;
     StatsDb::migrate_with_config(
         &StatsConfig {

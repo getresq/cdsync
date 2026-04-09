@@ -52,7 +52,8 @@ pub(crate) fn reconcile_count_match(
 pub(crate) async fn cmd_status(config_path: PathBuf, connection: Option<String>) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load_with_config(&cfg.state).await?;
+    let state =
+        SyncState::load_with_config_and_pool(&cfg.state, cfg.state_pool_max_connections()).await?;
     match connection {
         Some(connection_id) => {
             let value = serde_json::to_value(state.connections.get(&connection_id))?;
@@ -117,7 +118,8 @@ pub(crate) async fn cmd_report(
 ) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load_with_config(&cfg.state).await?;
+    let state =
+        SyncState::load_with_config_and_pool(&cfg.state, cfg.state_pool_max_connections()).await?;
     let stats_db = if let Some(stats_cfg) = &cfg.stats {
         Some(StatsDb::new(stats_cfg, &cfg.state.url).await?)
     } else {

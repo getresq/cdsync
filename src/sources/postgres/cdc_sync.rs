@@ -867,6 +867,9 @@ impl PostgresSource {
             .unwrap_or(default_batch_size);
         let snapshot_concurrency = snapshot_concurrency.max(1);
         let cdc_apply_concurrency = self.config.cdc_apply_concurrency(snapshot_concurrency);
+        let cdc_batch_load_worker_count = self
+            .config
+            .cdc_batch_load_worker_count(cdc_apply_concurrency);
         let cdc_apply_batch_size = batch_size.max(1);
         let cdc_apply_max_fill =
             Duration::from_millis(self.config.cdc_max_fill_ms.unwrap_or(2_000).max(1));
@@ -1033,6 +1036,7 @@ impl PostgresSource {
             table_info_map.clone(),
             stats.clone(),
             cdc_apply_concurrency,
+            cdc_batch_load_worker_count,
             state_handle.clone(),
             follow,
         )

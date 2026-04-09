@@ -90,6 +90,7 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
         cdc_pipeline_id: None,
         cdc_batch_size: None,
         cdc_apply_concurrency: None,
+        cdc_batch_load_worker_count: None,
         cdc_max_fill_ms: None,
         cdc_max_pending_events: None,
         cdc_idle_timeout_seconds: None,

@@ -98,6 +98,7 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(1000),
         cdc_apply_concurrency: Some(8),
+        cdc_batch_load_worker_count: Some(8),
         cdc_max_fill_ms: Some(2000),
         cdc_max_pending_events: Some(10_000),
         cdc_idle_timeout_seconds: Some(1),

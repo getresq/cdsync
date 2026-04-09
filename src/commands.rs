@@ -154,7 +154,7 @@ pub(crate) async fn cmd_migrate(config_path: PathBuf) -> Result<()> {
         url: None,
         schema: None,
     });
-    SyncStateStore::migrate_with_config(&cfg.state).await?;
+    SyncStateStore::migrate_with_config(&cfg.state, cfg.state_pool_max_connections()).await?;
     info!(schema = %cfg.state.schema_name(), "state migrations applied");
     StatsDb::migrate_with_config(&stats_cfg, &cfg.state.url).await?;
     info!(schema = %stats_cfg.schema_name(), "stats migrations applied");
@@ -182,7 +182,8 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         anyhow::bail!("--follow requires --connection for a single postgres CDC connection");
     }
 
-    let state_store = SyncStateStore::open_with_config(&cfg.state).await?;
+    let state_store =
+        SyncStateStore::open_with_config(&cfg.state, cfg.state_pool_max_connections()).await?;
     let mode = match (full, incremental) {
         (true, false) => SyncMode::Full,
         (false, true) => SyncMode::Incremental,

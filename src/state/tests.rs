@@ -15,8 +15,8 @@ async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     let mut state = ConnectionState {
@@ -86,8 +86,8 @@ async fn state_store_load_connection_state_reads_single_connection_meta() -> any
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     let mut state = ConnectionState {
@@ -134,8 +134,8 @@ async fn connection_locks_block_second_owner() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
 
     let lease = store.acquire_connection_lock("app").await?;
     let second = store.acquire_connection_lock("app").await;
@@ -149,8 +149,8 @@ async fn dropping_connection_lease_releases_lock() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
 
     {
         let _lease = store.acquire_connection_lock("app").await?;

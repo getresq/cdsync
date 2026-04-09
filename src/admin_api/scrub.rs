@@ -85,6 +85,7 @@ pub(super) fn scrub_postgres_config(pg: &PostgresConfig) -> ScrubbedPostgresConf
         cdc_pipeline_id: pg.cdc_pipeline_id,
         cdc_batch_size: pg.cdc_batch_size,
         cdc_apply_concurrency: pg.cdc_apply_concurrency,
+        cdc_batch_load_worker_count: pg.cdc_batch_load_worker_count,
         cdc_max_fill_ms: pg.cdc_max_fill_ms,
         cdc_max_pending_events: pg.cdc_max_pending_events,
         cdc_idle_timeout_seconds: pg.cdc_idle_timeout_seconds,

@@ -306,10 +306,13 @@ fn runner_process(config_path: &PathBuf, connection_id: &str) -> Result<tokio::p
 }
 
 async fn prepare_runner_state(pg_url: &str, state_schema: &str, stats_schema: &str) -> Result<()> {
-    SyncStateStore::migrate_with_config(&StateConfig {
-        url: pg_url.to_string(),
-        schema: Some(state_schema.to_string()),
-    })
+    SyncStateStore::migrate_with_config(
+        &StateConfig {
+            url: pg_url.to_string(),
+            schema: Some(state_schema.to_string()),
+        },
+        16,
+    )
     .await?;
     StatsDb::migrate_with_config(
         &StatsConfig {

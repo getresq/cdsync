@@ -211,7 +211,8 @@ pub(crate) async fn spawn_checkpoint_age_reporter(
         return Ok(None);
     }
 
-    let state_store = SyncStateStore::open_with_config(&cfg.state).await?;
+    let state_store =
+        SyncStateStore::open_with_config(&cfg.state, cfg.state_pool_max_connections()).await?;
     let interval = Duration::from_secs(
         cfg.observability
             .as_ref()

@@ -488,8 +488,9 @@ pub async fn spawn_admin_api(
         .context("admin_api.auth is required when admin_api.enabled=true")?;
     let auth_verifier = Arc::new(AdminApiServiceJwtVerifier::from_config(auth_cfg)?);
 
-    let state_store: Arc<dyn AdminStateBackend> =
-        Arc::new(SyncStateStore::open_with_config(&cfg.state).await?);
+    let state_store: Arc<dyn AdminStateBackend> = Arc::new(
+        SyncStateStore::open_with_config(&cfg.state, cfg.state_pool_max_connections()).await?,
+    );
     let stats_db = if let Some(stats_cfg) = &cfg.stats {
         Some(Arc::new(StatsDb::new(stats_cfg, &cfg.state.url).await?) as Arc<dyn AdminStatsBackend>)
     } else {

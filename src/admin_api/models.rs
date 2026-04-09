@@ -176,6 +176,7 @@ pub(super) struct ScrubbedPostgresConfig {
     pub(super) cdc_pipeline_id: Option<u64>,
     pub(super) cdc_batch_size: Option<usize>,
     pub(super) cdc_apply_concurrency: Option<usize>,
+    pub(super) cdc_batch_load_worker_count: Option<usize>,
     pub(super) cdc_max_fill_ms: Option<u64>,
     pub(super) cdc_max_pending_events: Option<usize>,
     pub(super) cdc_idle_timeout_seconds: Option<u64>,

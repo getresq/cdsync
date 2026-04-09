@@ -1469,8 +1469,8 @@ async fn save_snapshot_progress_persists_checkpoint_updates() -> anyhow::Result<
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    crate::state::SyncStateStore::migrate_with_config(&config).await?;
-    let store = crate::state::SyncStateStore::open_with_config(&config).await?;
+    crate::state::SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = crate::state::SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
 
     let checkpoint_state = Arc::new(Mutex::new(TableCheckpoint {

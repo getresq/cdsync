@@ -180,6 +180,7 @@ impl EtlBigQueryDestination {
         tables: HashMap<TableId, CdcTableInfo>,
         stats: Option<StatsHandle>,
         apply_concurrency: usize,
+        cdc_batch_load_worker_count: usize,
         state_handle: Option<StateHandle>,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
@@ -190,7 +191,7 @@ impl EtlBigQueryDestination {
                         inner.clone(),
                         stats.clone(),
                         state_handle,
-                        apply_concurrency.max(1),
+                        cdc_batch_load_worker_count.max(1),
                         local_retry_retryable_failures,
                     )
                     .await?,

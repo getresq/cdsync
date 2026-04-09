@@ -164,6 +164,7 @@ mod sync_selection_tests {
                 cdc_pipeline_id: None,
                 cdc_batch_size: None,
                 cdc_apply_concurrency: None,
+                cdc_batch_load_worker_count: None,
                 cdc_max_fill_ms: None,
                 cdc_max_pending_events: None,
                 cdc_idle_timeout_seconds: None,
@@ -331,8 +332,8 @@ mod sync_selection_tests {
         let Some(config) = test_state_config() else {
             return Ok(());
         };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
+        SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = SyncStateStore::open_with_config(&config, 16).await?;
         let handle = store.handle("app");
         let persisted = TableCheckpoint {
             last_primary_key: Some("42".to_string()),
@@ -358,8 +359,8 @@ mod sync_selection_tests {
         let Some(config) = test_state_config() else {
             return Ok(());
         };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
+        SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = SyncStateStore::open_with_config(&config, 16).await?;
         let handle = store.handle("app");
 
         let persisted = TableCheckpoint {

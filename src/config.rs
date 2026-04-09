@@ -64,6 +64,44 @@ impl Config {
             content: DEFAULT_TEMPLATE.to_string(),
         }
     }
+
+    pub fn state_pool_max_connections(&self) -> u32 {
+        const MIN_STATE_POOL_MAX_CONNECTIONS: u32 = 16;
+        const STATE_POOL_CONTROL_HEADROOM_PER_CDC_CONNECTION: u32 = 4;
+        const STATE_POOL_BASE_HEADROOM: u32 = 4;
+
+        let fallback_snapshot_concurrency = self
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.max_concurrency)
+            .unwrap_or(1)
+            .max(1);
+
+        let mut cdc_connection_count = 0_u32;
+        let mut batch_load_workers = 0_u32;
+
+        for connection in self
+            .connections
+            .iter()
+            .filter(|connection| connection.enabled())
+        {
+            let SourceConfig::Postgres(pg) = &connection.source;
+            if !pg.cdc.unwrap_or(true) {
+                continue;
+            }
+            cdc_connection_count = cdc_connection_count.saturating_add(1);
+            let apply_concurrency = pg.cdc_apply_concurrency(fallback_snapshot_concurrency);
+            let worker_count = pg.cdc_batch_load_worker_count(apply_concurrency);
+            batch_load_workers =
+                batch_load_workers.saturating_add(u32::try_from(worker_count).unwrap_or(u32::MAX));
+        }
+
+        let control_headroom = cdc_connection_count
+            .saturating_mul(STATE_POOL_CONTROL_HEADROOM_PER_CDC_CONNECTION)
+            .saturating_add(STATE_POOL_BASE_HEADROOM);
+
+        MIN_STATE_POOL_MAX_CONNECTIONS.max(batch_load_workers.saturating_add(control_headroom))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +333,7 @@ pub struct PostgresConfig {
     pub cdc_pipeline_id: Option<u64>,
     pub cdc_batch_size: Option<usize>,
     pub cdc_apply_concurrency: Option<usize>,
+    pub cdc_batch_load_worker_count: Option<usize>,
     pub cdc_max_fill_ms: Option<u64>,
     pub cdc_max_pending_events: Option<usize>,
     pub cdc_idle_timeout_seconds: Option<u64>,
@@ -318,6 +357,10 @@ impl PostgresConfig {
 
     pub fn cdc_apply_concurrency(&self, fallback: usize) -> usize {
         self.cdc_apply_concurrency.unwrap_or(fallback).max(1)
+    }
+
+    pub fn cdc_batch_load_worker_count(&self, fallback: usize) -> usize {
+        self.cdc_batch_load_worker_count.unwrap_or(fallback).max(1)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -506,6 +549,7 @@ connections:
       cdc_pipeline_id: 1
       cdc_batch_size: 10000
       cdc_apply_concurrency: 8
+      cdc_batch_load_worker_count: 8
       cdc_max_fill_ms: 2000
       cdc_max_pending_events: 100000
       cdc_idle_timeout_seconds: 10
@@ -691,6 +735,7 @@ connections:
             cdc_pipeline_id: None,
             cdc_batch_size: None,
             cdc_apply_concurrency: None,
+            cdc_batch_load_worker_count: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -716,6 +761,7 @@ connections:
             cdc_pipeline_id: None,
             cdc_batch_size: None,
             cdc_apply_concurrency: Some(9),
+            cdc_batch_load_worker_count: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -725,6 +771,186 @@ connections:
         };
 
         assert_eq!(config.cdc_apply_concurrency(4), 9);
+    }
+
+    #[test]
+    fn cdc_batch_load_worker_count_defaults_to_apply_concurrency() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_batch_load_worker_count(8), 8);
+    }
+
+    #[test]
+    fn cdc_batch_load_worker_count_honors_explicit_override() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: Some(12),
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_batch_load_worker_count(8), 12);
+    }
+
+    #[test]
+    fn state_pool_max_connections_uses_minimum_floor() {
+        let cfg = Config {
+            connections: vec![ConnectionConfig {
+                id: "app".to_string(),
+                enabled: Some(true),
+                source: SourceConfig::Postgres(PostgresConfig {
+                    url: "postgres://user:pass@host:5432/db".to_string(),
+                    tables: None,
+                    table_selection: Some(TableSelectionConfig {
+                        include: vec!["public.*".to_string()],
+                        exclude: vec![],
+                        defaults: None,
+                    }),
+                    batch_size: None,
+                    cdc: Some(true),
+                    publication: Some("cdsync_pub".to_string()),
+                    publication_mode: None,
+                    schema_changes: None,
+                    cdc_pipeline_id: Some(1),
+                    cdc_batch_size: None,
+                    cdc_apply_concurrency: Some(8),
+                    cdc_batch_load_worker_count: Some(8),
+                    cdc_max_fill_ms: None,
+                    cdc_max_pending_events: None,
+                    cdc_idle_timeout_seconds: None,
+                    cdc_tls: None,
+                    cdc_tls_ca_path: None,
+                    cdc_tls_ca: None,
+                }),
+                destination: DestinationConfig::BigQuery(BigQueryConfig {
+                    project_id: "proj".to_string(),
+                    dataset: "ds".to_string(),
+                    location: None,
+                    service_account_key_path: None,
+                    service_account_key: None,
+                    partition_by_synced_at: None,
+                    batch_load_bucket: None,
+                    batch_load_prefix: None,
+                    emulator_http: None,
+                    emulator_grpc: None,
+                }),
+                schedule: None,
+            }],
+            state: StateConfig {
+                url: "postgres://user:pass@host:5432/state".to_string(),
+                schema: None,
+            },
+            metadata: None,
+            logging: None,
+            admin_api: None,
+            observability: None,
+            sync: Some(SyncConfig {
+                default_batch_size: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                max_concurrency: Some(4),
+            }),
+            stats: None,
+        };
+
+        assert_eq!(cfg.state_pool_max_connections(), 16);
+    }
+
+    #[test]
+    fn state_pool_max_connections_scales_with_batch_load_workers() {
+        let cfg = Config {
+            connections: vec![ConnectionConfig {
+                id: "app".to_string(),
+                enabled: Some(true),
+                source: SourceConfig::Postgres(PostgresConfig {
+                    url: "postgres://user:pass@host:5432/db".to_string(),
+                    tables: None,
+                    table_selection: Some(TableSelectionConfig {
+                        include: vec!["public.*".to_string()],
+                        exclude: vec![],
+                        defaults: None,
+                    }),
+                    batch_size: None,
+                    cdc: Some(true),
+                    publication: Some("cdsync_pub".to_string()),
+                    publication_mode: None,
+                    schema_changes: None,
+                    cdc_pipeline_id: Some(1),
+                    cdc_batch_size: None,
+                    cdc_apply_concurrency: Some(32),
+                    cdc_batch_load_worker_count: Some(32),
+                    cdc_max_fill_ms: None,
+                    cdc_max_pending_events: None,
+                    cdc_idle_timeout_seconds: None,
+                    cdc_tls: None,
+                    cdc_tls_ca_path: None,
+                    cdc_tls_ca: None,
+                }),
+                destination: DestinationConfig::BigQuery(BigQueryConfig {
+                    project_id: "proj".to_string(),
+                    dataset: "ds".to_string(),
+                    location: None,
+                    service_account_key_path: None,
+                    service_account_key: None,
+                    partition_by_synced_at: None,
+                    batch_load_bucket: None,
+                    batch_load_prefix: None,
+                    emulator_http: None,
+                    emulator_grpc: None,
+                }),
+                schedule: None,
+            }],
+            state: StateConfig {
+                url: "postgres://user:pass@host:5432/state".to_string(),
+                schema: None,
+            },
+            metadata: None,
+            logging: None,
+            admin_api: None,
+            observability: None,
+            sync: Some(SyncConfig {
+                default_batch_size: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                max_concurrency: Some(4),
+            }),
+            stats: None,
+        };
+
+        assert_eq!(cfg.state_pool_max_connections(), 40);
     }
 
     #[test]
