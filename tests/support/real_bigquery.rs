@@ -27,12 +27,12 @@ pub fn install_rustls_provider() {
 pub fn load_env() -> Result<RealBigQueryEnv> {
     crate::dotenv_support::load_dotenv()?;
     let project_id =
-        env::var("CDSYNC_REAL_BQ_PROJECT").unwrap_or_else(|_| "resq-develop".to_string());
+        env::var("CDSYNC_REAL_BQ_PROJECT").unwrap_or_else(|_| "your-gcp-project".to_string());
     let dataset =
         env::var("CDSYNC_REAL_BQ_DATASET").unwrap_or_else(|_| "cdsync_e2e_real".to_string());
     let location = env::var("CDSYNC_REAL_BQ_LOCATION").unwrap_or_else(|_| "US".to_string());
     let key_path = env::var("CDSYNC_REAL_BQ_KEY_PATH")
-        .unwrap_or_else(|_| ".secrets/resq-develop-f0c7ed0c3d65.json".to_string());
+        .unwrap_or_else(|_| ".secrets/your-service-account.json".to_string());
     anyhow::ensure!(
         Path::new(&key_path).exists(),
         "set CDSYNC_REAL_BQ_KEY_PATH or place the key in .secrets/"

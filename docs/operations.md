@@ -1,17 +1,16 @@
 # Operations
 
-See also: [phased-migration-plan.md](/Users/mazdak/Code/cdsync/docs/phased-migration-plan.md)
-See also: [staging-oneoff-ecs.md](/Users/mazdak/Code/cdsync/docs/staging-oneoff-ecs.md)
-See also: [how-cdsync-works.md](/Users/mazdak/Code/cdsync/docs/how-cdsync-works.md)
-See also: [config-reload-plan.md](/Users/mazdak/Code/cdsync/docs/config-reload-plan.md)
+This document is the short operator-facing command reference for the current CLI.
 
-## Runner Mode
+## Config
 
-Use `run` when you want CDSync to stay alive under a process manager instead of invoking one-shot `sync`.
+Use `cdsync init` to generate a starter config:
 
-## Metadata Columns
+```bash
+cdsync init --config config.yaml
+```
 
-Destination metadata columns are configurable at the top level:
+CDSync accepts YAML and TOML configs. Destination metadata columns can be customized at the top level:
 
 ```yaml
 metadata:
@@ -19,43 +18,76 @@ metadata:
   deleted_at_column: "_cdsync_deleted_at"
 ```
 
-Defaults remain unchanged if omitted.
+## Core Commands
 
-### PostgreSQL CDC
-
-For PostgreSQL connections with `cdc: true`, `run` uses long-lived CDC follow mode and exits cleanly on `SIGINT` or `SIGTERM`.
+Apply state and stats migrations:
 
 ```bash
-cdsync run --config ./config.yaml --connection app
+cdsync migrate --config config.yaml
 ```
 
-### Polling Sources
+Validate source and destination connectivity:
 
-For polling-based connections, `run` requires `schedule.every` on the connection and performs incremental syncs on that interval.
+```bash
+cdsync validate --config config.yaml --connection app --verbose
+```
 
-Supported `schedule.every` values:
+Run a one-shot sync:
+
+```bash
+cdsync run --config config.yaml --connection app --once --incremental
+```
+
+Force a full one-shot refresh:
+
+```bash
+cdsync run --config config.yaml --connection app --once --full
+```
+
+Inspect state and recent runs:
+
+```bash
+cdsync status --config config.yaml --connection app
+cdsync report --config config.yaml --connection app --limit 10
+cdsync reconcile --config config.yaml --connection app
+```
+
+## Long-Lived Runner Mode
+
+Use `cdsync run` without `--once` when the process should stay alive under a supervisor.
+
+CDC connections:
+
+```bash
+cdsync run --config config.yaml --connection app
+```
+
+Polling connections:
+
+- require `schedule.every`
+- run incremental syncs on that interval
+
+Supported interval examples:
 
 - `30s`
 - `5m`
 - `1h`
 - `1d`
-- `15` (defaults to seconds)
+- `15` for 15 seconds
 
-## systemd
+`SIGINT` and `SIGTERM` are handled cleanly:
 
-Install the binary and config, then use the instance unit:
+- polling runners finish the current sync cycle, then exit
+- CDC runners stop at a safe boundary and persist the last checkpoint
 
-```bash
-sudo cp deploy/systemd/cdsync@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now cdsync@app
-```
+## Deployment Boundary
 
-This runs:
+This repo does not ship service units, ECS manifests, or environment-specific deployment templates.
 
-```bash
-cdsync run --config /etc/cdsync/config.yaml --connection app
-```
+The intended split is:
+
+- this repo owns the binary, config schema, and generic runner image
+- downstream infra repos own process supervision, secrets injection, and scheduler-specific rollout config
 
 ## Container
 
@@ -69,46 +101,21 @@ Run it:
 
 ```bash
 docker run --rm \
-  -v $(pwd)/config.yaml:/etc/cdsync/config.yaml:ro \
-  -v $(pwd)/state:/var/lib/cdsync \
+  -v "$(pwd)/config.yaml:/etc/cdsync/config.yaml:ro" \
   cdsync-runner --config /etc/cdsync/config.yaml --connection app
 ```
 
-## GitHub Releases
+The image entrypoint is already `cdsync run`.
 
-`cdsync` publishes release binaries from GitHub Actions. This repo owns the
-binary artifacts only; downstream runtimes are expected to own their own config,
-container image assembly, and ECS rollout.
+## Releases
 
-Release artifacts are packaged as:
+GitHub releases publish Linux tarballs and matching checksum files.
 
-- `cdsync-x86_64-unknown-linux-gnu.tar.gz`
-- `cdsync-aarch64-unknown-linux-gnu.tar.gz`
-- matching `.sha256` files
+Current workflow behavior:
 
-The intended downstream contract is:
-
-1. choose a tagged `cdsync` GitHub release
-2. download the Linux artifact for the target runtime
-3. build a thin runtime image around that binary
-4. inject environment/config from the downstream infra repo
-5. deploy the resulting image to the target scheduler
+- tagged releases build `x86_64` automatically
+- optional `aarch64` builds are available through the manual release workflow
 
 ## Real BigQuery
 
-For live BigQuery validation, set:
-
-```bash
-export CDSYNC_REAL_BQ_PROJECT="nora-461013"
-export CDSYNC_REAL_BQ_DATASET="cdsync_e2e_real"
-export CDSYNC_REAL_BQ_LOCATION="US"
-export CDSYNC_REAL_BQ_KEY_PATH="/absolute/path/to/service-account.json"
-```
-
-Then run the ignored live tests from [e2e.md](/Users/mazdak/Code/cdsync/docs/e2e.md).
-
-## Graceful Shutdown
-
-- `SIGINT` and `SIGTERM` are handled.
-- Polling runners finish the current sync cycle, then exit.
-- CDC runners stop following the stream after the current transaction boundary and persist the last known checkpoint.
+Live BigQuery tests use the environment variables in `.env.example`. See [e2e.md](e2e.md) for the current test commands.

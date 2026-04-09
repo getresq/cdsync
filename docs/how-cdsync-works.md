@@ -1,236 +1,94 @@
 # How CDSync Works
 
-This is the plain-English version of the runtime lifecycle.
-
-## Core Idea
-
-CDSync does two jobs:
-
-1. Copy the current state of selected PostgreSQL tables into BigQuery.
-2. Keep BigQuery updated as PostgreSQL changes over time.
-
-Those are related, but they are not the same operation.
-
-## Terms
-
-- **Snapshot**: a consistent copy of the rows that exist right now.
-- **WAL**: PostgreSQL's write-ahead log, which is the database's transaction diary.
-- **CDC**: change data capture. CDSync reads logical changes from the WAL and applies them to BigQuery.
-- **LSN**: a WAL position. CDSync saves this so it knows where to resume later.
-
-## Lifecycle
-
-```text
-               +----------------------------+
-               |         config.toml        |
-               | tables / columns / BQ / CDC|
-               +-------------+--------------+
-                             |
-                             v
-               +-------------+--------------+
-               |       load saved state     |
-               | checkpoints / last WAL LSN |
-               +-------------+--------------+
-                             |
-                   first run?|
-                 yes         | no
-                  |          |
-                  v          v
-      +-----------+--+   +---+------------------+
-      | take snapshot |   | resume from saved   |
-      | of current DB |   | WAL/LSN             |
-      +------+--------+   +----------+----------+
-             |                      |
-             v                      |
-      +------+--------+             |
-      | write batch   |             |
-      | files to GCS  |             |
-      +------+--------+             |
-             |                      |
-             v                      |
-      +------+--------+             |
-      | BigQuery load |             |
-      | jobs / merge  |             |
-      +------+--------+             |
-             +----------+-----------+
-                        |
-                        v
-               +--------+---------+
-               | follow WAL via   |
-               | CDC and apply    |
-               +--------+---------+
-                        |
-                        v
-               +--------+---------+
-               | save new state   |
-               | and last WAL LSN |
-               +------------------+
-```
+This is the current runtime model, not a future plan.
 
-## First Run From Scratch
+## Core Model
 
-On the first run, CDSync has no saved WAL position.
+CDSync keeps a BigQuery dataset aligned with selected PostgreSQL tables. It does that in two stages:
 
-It does this:
+1. take a snapshot of the current table contents
+2. keep applying later changes
 
-1. Read the config file.
-2. Discover the selected tables and columns.
-3. Create a **consistent snapshot** of the source tables.
-4. Copy those rows into BigQuery.
-5. Start CDC from the matching WAL position.
-6. Apply inserts, updates, and deletes that happened after the snapshot started.
-7. Save the current state, including the last processed WAL position.
+For polling connections, later changes come from repeated `SELECT` queries. For CDC connections, later changes come from PostgreSQL logical replication.
 
-In plain terms:
+## Runtime Modes
 
-- Snapshot gives CDSync the old data.
-- CDC gives CDSync the new changes after that point.
-- Together, they produce a correct BigQuery copy.
+`cdsync run --once ...` executes a single sync pass and exits.
 
-## Future Runs
+`cdsync run ...` is the long-lived worker mode:
 
-On later runs, CDSync should not start from zero.
+- polling connections run on their configured `schedule.every`
+- CDC connections stay attached to the WAL and keep following changes
 
-It does this:
+## First CDC Run
 
-1. Read the config file.
-2. Load the saved state.
-3. Resume from the last saved WAL position.
-4. Apply only the new changes.
-5. Save the new WAL position again.
+For a CDC connection with no saved LSN yet, CDSync:
 
-In plain terms:
+1. loads config and validates the publication
+2. resolves the configured table set
+3. snapshots the selected tables into BigQuery
+4. preserves the matching WAL backlog
+5. drains queued CDC work
+6. persists the last safe LSN
 
-- first run = bulk copy + catch-up
-- later runs = just catch-up
+That gives you a consistent initial copy plus all changes that happened while the snapshot was running.
 
-## What Happens In Polling Mode Versus CDC Mode
+## Resume Behavior
 
-### Polling mode
+Once a CDC connection has a saved LSN, CDSync resumes from that position instead of starting over.
 
-CDSync repeatedly queries source tables and pages through them using an `updated_at` column and primary key.
+The important state lives in the configured `state` schema, including:
 
-This is simpler, but it depends on:
+- per-table checkpoints
+- CDC slot metadata
+- queued batch-load/coordinator state for the BigQuery batch-load path
 
-- a trustworthy `updated_at` column
-- predictable paging
-- no hidden hard deletes unless they are modeled as soft deletes
+If that state is durable, restart and task replacement should resume cleanly.
 
-### CDC mode
+## Polling Versus CDC
 
-CDSync reads logical replication changes from PostgreSQL's WAL.
+Polling mode:
 
-This is stronger for:
+- uses `updated_at_column` plus primary-key paging
+- is simpler to operate
+- cannot see hard deletes unless they are modeled as soft deletes
 
-- low-latency change capture
-- real delete events
-- avoiding missed updates caused by bad timestamps
+CDC mode:
 
-It is also operationally more complex because it depends on:
+- reads inserts, updates, and deletes from PostgreSQL logical replication
+- has lower latency
+- needs a publication, replication slot state, and durable checkpoints
 
-- logical replication
-- publications
-- replication slots
-- saved WAL positions
+## Config Changes
 
-## What Happens When You Add A New Table To The Config
+CDSync does not hot-reload config files. Apply config changes by restarting `cdsync run` or replacing the running service/task.
 
-This depends on the sync mode.
+What happens after restart depends on the change:
 
-### Polling connections
+- adding a polling table causes a fresh backfill for that table
+- adding a CDC table bootstraps that table on the next run if the table is also present in the publication
+- removing a table stops syncing it but does not delete the destination table
 
-If a new polling table is added and the connection runs again:
+For CDC publication management:
 
-- CDSync discovers the new table
-- creates the destination table if needed
-- backfills it by paging from the beginning
+- `publication_mode: manage` lets CDSync reconcile publication membership at startup
+- `publication_mode: validate` requires the operator to update the publication first
 
-So polling mode is naturally tolerant of "new table added later".
+## Schema Changes
 
-### CDC connections
+With `schema_changes: auto`:
 
-For CDC connections, adding a new table to the config is not enough by itself.
+- additive columns are applied conservatively
+- historical rows stay null for newly added columns unless you resync
+- non-destructive changes are kept non-destructive on the BigQuery side
 
-You also need:
+Incompatible changes, especially primary-key changes, are treated as blocking and may require an explicit resync.
 
-- the table to be added to the PostgreSQL publication
-- a snapshot/backfill for that new table
+## Failure Semantics
 
-Why:
+CDSync persists state as it goes. In practice that means:
 
-- the saved WAL position only tells CDSync how to read **future** changes
-- it does not automatically give the historical rows that already existed before the table was added to the config
+- a crash should resume from the last durable checkpoint
+- CDC acknowledgement only advances after the relevant downstream work is durably safe
 
-So the safe operational rule is:
-
-- **new CDC table -> update publication -> run a targeted resync/full snapshot for that table**
-
-Until CDSync grows automatic targeted table backfill on config change, that should be treated as an operator action.
-
-## What Happens When You Remove A Table From The Config
-
-CDSync stops syncing it.
-
-It does **not** automatically delete the BigQuery table or clear its data.
-
-That is intentional. Removal from config means "stop managing this table", not "destroy destination history".
-
-## What Happens When You Add Or Change Columns
-
-### Additive changes
-
-If `schema_changes = auto`:
-
-- new source columns can usually be added to BigQuery automatically
-- historical rows remain null for the new column unless you explicitly resync/backfill
-
-### Non-destructive changes
-
-Examples:
-
-- column removed
-- column renamed
-
-With the current raw replication policy, these are handled conservatively:
-
-- removed columns are not automatically dropped from BigQuery
-- a rename is treated as "new column added, old column left in place"
-- nullability-only changes are logged but do not force a resync
-
-That keeps the raw destination non-destructive and avoids guessing at schema intent.
-
-### Incompatible changes
-
-Examples:
-
-- type changed in a way that changes the destination type
-- primary key changed
-
-These are treated as incompatible changes and usually require:
-
-- failure with operator intervention
-- or a resync, depending on policy
-
-## What Happens On Failure
-
-CDSync saves state as it goes.
-
-In a durable deployment, that means:
-
-- after a crash or restart
-- it should resume from the last good checkpoint / WAL position
-
-Important caveat:
-
-- if state is stored on ephemeral task storage, resumability only lasts as long as the task does
-- for production deployments, state must be on durable storage
-
-## Current Important Operational Reality
-
-Today, the most important practical rules are:
-
-- first CDC run = snapshot + WAL catch-up
-- later CDC runs = resume from saved WAL position
-- new CDC tables need a deliberate backfill step
-- config changes are not hot-reloaded by the running process
-- durable state storage matters as much as the replication logic
+The main operational requirement is simple: keep `state` and `stats` on durable storage, not ephemeral task-local files.
