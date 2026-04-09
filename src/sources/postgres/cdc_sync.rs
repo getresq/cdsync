@@ -95,6 +95,18 @@ pub(super) fn should_clear_snapshot_runtime_on_success(
     !has_pending_tasks && active_task_count == 0 && !is_blocked
 }
 
+pub(super) fn should_restart_blocked_resync_snapshot(
+    checkpoint: &TableCheckpoint,
+    manual_resync_requested: bool,
+) -> bool {
+    manual_resync_requested
+        && table_has_snapshot_progress(checkpoint)
+        && checkpoint
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.status == TableRuntimeStatus::Blocked)
+}
+
 pub(super) fn should_finalize_snapshot_checkpoint(
     table_name: &str,
     blocked_tables: &BTreeMap<String, String>,
@@ -104,6 +116,18 @@ pub(super) fn should_finalize_snapshot_checkpoint(
 
 pub(super) fn should_suppress_snapshot_retry_for_blocked_table(is_blocked: bool) -> bool {
     is_blocked
+}
+
+pub(super) fn refresh_snapshot_retry_resume_from_checkpoint(
+    checkpoint: &TableCheckpoint,
+    chunk: Option<SnapshotChunkRange>,
+) -> Result<Option<String>> {
+    checkpoint
+        .snapshot_chunks
+        .iter()
+        .find(|candidate| snapshot_chunk_checkpoint_matches_range(candidate, chunk))
+        .map(|candidate| candidate.last_primary_key.clone())
+        .context("missing snapshot chunk checkpoint for retry resume")
 }
 
 async fn clear_snapshot_task_runtime_state(
@@ -506,6 +530,13 @@ async fn run_cdc_snapshot_phase(
                         error = %format!("{err:#}"),
                         "snapshot task failed; scheduling table-local retry"
                     );
+                    entry.task.resume_from_primary_key = {
+                        let checkpoint = entry.task.checkpoint_state.lock().await;
+                        refresh_snapshot_retry_resume_from_checkpoint(
+                            &checkpoint,
+                            entry.task.chunk,
+                        )?
+                    };
                     entry.next_retry_at = Some(next_retry_at);
                     snapshot_task_queues
                         .entry(table_name)
@@ -1003,6 +1034,7 @@ impl PostgresSource {
             stats.clone(),
             cdc_apply_concurrency,
             state_handle.clone(),
+            follow,
         )
         .await?;
 
@@ -1016,6 +1048,22 @@ impl PostgresSource {
             }
         }
         let mut last_lsn = state.postgres_cdc.as_ref().and_then(|s| s.last_lsn.clone());
+        for table_name in &manual_resync_table_names {
+            let Some(checkpoint) = state.postgres.get_mut(table_name) else {
+                continue;
+            };
+            if !should_restart_blocked_resync_snapshot(checkpoint, true) {
+                continue;
+            }
+            checkpoint.snapshot_chunks.clear();
+            checkpoint.snapshot_start_lsn = None;
+            checkpoint.snapshot_preserve_backlog = false;
+            if let Some(state_handle) = &state_handle {
+                state_handle
+                    .save_postgres_checkpoint(table_name, checkpoint)
+                    .await?;
+            }
+        }
         let initial_snapshot_tables =
             initial_snapshot_table_ids(&table_ids, state, last_lsn.as_deref());
         let snapshot_progress_tables = snapshot_progress_table_ids(&table_ids, state);

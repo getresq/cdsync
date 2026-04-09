@@ -42,12 +42,18 @@ fn stable_cdc_batch_load_object_name(
     bigquery::stable_cdc_batch_load_object_name(prefix, target_table, &suffix)
 }
 
-fn should_resolve_cdc_batch_load_waiters(retry_class: SyncRetryClass) -> bool {
-    !retry_class.is_retryable()
+fn should_resolve_cdc_batch_load_waiters(
+    retry_class: SyncRetryClass,
+    local_retry_retryable_failures: bool,
+) -> bool {
+    !local_retry_retryable_failures || !retry_class.is_retryable()
 }
 
-fn should_mark_cdc_batch_load_fragments_failed(retry_class: SyncRetryClass) -> bool {
-    !retry_class.is_retryable()
+fn should_mark_cdc_batch_load_fragments_failed(
+    retry_class: SyncRetryClass,
+    local_retry_retryable_failures: bool,
+) -> bool {
+    !local_retry_retryable_failures || !retry_class.is_retryable()
 }
 
 fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
@@ -212,6 +218,7 @@ impl CdcBatchLoadManager {
         stats: Option<StatsHandle>,
         state_handle: StateHandle,
         worker_count: usize,
+        local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let manager = Self {
             inner,
@@ -219,6 +226,7 @@ impl CdcBatchLoadManager {
             state_handle,
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            local_retry_retryable_failures,
         };
         manager.restore_pending_jobs().await?;
         manager.start_workers(worker_count.max(1));
@@ -573,7 +581,10 @@ impl CdcBatchLoadManager {
                     .state_handle
                     .mark_cdc_batch_load_job_failed(&job_id, &err.to_string(), retry_class)
                     .await;
-                if should_mark_cdc_batch_load_fragments_failed(retry_class) {
+                if should_mark_cdc_batch_load_fragments_failed(
+                    retry_class,
+                    self.local_retry_retryable_failures,
+                ) {
                     let _ = self
                         .state_handle
                         .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
@@ -617,9 +628,10 @@ impl CdcBatchLoadManager {
 
         let resolve_waiters = match &result {
             Ok(()) => true,
-            Err(err) => should_resolve_cdc_batch_load_waiters(classify_sync_retry(
-                &anyhow::Error::new(err.clone()),
-            )),
+            Err(err) => should_resolve_cdc_batch_load_waiters(
+                classify_sync_retry(&anyhow::Error::new(err.clone())),
+                self.local_retry_retryable_failures,
+            ),
         };
 
         if resolve_waiters && let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
@@ -646,20 +658,36 @@ mod tests {
     #[test]
     fn retryable_batch_load_failures_keep_waiters_and_fragments_open() {
         assert!(!should_resolve_cdc_batch_load_waiters(
-            SyncRetryClass::Backpressure
+            SyncRetryClass::Backpressure,
+            true
         ));
         assert!(!should_mark_cdc_batch_load_fragments_failed(
-            SyncRetryClass::Transient
+            SyncRetryClass::Transient,
+            true
         ));
     }
 
     #[test]
     fn permanent_batch_load_failures_resolve_waiters_and_fail_fragments() {
         assert!(should_resolve_cdc_batch_load_waiters(
-            SyncRetryClass::Permanent
+            SyncRetryClass::Permanent,
+            true
         ));
         assert!(should_mark_cdc_batch_load_fragments_failed(
-            SyncRetryClass::Permanent
+            SyncRetryClass::Permanent,
+            true
+        ));
+    }
+
+    #[test]
+    fn one_shot_batch_load_failures_surface_retryable_errors() {
+        assert!(should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Backpressure,
+            false
+        ));
+        assert!(should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Transient,
+            false
         ));
     }
 

@@ -1163,6 +1163,60 @@ fn snapshot_retry_is_suppressed_once_table_is_blocked() {
 }
 
 #[test]
+fn blocked_manual_resync_forces_fresh_snapshot_restart() {
+    let checkpoint = TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("5".to_string()),
+            complete: false,
+        }],
+        runtime: Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            attempts: 1,
+            reason: Some(ErrorReasonCode::SnapshotBlocked),
+            last_error: Some("blocked".to_string()),
+            next_retry_at: None,
+            updated_at: None,
+        }),
+        ..Default::default()
+    };
+
+    assert!(super::cdc_sync::should_restart_blocked_resync_snapshot(
+        &checkpoint,
+        true
+    ));
+    assert!(!super::cdc_sync::should_restart_blocked_resync_snapshot(
+        &checkpoint,
+        false
+    ));
+}
+
+#[test]
+fn snapshot_retry_resume_uses_saved_chunk_progress() {
+    let checkpoint = TableCheckpoint {
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("7".to_string()),
+            complete: false,
+        }],
+        ..Default::default()
+    };
+
+    let resume = super::cdc_sync::refresh_snapshot_retry_resume_from_checkpoint(
+        &checkpoint,
+        Some(SnapshotChunkRange {
+            start_pk: 1,
+            end_pk: 10,
+        }),
+    )
+    .expect("resume");
+    assert_eq!(resume.as_deref(), Some("7"));
+}
+
+#[test]
 fn snapshot_phase_proceeds_to_cdc_only_in_follow_mode_with_blocked_tables() {
     assert!(super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
         true, 1
