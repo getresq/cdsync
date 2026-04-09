@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::SyncRetryClass;
 
 impl StateHandle {
     pub async fn save_connection_state(
@@ -38,12 +39,13 @@ impl StateHandle {
             .await
     }
 
-    pub async fn enqueue_cdc_batch_load_job(
+    pub async fn enqueue_cdc_batch_load_bundle(
         &self,
         job: &CdcBatchLoadJobRecord,
+        fragments: &[CdcCommitFragmentRecord],
     ) -> anyhow::Result<CdcBatchLoadJobRecord> {
         self.store
-            .enqueue_cdc_batch_load_job(&self.connection_id, job)
+            .enqueue_cdc_batch_load_bundle(&self.connection_id, job, fragments)
             .await
     }
 
@@ -83,6 +85,12 @@ impl StateHandle {
             .await
     }
 
+    pub async fn requeue_cdc_batch_load_job(&self, job_id: &str) -> anyhow::Result<bool> {
+        self.store
+            .requeue_cdc_batch_load_job(&self.connection_id, job_id)
+            .await
+    }
+
     pub async fn mark_cdc_batch_load_job_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
             .mark_cdc_batch_load_job_succeeded(&self.connection_id, job_id)
@@ -93,18 +101,10 @@ impl StateHandle {
         &self,
         job_id: &str,
         error: &str,
+        retry_class: SyncRetryClass,
     ) -> anyhow::Result<()> {
         self.store
-            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error)
-            .await
-    }
-
-    pub async fn upsert_cdc_commit_fragments(
-        &self,
-        fragments: &[CdcCommitFragmentRecord],
-    ) -> anyhow::Result<()> {
-        self.store
-            .upsert_cdc_commit_fragments(&self.connection_id, fragments)
+            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error, retry_class)
             .await
     }
 

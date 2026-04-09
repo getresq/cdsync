@@ -125,22 +125,22 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Full,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Full,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     let http_client = reqwest::Client::new();
     let fields = emulator_read_support::fetch_table_fields(

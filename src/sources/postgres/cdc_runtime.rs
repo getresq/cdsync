@@ -908,18 +908,15 @@ impl PostgresSource {
                 },
             )?;
 
-            if cdc_should_stop_after_idle(
-                &CdcIdleState {
-                    follow,
-                    in_tx,
-                    pending_events_empty: pending_events.is_empty(),
-                    queued_batches_empty: queued_batches.is_empty(),
-                    pending_table_batches_empty: pending_table_batches.is_empty(),
-                    inflight_apply_empty: inflight_dispatch.is_empty() && inflight_apply.is_empty(),
-                },
-                last_xlog_activity,
-                idle_timeout,
-            ) {
+            let idle_state = CdcIdleState {
+                follow,
+                in_tx,
+                pending_events_empty: pending_events.is_empty(),
+                queued_batches_empty: queued_batches.is_empty(),
+                pending_table_batches_empty: pending_table_batches.is_empty(),
+                inflight_apply_empty: inflight_dispatch.is_empty() && inflight_apply.is_empty(),
+            };
+            if cdc_should_stop_after_idle(&idle_state, last_xlog_activity, idle_timeout) {
                 break;
             }
         }

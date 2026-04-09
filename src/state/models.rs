@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::{ErrorReasonCode, SyncRetryClass};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -51,6 +52,7 @@ pub struct CdcBatchLoadJobRecord {
     pub status: CdcBatchLoadJobStatus,
     pub payload_json: String,
     pub attempt_count: i32,
+    pub retry_class: Option<SyncRetryClass>,
     pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -180,6 +182,7 @@ pub struct ConnectionState {
     pub last_sync_started_at: Option<DateTime<Utc>>,
     pub last_sync_finished_at: Option<DateTime<Utc>>,
     pub last_sync_status: Option<String>,
+    pub last_error_reason: Option<ErrorReasonCode>,
     pub last_error: Option<String>,
 }
 

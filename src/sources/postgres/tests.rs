@@ -1,9 +1,10 @@
 use super::snapshot_sync::save_snapshot_progress;
 use super::*;
 use crate::destinations::Destination;
+use crate::retry::ErrorReasonCode;
 use async_trait::async_trait;
 use polars::prelude::{NamedFrom, Series};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -963,6 +964,363 @@ fn snapshot_table_write_plan_truncates_new_bootstrap_tables_on_resume() {
     );
     assert!(matches!(resumed_resync.write_mode, WriteMode::Append));
     assert!(resumed_resync.truncate_before_copy);
+}
+
+#[test]
+fn snapshot_task_failure_disposition_retries_bigquery_dml_quota_errors() {
+    let err = anyhow::anyhow!(
+        "merging staging BigQuery table public__foo into public__bar: Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table, pending + running"
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_retries_transient_transport_errors() {
+    let err = anyhow::anyhow!("pending bigquery future timed out after 120s");
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_blocks_permanent_schema_and_publication_errors() {
+    let schema_err = anyhow::Error::new(crate::retry::CdcSyncPolicyError::SchemaChangeDetected {
+        table: "public.accounts".to_string(),
+    });
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&schema_err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+    );
+
+    let publication_err =
+        anyhow::Error::new(crate::retry::CdcSyncPolicyError::PublicationMissing {
+            publication: "cdsync_app_pub".to_string(),
+        });
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&publication_err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Block
+    );
+}
+
+#[test]
+fn snapshot_task_failure_disposition_retries_other_snapshot_copy_failures() {
+    let err = anyhow::anyhow!("invalid field mapping for BigQuery merge");
+    assert_eq!(
+        super::cdc_sync::snapshot_task_failure_disposition(&err),
+        super::cdc_sync::SnapshotTaskFailureDisposition::Retry
+    );
+}
+
+#[test]
+fn snapshot_task_retry_backoff_caps_at_fifteen_minutes() {
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(1, 1_000),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(6, 1_000),
+        Duration::from_secs(32)
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_retry_backoff(20, 1_000),
+        Duration::from_secs(15 * 60)
+    );
+}
+
+#[test]
+fn snapshot_task_queue_seed_preserves_blocked_tables_until_manual_resync() {
+    let runtime = TableRuntimeState {
+        status: TableRuntimeStatus::Blocked,
+        attempts: 2,
+        reason: Some(ErrorReasonCode::SnapshotBlocked),
+        last_error: Some("permanent schema mismatch".to_string()),
+        next_retry_at: None,
+        updated_at: None,
+    };
+
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), false),
+        super::cdc_sync::SnapshotTaskQueueSeed::Blocked {
+            last_error: Some("permanent schema mismatch".to_string())
+        }
+    );
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), true),
+        super::cdc_sync::SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: None
+        }
+    );
+}
+
+#[test]
+fn snapshot_task_queue_seed_keeps_retry_schedule_for_retrying_tables() {
+    let retry_at = Utc::now();
+    let runtime = TableRuntimeState {
+        status: TableRuntimeStatus::Retrying,
+        attempts: 4,
+        reason: Some(ErrorReasonCode::BigqueryDmlQuota),
+        last_error: Some("quota exceeded".to_string()),
+        next_retry_at: Some(retry_at),
+        updated_at: Some(retry_at),
+    };
+
+    assert_eq!(
+        super::cdc_sync::snapshot_task_queue_seed(Some(&runtime), false),
+        super::cdc_sync::SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: Some(retry_at)
+        }
+    );
+}
+
+#[test]
+fn snapshot_task_requires_table_serialization_only_for_upserts() {
+    assert!(!super::cdc_sync::snapshot_task_requires_table_serialization(WriteMode::Append));
+    assert!(super::cdc_sync::snapshot_task_requires_table_serialization(
+        WriteMode::Upsert
+    ));
+}
+
+#[test]
+fn should_reset_snapshot_runtime_for_fresh_or_manual_snapshots() {
+    assert!(super::cdc_sync::should_reset_snapshot_runtime(false, false));
+    assert!(super::cdc_sync::should_reset_snapshot_runtime(true, true));
+    assert!(!super::cdc_sync::should_reset_snapshot_runtime(true, false));
+}
+
+#[test]
+fn should_clear_snapshot_runtime_only_after_table_fully_drains() {
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        true, 0, false
+    ));
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 1, false
+    ));
+    assert!(!super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 0, true
+    ));
+    assert!(super::cdc_sync::should_clear_snapshot_runtime_on_success(
+        false, 0, false
+    ));
+}
+
+#[test]
+fn blocked_tables_are_excluded_from_snapshot_finalization() {
+    let completed_at = Utc::now();
+    let mut blocked_tables = BTreeMap::new();
+    blocked_tables.insert(
+        "public.accounts".to_string(),
+        "permanent schema mismatch".to_string(),
+    );
+    let mut checkpoint = TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_preserve_backlog: true,
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("5".to_string()),
+            complete: false,
+        }],
+        runtime: Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            attempts: 2,
+            reason: Some(ErrorReasonCode::SnapshotBlocked),
+            last_error: Some("permanent schema mismatch".to_string()),
+            next_retry_at: None,
+            updated_at: Some(completed_at),
+        }),
+        ..Default::default()
+    };
+
+    if super::cdc_sync::should_finalize_snapshot_checkpoint("public.accounts", &blocked_tables) {
+        checkpoint.last_synced_at = Some(completed_at);
+        checkpoint.last_primary_key = None;
+        checkpoint.snapshot_start_lsn = None;
+        checkpoint.snapshot_preserve_backlog = false;
+        checkpoint.snapshot_chunks.clear();
+    }
+
+    assert!(checkpoint.last_synced_at.is_none());
+    assert_eq!(checkpoint.snapshot_start_lsn.as_deref(), Some("0/ABC"));
+    assert!(checkpoint.snapshot_preserve_backlog);
+    assert_eq!(checkpoint.snapshot_chunks.len(), 1);
+    assert!(matches!(
+        checkpoint
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.status.clone()),
+        Some(TableRuntimeStatus::Blocked)
+    ));
+}
+
+#[test]
+fn snapshot_retry_is_suppressed_once_table_is_blocked() {
+    assert!(super::cdc_sync::should_suppress_snapshot_retry_for_blocked_table(true));
+    assert!(!super::cdc_sync::should_suppress_snapshot_retry_for_blocked_table(false));
+}
+
+#[test]
+fn blocked_manual_resync_forces_fresh_snapshot_restart() {
+    let checkpoint = TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("5".to_string()),
+            complete: false,
+        }],
+        runtime: Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            attempts: 1,
+            reason: Some(ErrorReasonCode::SnapshotBlocked),
+            last_error: Some("blocked".to_string()),
+            next_retry_at: None,
+            updated_at: None,
+        }),
+        ..Default::default()
+    };
+
+    assert!(super::cdc_sync::should_restart_blocked_resync_snapshot(
+        &checkpoint,
+        true
+    ));
+    assert!(!super::cdc_sync::should_restart_blocked_resync_snapshot(
+        &checkpoint,
+        false
+    ));
+}
+
+#[test]
+fn snapshot_retry_resume_uses_saved_chunk_progress() {
+    let checkpoint = TableCheckpoint {
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: Some("7".to_string()),
+            complete: false,
+        }],
+        ..Default::default()
+    };
+
+    let resume = super::cdc_sync::refresh_snapshot_retry_resume_from_checkpoint(
+        &checkpoint,
+        Some(SnapshotChunkRange {
+            start_pk: 1,
+            end_pk: 10,
+        }),
+    )
+    .expect("resume");
+    assert_eq!(resume.as_deref(), Some("7"));
+}
+
+#[test]
+fn snapshot_phase_proceeds_to_cdc_only_in_follow_mode_with_blocked_tables() {
+    assert!(super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        true, 1
+    ));
+    assert!(!super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        false, 1
+    ));
+    assert!(!super::cdc_sync::snapshot_phase_should_proceed_to_cdc(
+        true, 0
+    ));
+}
+
+#[test]
+fn snapshot_scheduler_round_robins_runnable_tables() {
+    let now = Utc::now();
+    let checkpoint = Arc::new(Mutex::new(TableCheckpoint::default()));
+    let make_info = |table_name: &str| {
+        CdcTableInfo::new(
+            crate::destinations::etl_bigquery::CdcTableSpec {
+                table_id: TableId::new(1),
+                source_name: table_name.to_string(),
+                dest_name: table_name.replace('.', "__"),
+                schema: TableSchema {
+                    name: table_name.replace('.', "__"),
+                    columns: vec![ColumnSchema {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    }],
+                    primary_key: Some("id".to_string()),
+                },
+                metadata: MetadataColumns::default(),
+                primary_key: "id".to_string(),
+                soft_delete: false,
+                soft_delete_column: None,
+            },
+            &EtlTableSchema::new(
+                TableId::new(1),
+                etl::types::TableName::new("public".to_string(), "items".to_string()),
+                vec![etl::types::ColumnSchema::new(
+                    "id".to_string(),
+                    etl::types::Type::INT8,
+                    -1,
+                    false,
+                    false,
+                )],
+            ),
+        )
+        .expect("cdc table info")
+    };
+    let make_entry = |table_name: &str| super::cdc_sync::SnapshotTaskQueueEntry {
+        task: CdcSnapshotTask {
+            table: ResolvedPostgresTable {
+                name: table_name.to_string(),
+                primary_key: "id".to_string(),
+                updated_at_column: None,
+                soft_delete: false,
+                soft_delete_column: None,
+                where_clause: None,
+                columns: ColumnSelection {
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                },
+            },
+            info: make_info(table_name),
+            checkpoint_state: Arc::clone(&checkpoint),
+            resume_from_primary_key: None,
+            chunk: Some(SnapshotChunkRange {
+                start_pk: 1,
+                end_pk: 10,
+            }),
+            write_mode: WriteMode::Append,
+            state_handle: None,
+        },
+        next_retry_at: None,
+    };
+
+    let mut queues = BTreeMap::new();
+    queues.insert(
+        "public.a_big".to_string(),
+        VecDeque::from(vec![make_entry("public.a_big"), make_entry("public.a_big")]),
+    );
+    queues.insert(
+        "public.z_small".to_string(),
+        VecDeque::from(vec![make_entry("public.z_small")]),
+    );
+
+    let (first, _, cursor) = super::cdc_sync::next_snapshot_task_table(
+        &["public.a_big".to_string(), "public.z_small".to_string()],
+        0,
+        &queues,
+        &HashSet::new(),
+        now,
+    );
+    assert_eq!(first.as_deref(), Some("public.a_big"));
+
+    let (second, _, _) = super::cdc_sync::next_snapshot_task_table(
+        &["public.a_big".to_string(), "public.z_small".to_string()],
+        cursor,
+        &queues,
+        &HashSet::new(),
+        now,
+    );
+    assert_eq!(second.as_deref(), Some("public.z_small"));
 }
 
 #[test]

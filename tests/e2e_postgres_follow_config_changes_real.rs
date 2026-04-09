@@ -140,22 +140,22 @@ async fn run_cdc_once(
     let dest =
         BigQueryDestination::new(env.bq_config(prefix), false, MetadataColumns::default()).await?;
     dest.validate().await?;
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state,
-            state_handle,
-            mode,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1_000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state,
+        state_handle,
+        mode,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1_000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await
 }
 
 #[tokio::test]
@@ -190,7 +190,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
         .await?;
 
     let mut state = ConnectionState::default();
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(
@@ -202,7 +202,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
         &prefix,
         SyncMode::Full,
         None,
-    )
+    ))
     .await?;
 
     pool.execute(
@@ -213,7 +213,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
     pool.execute(format!("insert into {table_b} (id, name) values (1, 'beta')").as_str())
         .await?;
 
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(
@@ -228,7 +228,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
         &prefix,
         SyncMode::Incremental,
         None,
-    )
+    ))
     .await?;
 
     let client = real_bigquery_support::client(&env.bq.key_path).await?;
@@ -304,7 +304,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
         .await?;
 
     let mut state = ConnectionState::default();
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(
@@ -319,7 +319,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
         &prefix,
         SyncMode::Full,
         None,
-    )
+    ))
     .await?;
 
     pool.execute(
@@ -333,7 +333,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
     )
     .await?;
 
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(
@@ -345,7 +345,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
         &prefix,
         SyncMode::Incremental,
         None,
-    )
+    ))
     .await?;
 
     let client = real_bigquery_support::client(&env.bq.key_path).await?;
@@ -431,7 +431,7 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
         tracked_table(table_a.clone()),
         tracked_table(table_b.clone()),
     ];
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(
@@ -443,7 +443,7 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
         &prefix,
         SyncMode::Full,
         Some(state_handle.clone()),
-    )
+    ))
     .await?;
 
     pool.execute(format!("alter table {table_a} drop column extra").as_str())
@@ -459,14 +459,14 @@ async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_
     state_store
         .request_postgres_table_resync("app", &table_a)
         .await?;
-    run_cdc_once(
+    Box::pin(run_cdc_once(
         &env,
         &mut state,
         env.pg_config(&publication, pipeline_id, SchemaChangePolicy::Auto, tracked),
         &prefix,
         SyncMode::Incremental,
         Some(state_handle),
-    )
+    ))
     .await?;
 
     let client = real_bigquery_support::client(&env.bq.key_path).await?;

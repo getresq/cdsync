@@ -1,4 +1,5 @@
 use cdsync::config::StateConfig;
+use cdsync::retry::SyncRetryClass;
 use cdsync::state::{
     CdcBatchLoadJobRecord, CdcBatchLoadJobStatus, CdcCommitFragmentRecord, CdcCommitFragmentStatus,
     CdcWatermarkState, ConnectionState, PostgresCdcState, SyncStateStore,
@@ -172,37 +173,55 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
     let handle = store.handle("app");
 
     handle
-        .upsert_cdc_commit_fragments(&[
-            CdcCommitFragmentRecord {
-                fragment_id: "fragment-1".to_string(),
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
                 job_id: "job-1".to_string(),
-                sequence: 41,
-                commit_lsn: "0/AAA".to_string(),
                 table_key: "public__items".to_string(),
-                status: CdcCommitFragmentStatus::Pending,
-                row_count: 10,
-                upserted_count: 8,
-                deleted_count: 2,
+                first_sequence: 41,
+                status: CdcBatchLoadJobStatus::Pending,
+                payload_json: "{}".to_string(),
+                attempt_count: 0,
+                retry_class: None,
                 last_error: None,
                 created_at: 1000,
                 updated_at: 1000,
             },
-            CdcCommitFragmentRecord {
-                fragment_id: "fragment-2".to_string(),
-                job_id: "job-1".to_string(),
-                sequence: 42,
-                commit_lsn: "0/AAB".to_string(),
-                table_key: "public__items".to_string(),
-                status: CdcCommitFragmentStatus::Pending,
-                row_count: 0,
-                upserted_count: 0,
-                deleted_count: 0,
-                last_error: None,
-                created_at: 1001,
-                updated_at: 1001,
-            },
-        ])
+            &[
+                CdcCommitFragmentRecord {
+                    fragment_id: "fragment-1".to_string(),
+                    job_id: "job-1".to_string(),
+                    sequence: 41,
+                    commit_lsn: "0/AAA".to_string(),
+                    table_key: "public__items".to_string(),
+                    status: CdcCommitFragmentStatus::Pending,
+                    row_count: 10,
+                    upserted_count: 8,
+                    deleted_count: 2,
+                    last_error: None,
+                    created_at: 1000,
+                    updated_at: 1000,
+                },
+                CdcCommitFragmentRecord {
+                    fragment_id: "fragment-2".to_string(),
+                    job_id: "job-1".to_string(),
+                    sequence: 42,
+                    commit_lsn: "0/AAB".to_string(),
+                    table_key: "public__items".to_string(),
+                    status: CdcCommitFragmentStatus::Pending,
+                    row_count: 0,
+                    upserted_count: 0,
+                    deleted_count: 0,
+                    last_error: None,
+                    created_at: 1001,
+                    updated_at: 1001,
+                },
+            ],
+        )
         .await?;
+    handle
+        .mark_cdc_commit_fragments_succeeded_for_job("job-1")
+        .await?;
+
     handle
         .save_cdc_watermark_state(&CdcWatermarkState {
             next_sequence_to_ack: 41,
@@ -216,9 +235,6 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
             last_slot_feedback_lsn: None,
             updated_at: None,
         })
-        .await?;
-    handle
-        .mark_cdc_commit_fragments_succeeded_for_job("job-1")
         .await?;
 
     let fragments = store
@@ -259,6 +275,7 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -270,6 +287,7 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now + 1,
             updated_at: now + 1,
@@ -281,12 +299,13 @@ async fn postgres_state_store_claims_oldest_eligible_job_per_table() -> anyhow::
             status: CdcBatchLoadJobStatus::Pending,
             payload_json: "{}".to_string(),
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now + 2,
             updated_at: now + 2,
         },
     ] {
-        handle.enqueue_cdc_batch_load_job(&job).await?;
+        handle.enqueue_cdc_batch_load_bundle(&job, &[]).await?;
     }
 
     let first = handle
@@ -351,17 +370,21 @@ async fn postgres_state_store_requeues_running_jobs() -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
 
     handle
-        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
-            job_id: "job-running".to_string(),
-            table_key: "table_a".to_string(),
-            first_sequence: 10,
-            status: CdcBatchLoadJobStatus::Running,
-            payload_json: "{}".to_string(),
-            attempt_count: 1,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-        })
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: "job-running".to_string(),
+                table_key: "table_a".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Running,
+                payload_json: "{}".to_string(),
+                attempt_count: 1,
+                retry_class: None,
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            },
+            &[],
+        )
         .await?;
 
     let requeued = handle.requeue_cdc_batch_load_running_jobs().await?;
@@ -387,19 +410,20 @@ async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result
     let now = chrono::Utc::now().timestamp_millis();
 
     handle
-        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
+        .enqueue_cdc_batch_load_bundle(&CdcBatchLoadJobRecord {
             job_id: "job-failed-merge".to_string(),
             table_key: "table_a".to_string(),
             first_sequence: 10,
             status: CdcBatchLoadJobStatus::Failed,
             payload_json: "{}".to_string(),
             attempt_count: 2,
+            retry_class: Some(SyncRetryClass::Transient),
             last_error: Some(
                 "[DestinationError] failed to process CDC batch-load job: merging staging BigQuery table foo into bar".to_string(),
             ),
             created_at: now,
             updated_at: now,
-        })
+        }, &[])
         .await?;
 
     let requeued = handle
@@ -412,6 +436,48 @@ async fn postgres_state_store_requeues_retryable_failed_jobs() -> anyhow::Result
         .await?;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].job_id, "job-failed-merge");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_does_not_requeue_permanent_failed_jobs() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: "job-failed-perm".to_string(),
+                table_key: "table_a".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Failed,
+                payload_json: "{}".to_string(),
+                attempt_count: 2,
+                retry_class: Some(SyncRetryClass::Permanent),
+                last_error: Some("permanent failure".to_string()),
+                created_at: now,
+                updated_at: now,
+            },
+            &[],
+        )
+        .await?;
+
+    let requeued = handle
+        .requeue_retryable_failed_cdc_batch_load_jobs()
+        .await?;
+    assert_eq!(requeued, 0);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Failed])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, "job-failed-perm");
 
     Ok(())
 }
@@ -433,12 +499,13 @@ async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow
         status: CdcBatchLoadJobStatus::Pending,
         payload_json: "{\"v\":1}".to_string(),
         attempt_count: 0,
+        retry_class: None,
         last_error: None,
         created_at: now,
         updated_at: now,
     };
 
-    let first = handle.enqueue_cdc_batch_load_job(&base).await?;
+    let first = handle.enqueue_cdc_batch_load_bundle(&base, &[]).await?;
     assert_eq!(first.status, CdcBatchLoadJobStatus::Pending);
 
     handle
@@ -446,11 +513,14 @@ async fn postgres_state_store_enqueue_dedup_preserves_succeeded_jobs() -> anyhow
         .await?;
 
     let replayed = handle
-        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
-            payload_json: "{\"v\":2}".to_string(),
-            updated_at: now + 100,
-            ..base.clone()
-        })
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                payload_json: "{\"v\":2}".to_string(),
+                updated_at: now + 100,
+                ..base.clone()
+            },
+            &[],
+        )
         .await?;
     assert_eq!(replayed.status, CdcBatchLoadJobStatus::Succeeded);
     assert_eq!(replayed.payload_json, "{\"v\":1}");
@@ -475,26 +545,139 @@ async fn postgres_state_store_enqueue_dedup_revives_failed_jobs() -> anyhow::Res
         status: CdcBatchLoadJobStatus::Pending,
         payload_json: "{\"v\":1}".to_string(),
         attempt_count: 0,
+        retry_class: None,
         last_error: None,
         created_at: now,
         updated_at: now,
     };
 
-    handle.enqueue_cdc_batch_load_job(&base).await?;
+    handle.enqueue_cdc_batch_load_bundle(&base, &[]).await?;
     handle
-        .mark_cdc_batch_load_job_failed(&base.job_id, "boom")
+        .mark_cdc_batch_load_job_failed(&base.job_id, "boom", SyncRetryClass::Permanent)
         .await?;
 
     let replayed = handle
-        .enqueue_cdc_batch_load_job(&CdcBatchLoadJobRecord {
-            payload_json: "{\"v\":2}".to_string(),
-            updated_at: now + 100,
-            ..base
-        })
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                payload_json: "{\"v\":2}".to_string(),
+                updated_at: now + 100,
+                ..base
+            },
+            &[],
+        )
         .await?;
     assert_eq!(replayed.status, CdcBatchLoadJobStatus::Pending);
     assert_eq!(replayed.payload_json, "{\"v\":2}");
     assert_eq!(replayed.last_error, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_requeues_retryable_batch_load_job_by_id() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let base = CdcBatchLoadJobRecord {
+        job_id: "job-retry".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        payload_json: "{\"v\":1}".to_string(),
+        attempt_count: 0,
+        retry_class: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    handle.enqueue_cdc_batch_load_bundle(&base, &[]).await?;
+    handle
+        .mark_cdc_batch_load_job_failed(
+            &base.job_id,
+            "quota exceeded",
+            SyncRetryClass::Backpressure,
+        )
+        .await?;
+
+    assert!(handle.requeue_cdc_batch_load_job(&base.job_id).await?);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, base.job_id);
+    assert_eq!(jobs[0].retry_class, Some(SyncRetryClass::Backpressure));
+    assert_eq!(jobs[0].last_error, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_enqueue_bundle_persists_job_fragments_and_watermark()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-bundle".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 42,
+        status: CdcBatchLoadJobStatus::Pending,
+        payload_json: "{\"v\":1}".to_string(),
+        attempt_count: 0,
+        retry_class: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-bundle:42".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 42,
+        commit_lsn: "0/ABC".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Pending,
+        row_count: 10,
+        upserted_count: 10,
+        deleted_count: 0,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let persisted = handle
+        .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+        .await?;
+    assert_eq!(persisted.job_id, job.job_id);
+
+    let jobs = handle
+        .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, job.job_id);
+
+    let fragments = store
+        .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Pending])
+        .await?;
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].fragment_id, fragment.fragment_id);
+
+    let watermark = handle.load_cdc_watermark_state().await?;
+    assert_eq!(
+        watermark.and_then(|state| state.last_enqueued_sequence),
+        Some(42)
+    );
 
     Ok(())
 }

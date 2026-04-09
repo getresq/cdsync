@@ -121,6 +121,9 @@ pub(super) fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> O
     if let Ok(ts) = row.try_get::<DateTime<Utc>, _>(column.as_str()) {
         return Some(Value::String(ts.to_rfc3339()));
     }
+    if let Ok(ts) = row.try_get::<DateTime<FixedOffset>, _>(column.as_str()) {
+        return Some(Value::String(ts.to_rfc3339()));
+    }
 
     if let Ok(date) = row.try_get::<NaiveDate, _>(column.as_str()) {
         return Some(Value::String(date.format("%Y-%m-%d").to_string()));

@@ -1,10 +1,625 @@
 use super::snapshot_sync::{release_exported_snapshot_slot, snapshot_shutdown_requested};
 use super::*;
+use crate::retry::CdcSyncPolicyError;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SnapshotTableWritePlan {
     pub write_mode: WriteMode,
     pub truncate_before_copy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotTaskFailureDisposition {
+    Retry,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SnapshotTaskQueueSeed {
+    Runnable {
+        next_retry_at: Option<DateTime<Utc>>,
+    },
+    Blocked {
+        last_error: Option<String>,
+    },
+}
+
+pub(super) struct SnapshotTaskQueueEntry {
+    pub(super) task: CdcSnapshotTask,
+    pub(super) next_retry_at: Option<DateTime<Utc>>,
+}
+
+const SNAPSHOT_TASK_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+pub(super) fn snapshot_task_retry_backoff(attempts: u32, retry_backoff_ms: u64) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(20);
+    let multiplier = 1_u128 << exponent;
+    let millis = u128::from(retry_backoff_ms).saturating_mul(multiplier);
+    let capped = millis.min(SNAPSHOT_TASK_MAX_RETRY_BACKOFF.as_millis());
+    Duration::from_millis(capped as u64)
+}
+
+pub(super) fn snapshot_task_failure_disposition(
+    error: &anyhow::Error,
+) -> SnapshotTaskFailureDisposition {
+    match crate::retry::classify_sync_retry(error) {
+        crate::retry::SyncRetryClass::Permanent => SnapshotTaskFailureDisposition::Block,
+        crate::retry::SyncRetryClass::Backpressure | crate::retry::SyncRetryClass::Transient => {
+            SnapshotTaskFailureDisposition::Retry
+        }
+    }
+}
+
+pub(super) fn snapshot_task_queue_seed(
+    runtime: Option<&TableRuntimeState>,
+    manual_resync_requested: bool,
+) -> SnapshotTaskQueueSeed {
+    match runtime {
+        Some(TableRuntimeState {
+            status: TableRuntimeStatus::Blocked,
+            last_error,
+            ..
+        }) if !manual_resync_requested => SnapshotTaskQueueSeed::Blocked {
+            last_error: last_error.clone(),
+        },
+        Some(TableRuntimeState {
+            status: TableRuntimeStatus::Retrying,
+            next_retry_at,
+            ..
+        }) => SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: *next_retry_at,
+        },
+        _ => SnapshotTaskQueueSeed::Runnable {
+            next_retry_at: None,
+        },
+    }
+}
+
+pub(super) fn snapshot_task_requires_table_serialization(write_mode: WriteMode) -> bool {
+    matches!(write_mode, WriteMode::Upsert)
+}
+
+pub(super) fn should_reset_snapshot_runtime(
+    resume_snapshot_run: bool,
+    manual_resync_requested: bool,
+) -> bool {
+    !resume_snapshot_run || manual_resync_requested
+}
+
+pub(super) fn should_clear_snapshot_runtime_on_success(
+    has_pending_tasks: bool,
+    active_task_count: usize,
+    is_blocked: bool,
+) -> bool {
+    !has_pending_tasks && active_task_count == 0 && !is_blocked
+}
+
+pub(super) fn should_restart_blocked_resync_snapshot(
+    checkpoint: &TableCheckpoint,
+    manual_resync_requested: bool,
+) -> bool {
+    manual_resync_requested
+        && table_has_snapshot_progress(checkpoint)
+        && checkpoint
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.status == TableRuntimeStatus::Blocked)
+}
+
+pub(super) fn should_finalize_snapshot_checkpoint(
+    table_name: &str,
+    blocked_tables: &BTreeMap<String, String>,
+) -> bool {
+    !blocked_tables.contains_key(table_name)
+}
+
+pub(super) fn should_suppress_snapshot_retry_for_blocked_table(is_blocked: bool) -> bool {
+    is_blocked
+}
+
+pub(super) fn refresh_snapshot_retry_resume_from_checkpoint(
+    checkpoint: &TableCheckpoint,
+    chunk: Option<SnapshotChunkRange>,
+) -> Result<Option<String>> {
+    checkpoint
+        .snapshot_chunks
+        .iter()
+        .find(|candidate| snapshot_chunk_checkpoint_matches_range(candidate, chunk))
+        .map(|candidate| candidate.last_primary_key.clone())
+        .context("missing snapshot chunk checkpoint for retry resume")
+}
+
+async fn clear_snapshot_task_runtime_state(
+    checkpoint_state: &Arc<Mutex<TableCheckpoint>>,
+    table_name: &str,
+    state_handle: Option<&StateHandle>,
+) -> Result<()> {
+    let checkpoint = {
+        let mut checkpoint = checkpoint_state.lock().await;
+        checkpoint.runtime = None;
+        checkpoint.clone()
+    };
+    if let Some(state_handle) = state_handle {
+        state_handle
+            .save_postgres_checkpoint(table_name, &checkpoint)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn set_snapshot_task_runtime_state(
+    checkpoint_state: &Arc<Mutex<TableCheckpoint>>,
+    table_name: &str,
+    state_handle: Option<&StateHandle>,
+    status: TableRuntimeStatus,
+    attempts: u32,
+    error: &anyhow::Error,
+    next_retry_at: Option<DateTime<Utc>>,
+) -> Result<TableRuntimeState> {
+    let checkpoint = {
+        let mut checkpoint = checkpoint_state.lock().await;
+        let blocked = matches!(status, TableRuntimeStatus::Blocked);
+        let retry_class = crate::retry::classify_sync_retry(error);
+        checkpoint.runtime = Some(TableRuntimeState {
+            status,
+            attempts,
+            reason: Some(crate::retry::table_runtime_reason_for_retry_class(
+                retry_class,
+                blocked,
+            )),
+            last_error: Some(format!("{error:#}")),
+            next_retry_at,
+            updated_at: Some(Utc::now()),
+        });
+        checkpoint.clone()
+    };
+    if let Some(state_handle) = state_handle {
+        state_handle
+            .save_postgres_checkpoint(table_name, &checkpoint)
+            .await?;
+    }
+    checkpoint
+        .runtime
+        .clone()
+        .context("missing snapshot runtime state after update")
+}
+
+async fn next_snapshot_task_attempts(checkpoint_state: &Arc<Mutex<TableCheckpoint>>) -> u32 {
+    let checkpoint = checkpoint_state.lock().await;
+    checkpoint
+        .runtime
+        .as_ref()
+        .map_or(0, |runtime| runtime.attempts)
+        .saturating_add(1)
+}
+
+async fn wait_snapshot_task_backoff(duration: Duration, shutdown: Option<ShutdownSignal>) -> bool {
+    if let Some(mut shutdown) = shutdown {
+        tokio::select! {
+            () = tokio::time::sleep(duration) => false,
+            changed = shutdown.changed() => changed,
+        }
+    } else {
+        tokio::time::sleep(duration).await;
+        false
+    }
+}
+
+struct SnapshotPhaseResult {
+    completed: bool,
+    blocked_tables: BTreeSet<String>,
+}
+
+pub(super) fn snapshot_phase_should_proceed_to_cdc(
+    follow: bool,
+    blocked_table_count: usize,
+) -> bool {
+    follow && blocked_table_count > 0
+}
+
+pub(super) fn next_snapshot_task_table(
+    table_order: &[String],
+    next_cursor: usize,
+    snapshot_task_queues: &BTreeMap<String, VecDeque<SnapshotTaskQueueEntry>>,
+    active_serialized_tables: &HashSet<String>,
+    now: DateTime<Utc>,
+) -> (Option<String>, Option<DateTime<Utc>>, usize) {
+    let mut earliest_retry_at: Option<DateTime<Utc>> = None;
+    if table_order.is_empty() {
+        return (None, None, next_cursor);
+    }
+
+    for offset in 0..table_order.len() {
+        let index = (next_cursor + offset) % table_order.len();
+        let table_name = &table_order[index];
+        let Some(queue) = snapshot_task_queues.get(table_name) else {
+            continue;
+        };
+        let Some(entry) = queue.front() else {
+            continue;
+        };
+        if snapshot_task_requires_table_serialization(entry.task.write_mode)
+            && active_serialized_tables.contains(table_name)
+        {
+            continue;
+        }
+        if let Some(next_retry_at) = entry.next_retry_at
+            && next_retry_at > now
+        {
+            earliest_retry_at = Some(match earliest_retry_at {
+                Some(current) => current.min(next_retry_at),
+                None => next_retry_at,
+            });
+            continue;
+        }
+        return (
+            Some(table_name.clone()),
+            earliest_retry_at,
+            (index + 1) % table_order.len(),
+        );
+    }
+
+    (None, earliest_retry_at, next_cursor)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cdc_snapshot_phase(
+    source: &PostgresSource,
+    connection_label: &str,
+    snapshot_tasks_to_run: Vec<CdcSnapshotTask>,
+    snapshot_checkpoint_states: HashMap<String, Arc<Mutex<TableCheckpoint>>>,
+    manual_resync_table_names: &HashSet<String>,
+    snapshot_name: Option<String>,
+    mut slot_guard: Option<ExportedSnapshotSlot>,
+    snapshot_slot_name: String,
+    preserve_existing_backlog: bool,
+    dest: &crate::destinations::bigquery::BigQueryDestination,
+    batch_size: usize,
+    snapshot_concurrency: usize,
+    retry_backoff_ms: u64,
+    stats: Option<StatsHandle>,
+    state_handle: Option<StateHandle>,
+    shutdown: Option<ShutdownSignal>,
+    follow: bool,
+) -> Result<SnapshotPhaseResult> {
+    let mut snapshot_task_queues: BTreeMap<String, VecDeque<SnapshotTaskQueueEntry>> =
+        BTreeMap::new();
+    let mut blocked_tables: BTreeMap<String, String> = BTreeMap::new();
+    for snapshot_task in snapshot_tasks_to_run {
+        let runtime = {
+            let checkpoint = snapshot_task.checkpoint_state.lock().await;
+            checkpoint.runtime.clone()
+        };
+        let manual_resync_requested =
+            manual_resync_table_names.contains(&snapshot_task.info.source_name);
+        match snapshot_task_queue_seed(runtime.as_ref(), manual_resync_requested) {
+            SnapshotTaskQueueSeed::Runnable { next_retry_at } => {
+                snapshot_task_queues
+                    .entry(snapshot_task.info.source_name.clone())
+                    .or_default()
+                    .push_back(SnapshotTaskQueueEntry {
+                        task: snapshot_task,
+                        next_retry_at,
+                    });
+            }
+            SnapshotTaskQueueSeed::Blocked { last_error } => {
+                blocked_tables.insert(
+                    snapshot_task.info.source_name.clone(),
+                    last_error.unwrap_or_else(|| "snapshot blocked".to_string()),
+                );
+            }
+        }
+    }
+
+    let mut active_serialized_tables = HashSet::new();
+    let mut active_task_counts: HashMap<String, usize> = HashMap::new();
+    let mut snapshot_tasks = FuturesUnordered::new();
+    let table_order = snapshot_task_queues.keys().cloned().collect::<Vec<_>>();
+    let mut next_table_cursor = 0usize;
+
+    let snapshot_result: Result<()> = loop {
+        let mut earliest_retry_at: Option<DateTime<Utc>> = None;
+        while snapshot_tasks.len() < snapshot_concurrency {
+            let now = Utc::now();
+            let (selected_table_name, selection_retry_at, updated_cursor) =
+                next_snapshot_task_table(
+                    &table_order,
+                    next_table_cursor,
+                    &snapshot_task_queues,
+                    &active_serialized_tables,
+                    now,
+                );
+            earliest_retry_at = match (earliest_retry_at, selection_retry_at) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (None, Some(candidate)) => Some(candidate),
+                (current, None) => current,
+            };
+            next_table_cursor = updated_cursor;
+
+            let Some(table_name) = selected_table_name else {
+                break;
+            };
+            let entry = snapshot_task_queues
+                .get_mut(&table_name)
+                .and_then(VecDeque::pop_front)
+                .context("missing queued snapshot task for selected table")?;
+            if snapshot_task_requires_table_serialization(entry.task.write_mode) {
+                active_serialized_tables.insert(table_name.clone());
+            }
+            *active_task_counts.entry(table_name.clone()).or_default() += 1;
+            let task_snapshot_name = snapshot_name.clone();
+            let task_shutdown = shutdown.clone();
+            let task_stats = stats.clone();
+            let apply_dest = dest.clone();
+            snapshot_tasks.push(async move {
+                let SnapshotTaskQueueEntry {
+                    task: snapshot_task,
+                    next_retry_at,
+                } = entry;
+                info!(
+                    table = %snapshot_task.info.source_name,
+                    snapshot_name = task_snapshot_name.as_deref().unwrap_or("resume"),
+                    batch_size,
+                    snapshot_concurrency,
+                    chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
+                    chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
+                    write_mode = match snapshot_task.write_mode {
+                        WriteMode::Append => "append",
+                        WriteMode::Upsert => "upsert",
+                    },
+                    "starting exported CDC snapshot copy"
+                );
+                let result = source
+                    .run_snapshot_copy_with_exported_snapshot(
+                        &snapshot_task.table,
+                        &snapshot_task.info.schema,
+                        snapshot_task.chunk,
+                        SnapshotCopyContext {
+                            dest: &apply_dest,
+                            snapshot_name: task_snapshot_name.as_deref(),
+                            batch_size,
+                            stats: task_stats,
+                            checkpoint_state: snapshot_task.checkpoint_state.clone(),
+                            resume_from_primary_key: snapshot_task.resume_from_primary_key.clone(),
+                            write_mode: snapshot_task.write_mode,
+                            state_handle: snapshot_task.state_handle.clone(),
+                            shutdown: task_shutdown,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "copying exported snapshot for {}",
+                            snapshot_task.info.source_name
+                        )
+                    });
+                (
+                    table_name,
+                    SnapshotTaskQueueEntry {
+                        task: snapshot_task,
+                        next_retry_at,
+                    },
+                    result,
+                )
+            });
+        }
+
+        if snapshot_tasks.is_empty() {
+            let has_pending_tasks = snapshot_task_queues.values().any(|queue| !queue.is_empty());
+            if !has_pending_tasks {
+                if blocked_tables.is_empty() {
+                    break Ok(());
+                }
+                if snapshot_phase_should_proceed_to_cdc(follow, blocked_tables.len()) {
+                    warn!(
+                        connection = %connection_label,
+                        blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
+                        "snapshot drained runnable tables; continuing CDC for ready tables while blocked tables wait for manual resync"
+                    );
+                    break Ok(());
+                }
+                break Err(CdcSyncPolicyError::SnapshotBlocked {
+                    tables: blocked_tables.keys().cloned().collect(),
+                }
+                .into());
+            }
+            if let Some(next_retry_at) = earliest_retry_at {
+                let now = Utc::now();
+                let wait = (next_retry_at - now)
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_millis(0));
+                if wait_snapshot_task_backoff(wait, shutdown.clone()).await {
+                    break Ok(());
+                }
+                continue;
+            }
+            if blocked_tables.is_empty() {
+                break Ok(());
+            }
+            if snapshot_phase_should_proceed_to_cdc(follow, blocked_tables.len()) {
+                warn!(
+                    connection = %connection_label,
+                    blocked_tables = ?blocked_tables.keys().cloned().collect::<Vec<_>>(),
+                    "snapshot has only blocked tables remaining; continuing CDC for ready tables while blocked tables wait for manual resync"
+                );
+                break Ok(());
+            }
+            break Err(CdcSyncPolicyError::SnapshotBlocked {
+                tables: blocked_tables.keys().cloned().collect(),
+            }
+            .into());
+        }
+
+        let (table_name, mut entry, result) = snapshot_tasks
+            .next()
+            .await
+            .context("snapshot task scheduler stopped unexpectedly")?;
+        if snapshot_task_requires_table_serialization(entry.task.write_mode) {
+            active_serialized_tables.remove(&table_name);
+        }
+        let active_task_count = match active_task_counts.get_mut(&table_name) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                let remaining = *count;
+                if remaining == 0 {
+                    active_task_counts.remove(&table_name);
+                }
+                remaining
+            }
+            None => 0,
+        };
+        match result {
+            Ok(()) => {
+                let has_pending_tasks = snapshot_task_queues
+                    .get(&table_name)
+                    .is_some_and(|queue| !queue.is_empty());
+                let is_blocked = blocked_tables.contains_key(&table_name);
+                if should_clear_snapshot_runtime_on_success(
+                    has_pending_tasks,
+                    active_task_count,
+                    is_blocked,
+                ) {
+                    clear_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                    )
+                    .await?;
+                    blocked_tables.remove(&table_name);
+                }
+                if snapshot_task_queues
+                    .get(&table_name)
+                    .is_some_and(VecDeque::is_empty)
+                {
+                    snapshot_task_queues.remove(&table_name);
+                }
+            }
+            Err(err) => match snapshot_task_failure_disposition(&err) {
+                SnapshotTaskFailureDisposition::Retry => {
+                    if should_suppress_snapshot_retry_for_blocked_table(
+                        blocked_tables.contains_key(&table_name),
+                    ) {
+                        warn!(
+                            connection = %connection_label,
+                            table = %table_name,
+                            error = %format!("{err:#}"),
+                            "snapshot task failed retryably after table was already blocked; preserving blocked state"
+                        );
+                        continue;
+                    }
+                    let attempts = next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
+                    let backoff = snapshot_task_retry_backoff(attempts, retry_backoff_ms);
+                    let next_retry_at = Utc::now()
+                        + chrono::Duration::from_std(backoff)
+                            .context("invalid snapshot retry backoff duration")?;
+                    let _runtime = set_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                        TableRuntimeStatus::Retrying,
+                        attempts,
+                        &err,
+                        Some(next_retry_at),
+                    )
+                    .await?;
+                    warn!(
+                        connection = %connection_label,
+                        table = %table_name,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %format!("{err:#}"),
+                        "snapshot task failed; scheduling table-local retry"
+                    );
+                    entry.task.resume_from_primary_key = {
+                        let checkpoint = entry.task.checkpoint_state.lock().await;
+                        refresh_snapshot_retry_resume_from_checkpoint(
+                            &checkpoint,
+                            entry.task.chunk,
+                        )?
+                    };
+                    entry.next_retry_at = Some(next_retry_at);
+                    snapshot_task_queues
+                        .entry(table_name)
+                        .or_default()
+                        .push_front(entry);
+                }
+                SnapshotTaskFailureDisposition::Block => {
+                    let attempts = next_snapshot_task_attempts(&entry.task.checkpoint_state).await;
+                    let runtime = set_snapshot_task_runtime_state(
+                        &entry.task.checkpoint_state,
+                        &entry.task.table.name,
+                        entry.task.state_handle.as_ref(),
+                        TableRuntimeStatus::Blocked,
+                        attempts,
+                        &err,
+                        None,
+                    )
+                    .await?;
+                    warn!(
+                        connection = %connection_label,
+                        table = %table_name,
+                        attempts = runtime.attempts,
+                        error = %format!("{err:#}"),
+                        "snapshot task blocked; preserving table-local state and continuing other tables"
+                    );
+                    blocked_tables.insert(table_name.clone(), format!("{err:#}"));
+                    snapshot_task_queues.remove(&table_name);
+                }
+            },
+        }
+    };
+
+    let snapshot_completed = cdc_snapshot_completed(snapshot_result.is_ok(), shutdown.as_ref());
+    if let Some(slot_guard) = slot_guard.take() {
+        release_exported_snapshot_slot(slot_guard, snapshot_completed).await?;
+    }
+    if preserve_existing_backlog {
+        let client =
+            PgReplicationClient::connect(source.build_pg_connection_config().await?).await?;
+        if let Err(err) = client.delete_slot(&snapshot_slot_name).await
+            && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
+        {
+            return Err(err.into());
+        }
+    }
+    snapshot_result?;
+    if !snapshot_completed {
+        return Ok(SnapshotPhaseResult {
+            completed: false,
+            blocked_tables: blocked_tables.keys().cloned().collect(),
+        });
+    }
+
+    let completed_at = Utc::now();
+    for (table_name, checkpoint_state) in snapshot_checkpoint_states {
+        if !should_finalize_snapshot_checkpoint(&table_name, &blocked_tables) {
+            continue;
+        }
+        let checkpoint = {
+            let mut checkpoint = checkpoint_state.lock().await;
+            checkpoint.last_synced_at = Some(completed_at);
+            checkpoint.last_primary_key = None;
+            checkpoint.snapshot_start_lsn = None;
+            checkpoint.snapshot_preserve_backlog = false;
+            checkpoint.snapshot_chunks.clear();
+            checkpoint.clone()
+        };
+        if let Some(state_handle) = &state_handle {
+            state_handle
+                .save_postgres_checkpoint(&table_name, &checkpoint)
+                .await?;
+            if manual_resync_table_names.contains(&table_name) {
+                state_handle
+                    .clear_postgres_table_resync_request(&table_name)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(SnapshotPhaseResult {
+        completed: true,
+        blocked_tables: blocked_tables.keys().cloned().collect(),
+    })
 }
 
 pub(super) fn checkpoint_has_material_sync_progress(checkpoint: &TableCheckpoint) -> bool {
@@ -214,6 +829,7 @@ impl PostgresSource {
             dry_run,
             follow,
             default_batch_size,
+            retry_backoff_ms,
             snapshot_concurrency,
             tables,
             schema_diff_enabled,
@@ -229,10 +845,10 @@ impl PostgresSource {
             .map_or("postgres", StateHandle::connection_id);
 
         if !self.cdc_enabled() {
-            anyhow::bail!("CDC is disabled for Postgres source");
+            return Err(CdcSyncPolicyError::CdcDisabled.into());
         }
         if tables.is_empty() {
-            anyhow::bail!("no postgres tables configured for CDC");
+            return Err(CdcSyncPolicyError::NoTablesConfigured.into());
         }
         let policy = self.config.schema_policy();
 
@@ -240,7 +856,7 @@ impl PostgresSource {
             .config
             .publication
             .as_deref()
-            .context("postgres.publication is required when CDC is enabled")?;
+            .ok_or(CdcSyncPolicyError::PublicationRequired)?;
         let publication_mode = self.config.publication_mode();
         let pipeline_id = self.config.cdc_pipeline_id;
         let stream_pipeline_id = pipeline_id.unwrap_or(1);
@@ -265,7 +881,10 @@ impl PostgresSource {
         match publication_mode {
             crate::config::PostgresPublicationMode::Validate => {
                 if !replication_client.publication_exists(publication).await? {
-                    anyhow::bail!("publication '{}' does not exist", publication);
+                    return Err(CdcSyncPolicyError::PublicationMissing {
+                        publication: publication.to_string(),
+                    }
+                    .into());
                 }
             }
             crate::config::PostgresPublicationMode::Manage => {
@@ -348,17 +967,17 @@ impl PostgresSource {
                 }
                 match policy {
                     SchemaChangePolicy::Fail => {
-                        anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                     SchemaChangePolicy::Auto => {
                         if diff.has_incompatible() || primary_key_changed_detected {
-                            anyhow::bail!(
-                                "incompatible schema change detected for {}; trigger a manual table resync",
-                                table_cfg.name
-                            );
+                            return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                                table: table_cfg.name.clone(),
+                            }
+                            .into());
                         }
                     }
                 }
@@ -386,16 +1005,16 @@ impl PostgresSource {
                 );
                 match policy {
                     SchemaChangePolicy::Fail => {
-                        anyhow::bail!(
-                            "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                     SchemaChangePolicy::Auto => {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -415,6 +1034,7 @@ impl PostgresSource {
             stats.clone(),
             cdc_apply_concurrency,
             state_handle.clone(),
+            follow,
         )
         .await?;
 
@@ -428,6 +1048,22 @@ impl PostgresSource {
             }
         }
         let mut last_lsn = state.postgres_cdc.as_ref().and_then(|s| s.last_lsn.clone());
+        for table_name in &manual_resync_table_names {
+            let Some(checkpoint) = state.postgres.get_mut(table_name) else {
+                continue;
+            };
+            if !should_restart_blocked_resync_snapshot(checkpoint, true) {
+                continue;
+            }
+            checkpoint.snapshot_chunks.clear();
+            checkpoint.snapshot_start_lsn = None;
+            checkpoint.snapshot_preserve_backlog = false;
+            if let Some(state_handle) = &state_handle {
+                state_handle
+                    .save_postgres_checkpoint(table_name, checkpoint)
+                    .await?;
+            }
+        }
         let initial_snapshot_tables =
             initial_snapshot_table_ids(&table_ids, state, last_lsn.as_deref());
         let snapshot_progress_tables = snapshot_progress_table_ids(&table_ids, state);
@@ -445,25 +1081,28 @@ impl PostgresSource {
 
         let has_snapshot_progress = !snapshot_progress_tables.is_empty();
         let mut snapshot_progress_missing_lsn = false;
-        let snapshot_resume_lsn = tables.iter().try_fold(None, |current, table| {
-            let Some(checkpoint) = state.postgres.get(&table.name) else {
-                return Ok(current);
-            };
-            if !table_has_snapshot_progress(checkpoint) {
-                return Ok(current);
-            }
-            match (&current, checkpoint.snapshot_start_lsn.as_ref()) {
-                (None, Some(lsn)) => Ok(Some(lsn.clone())),
-                (Some(existing), Some(lsn)) if existing == lsn => Ok(current),
-                (Some(_), Some(_)) => {
-                    anyhow::bail!("snapshot progress checkpoints have mismatched start LSNs")
-                }
-                (_, None) => {
-                    snapshot_progress_missing_lsn = true;
-                    Ok(current)
-                }
-            }
-        })?;
+        let snapshot_resume_lsn =
+            tables
+                .iter()
+                .try_fold(None, |current, table| -> Result<Option<String>> {
+                    let Some(checkpoint) = state.postgres.get(&table.name) else {
+                        return Ok(current);
+                    };
+                    if !table_has_snapshot_progress(checkpoint) {
+                        return Ok(current);
+                    }
+                    match (&current, checkpoint.snapshot_start_lsn.as_ref()) {
+                        (None, Some(lsn)) => Ok(Some(lsn.clone())),
+                        (Some(existing), Some(lsn)) if existing == lsn => Ok(current),
+                        (Some(_), Some(_)) => {
+                            Err(CdcSyncPolicyError::SnapshotProgressCheckpointMismatch.into())
+                        }
+                        (_, None) => {
+                            snapshot_progress_missing_lsn = true;
+                            Ok(current)
+                        }
+                    }
+                })?;
         let force_snapshot_restart = has_snapshot_progress
             && (snapshot_resume_lsn.is_none() || snapshot_progress_missing_lsn);
         if force_snapshot_restart {
@@ -552,6 +1191,7 @@ impl PostgresSource {
                     .get(table_id)
                     .cloned()
                     .context("missing table config for CDC snapshot")?;
+                let manual_resync_requested = manual_resync_table_names.contains(&table.name);
                 let info = table_info_map
                     .get(table_id)
                     .cloned()
@@ -562,6 +1202,9 @@ impl PostgresSource {
                     let had_progress = table_has_snapshot_progress(entry);
                     let is_initial_snapshot_table = initial_snapshot_tables.contains(table_id);
                     resumed_from_saved_progress = resume_snapshot_run && had_progress;
+                    if should_reset_snapshot_runtime(resume_snapshot_run, manual_resync_requested) {
+                        entry.runtime = None;
+                    }
                     if let Some(schema_hash) = table_hashes.get(table_id) {
                         entry.schema_hash = Some(schema_hash.clone());
                     }
@@ -692,82 +1335,35 @@ impl PostgresSource {
                 }
             }
 
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_concurrency));
-            let mut snapshot_tasks = FuturesUnordered::new();
-            for snapshot_task in snapshot_tasks_to_run {
-                let permit_pool = Arc::clone(&semaphore);
-                let snapshot_name = snapshot_name.clone();
-                let task_shutdown = shutdown.clone();
-                let source = self;
-                let dest = dest.clone();
-                let stats = stats.clone();
-                snapshot_tasks.push(async move {
-                    let permit = permit_pool
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| anyhow::anyhow!("failed to acquire CDC snapshot permit"))?;
-                    let _permit = permit;
-                    info!(
-                        table = %snapshot_task.info.source_name,
-                        snapshot_name = snapshot_name.as_deref().unwrap_or("resume"),
-                        batch_size,
-                        snapshot_concurrency,
-                        chunk_start = snapshot_task.chunk.map(|chunk| chunk.start_pk),
-                        chunk_end = snapshot_task.chunk.map(|chunk| chunk.end_pk),
-                        write_mode = match snapshot_task.write_mode {
-                            WriteMode::Append => "append",
-                            WriteMode::Upsert => "upsert",
-                        },
-                        "starting exported CDC snapshot copy"
-                    );
-                    source
-                        .run_snapshot_copy_with_exported_snapshot(
-                            &snapshot_task.table,
-                            &snapshot_task.info.schema,
-                            snapshot_task.chunk,
-                            SnapshotCopyContext {
-                                dest: &dest,
-                                snapshot_name: snapshot_name.as_deref(),
-                                batch_size,
-                                stats,
-                                checkpoint_state: snapshot_task.checkpoint_state,
-                                resume_from_primary_key: snapshot_task.resume_from_primary_key,
-                                write_mode: snapshot_task.write_mode,
-                                state_handle: snapshot_task.state_handle,
-                                shutdown: task_shutdown,
-                            },
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "copying exported snapshot for {}",
-                                snapshot_task.info.source_name
-                            )
-                        })?;
-                    Ok::<(), anyhow::Error>(())
-                });
-            }
+            let preferred_start_lsn = if preserve_existing_backlog {
+                None
+            } else {
+                Some(snapshot_start_lsn.parse().map_err(|_| {
+                    anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
+                })?)
+            };
 
-            let snapshot_result: Result<()> = async {
-                while let Some(result) = snapshot_tasks.next().await {
-                    result?;
-                }
-                Ok(())
-            }
-            .await;
-            let snapshot_completed =
-                cdc_snapshot_completed(snapshot_result.is_ok(), shutdown.as_ref());
-            if let Some(slot_guard) = slot_guard {
-                release_exported_snapshot_slot(slot_guard, snapshot_completed).await?;
-            }
-            if preserve_existing_backlog
-                && let Err(err) = replication_client.delete_slot(&snapshot_slot_name).await
-                && err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
-            {
-                return Err(err.into());
-            }
-            snapshot_result?;
-            if !snapshot_completed {
+            let snapshot_outcome = run_cdc_snapshot_phase(
+                self,
+                connection_label,
+                snapshot_tasks_to_run,
+                snapshot_checkpoint_states.clone(),
+                &manual_resync_table_names,
+                snapshot_name,
+                slot_guard,
+                snapshot_slot_name,
+                preserve_existing_backlog,
+                dest,
+                batch_size,
+                snapshot_concurrency,
+                retry_backoff_ms,
+                stats.clone(),
+                state_handle.clone(),
+                shutdown.clone(),
+                follow,
+            )
+            .await?;
+            if !snapshot_outcome.completed {
                 for (table_name, checkpoint_state) in &snapshot_checkpoint_states {
                     let checkpoint = checkpoint_state.lock().await.clone();
                     state.postgres.insert(table_name.clone(), checkpoint);
@@ -779,42 +1375,44 @@ impl PostgresSource {
                 );
                 return Ok(());
             }
+            if !snapshot_outcome.blocked_tables.is_empty() {
+                let blocked_table_ids: HashSet<TableId> = table_ids
+                    .iter()
+                    .filter_map(|(table_id, table_cfg)| {
+                        snapshot_outcome
+                            .blocked_tables
+                            .contains(&table_cfg.name)
+                            .then_some(*table_id)
+                    })
+                    .collect();
+                if blocked_table_ids.len() == include_tables.len() {
+                    return Err(CdcSyncPolicyError::SnapshotBlocked {
+                        tables: snapshot_outcome.blocked_tables.iter().cloned().collect(),
+                    }
+                    .into());
+                }
+                for blocked_table_id in blocked_table_ids {
+                    include_tables.remove(&blocked_table_id);
+                }
+                warn!(
+                    connection = %connection_label,
+                    blocked_tables = ?snapshot_outcome.blocked_tables,
+                    remaining_cdc_tables = include_tables.len(),
+                    "starting CDC while excluding blocked snapshot tables until manual resync"
+                );
+            }
             if !preserve_existing_backlog {
                 let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
                 cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
                 if let Some(state_handle) = &state_handle {
                     state_handle.save_postgres_cdc_state(cdc_state).await?;
                 }
+                start_lsn = preferred_start_lsn;
+                last_lsn = Some(snapshot_start_lsn.clone());
             }
-            let completed_at = Utc::now();
             for (table_name, checkpoint_state) in snapshot_checkpoint_states {
-                let checkpoint = {
-                    let mut checkpoint = checkpoint_state.lock().await;
-                    checkpoint.last_synced_at = Some(completed_at);
-                    checkpoint.last_primary_key = None;
-                    checkpoint.snapshot_start_lsn = None;
-                    checkpoint.snapshot_preserve_backlog = false;
-                    checkpoint.snapshot_chunks.clear();
-                    checkpoint.clone()
-                };
-                if let Some(state_handle) = &state_handle {
-                    state_handle
-                        .save_postgres_checkpoint(&table_name, &checkpoint)
-                        .await?;
-                    if manual_resync_table_names.contains(&table_name) {
-                        state_handle
-                            .clear_postgres_table_resync_request(&table_name)
-                            .await?;
-                    }
-                }
+                let checkpoint = checkpoint_state.lock().await.clone();
                 state.postgres.insert(table_name, checkpoint);
-            }
-            if !preserve_existing_backlog {
-                let parsed_start_lsn = snapshot_start_lsn.parse().map_err(|_| {
-                    anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
-                })?;
-                start_lsn = Some(parsed_start_lsn);
-                last_lsn = Some(snapshot_start_lsn);
             }
         } else {
             info!(
@@ -905,17 +1503,17 @@ impl PostgresSource {
         verbose: bool,
     ) -> Result<()> {
         if !self.cdc_enabled() {
-            anyhow::bail!("CDC is disabled for Postgres source");
+            return Err(CdcSyncPolicyError::CdcDisabled.into());
         }
         if tables.is_empty() {
-            anyhow::bail!("no postgres tables configured for CDC");
+            return Err(CdcSyncPolicyError::NoTablesConfigured.into());
         }
 
         let publication = self
             .config
             .publication
             .as_deref()
-            .context("postgres.publication is required when CDC is enabled")?;
+            .ok_or(CdcSyncPolicyError::PublicationRequired)?;
         let publication_mode = self.config.publication_mode();
 
         self.validate_wal_level().await?;
@@ -926,7 +1524,10 @@ impl PostgresSource {
         match publication_mode {
             crate::config::PostgresPublicationMode::Validate => {
                 if !replication_client.publication_exists(publication).await? {
-                    anyhow::bail!("publication '{}' does not exist", publication);
+                    return Err(CdcSyncPolicyError::PublicationMissing {
+                        publication: publication.to_string(),
+                    }
+                    .into());
                 }
             }
             crate::config::PostgresPublicationMode::Manage => {
@@ -972,7 +1573,7 @@ impl PostgresSource {
             .await
             .context("checking wal_level")?;
         if wal_level != "logical" {
-            anyhow::bail!("wal_level must be logical for CDC (found '{}')", wal_level);
+            return Err(CdcSyncPolicyError::WalLevelNotLogical { wal_level }.into());
         }
         Ok(())
     }
@@ -993,11 +1594,11 @@ impl PostgresSource {
 
         for table in tables {
             if !publication_set.contains(&table.name) {
-                anyhow::bail!(
-                    "table {} not found in publication {}",
-                    table.name,
-                    publication
-                );
+                return Err(CdcSyncPolicyError::TableNotInPublication {
+                    table: table.name.clone(),
+                    publication: publication.to_string(),
+                }
+                .into());
             }
         }
         Ok(())
@@ -1013,10 +1614,11 @@ impl PostgresSource {
         for table in tables {
             if let Some(where_clause) = &table.where_clause {
                 let actual = filters.get(&table.name).and_then(|v| v.as_ref());
-                let actual = actual.context(format!(
-                    "publication {} missing row filter for table {}",
-                    publication, table.name
-                ))?;
+                let actual =
+                    actual.ok_or_else(|| CdcSyncPolicyError::PublicationFilterMissing {
+                        publication: publication.to_string(),
+                        table: table.name.clone(),
+                    })?;
                 let expected_norm = normalize_filter(where_clause);
                 let actual_norm = normalize_filter(actual);
                 if expected_norm != actual_norm {
@@ -1028,13 +1630,13 @@ impl PostgresSource {
                             "publication row filter mismatch"
                         );
                     }
-                    anyhow::bail!(
-                        "publication {} row filter mismatch for {} (expected `{}`, got `{}`)",
-                        publication,
-                        table.name,
-                        where_clause,
-                        actual
-                    );
+                    return Err(CdcSyncPolicyError::PublicationFilterMismatch {
+                        publication: publication.to_string(),
+                        table: table.name.clone(),
+                        expected: where_clause.clone(),
+                        actual: actual.clone(),
+                    }
+                    .into());
                 }
             }
         }

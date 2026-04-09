@@ -96,6 +96,7 @@ struct CdcBatchLoadManager {
     state_handle: StateHandle,
     waiters: Arc<Mutex<CdcBatchLoadJobWaiters>>,
     notify: Arc<Notify>,
+    local_retry_retryable_failures: bool,
 }
 
 enum PendingTableRowAction {
@@ -180,6 +181,7 @@ impl EtlBigQueryDestination {
         stats: Option<StatsHandle>,
         apply_concurrency: usize,
         state_handle: Option<StateHandle>,
+        local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let cdc_batch_load_manager = if inner.cdc_batch_load_queue_enabled() {
             if let Some(state_handle) = state_handle {
@@ -189,6 +191,7 @@ impl EtlBigQueryDestination {
                         stats.clone(),
                         state_handle,
                         apply_concurrency.max(1),
+                        local_retry_retryable_failures,
                     )
                     .await?,
                 ))

@@ -1,3 +1,4 @@
+use crate::retry::ErrorReasonCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,23 @@ pub struct SnapshotChunkCheckpoint {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableRuntimeStatus {
+    Retrying,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableRuntimeState {
+    pub status: TableRuntimeStatus,
+    pub attempts: u32,
+    pub reason: Option<ErrorReasonCode>,
+    pub last_error: Option<String>,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
@@ -85,4 +103,6 @@ pub struct TableCheckpoint {
     pub snapshot_preserve_backlog: bool,
     #[serde(default)]
     pub snapshot_chunks: Vec<SnapshotChunkCheckpoint>,
+    #[serde(default)]
+    pub runtime: Option<TableRuntimeState>,
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::destinations::bigquery;
+use crate::retry::{SyncRetryClass, classify_sync_retry, compute_sync_retry_backoff};
 
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
@@ -39,6 +40,28 @@ fn stable_cdc_batch_load_object_name(
 ) -> String {
     let suffix = format!("{}_{}", step_kind.as_str(), job_id);
     bigquery::stable_cdc_batch_load_object_name(prefix, target_table, &suffix)
+}
+
+fn should_resolve_cdc_batch_load_waiters(
+    retry_class: SyncRetryClass,
+    local_retry_retryable_failures: bool,
+) -> bool {
+    !local_retry_retryable_failures || !retry_class.is_retryable()
+}
+
+fn should_mark_cdc_batch_load_fragments_failed(
+    retry_class: SyncRetryClass,
+    local_retry_retryable_failures: bool,
+) -> bool {
+    !local_retry_retryable_failures || !retry_class.is_retryable()
+}
+
+fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
+    compute_sync_retry_backoff(
+        &format!("cdc_batch_load:{table_key}"),
+        attempt_count.max(1) as u32,
+        1_000,
+    )
 }
 
 impl EtlBigQueryDestination {
@@ -195,6 +218,7 @@ impl CdcBatchLoadManager {
         stats: Option<StatsHandle>,
         state_handle: StateHandle,
         worker_count: usize,
+        local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let manager = Self {
             inner,
@@ -202,6 +226,7 @@ impl CdcBatchLoadManager {
             state_handle,
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            local_retry_retryable_failures,
         };
         manager.restore_pending_jobs().await?;
         manager.start_workers(worker_count.max(1));
@@ -303,6 +328,7 @@ impl CdcBatchLoadManager {
                 )
             })?,
             attempt_count: 0,
+            retry_class: None,
             last_error: None,
             created_at: now,
             updated_at: now,
@@ -353,68 +379,28 @@ impl CdcBatchLoadManager {
                 updated_at: now,
             })
             .collect();
-        let persisted_record = self
-            .state_handle
-            .enqueue_cdc_batch_load_job(&record)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to persist CDC batch-load job",
-                    err.to_string()
-                )
-            })?;
-        self.state_handle
-            .upsert_cdc_commit_fragments(&fragment_records)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to persist CDC commit fragments",
-                    err.to_string()
-                )
-            })?;
-        if let Some(last_fragment) = fragment_records.last() {
-            let mut watermark = self
-                .state_handle
-                .load_cdc_watermark_state()
-                .await
-                .map_err(|err| {
-                    etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to load CDC watermark state",
-                        err.to_string()
-                    )
-                })?
-                .unwrap_or_default();
-            watermark.last_enqueued_sequence = Some(
-                watermark
-                    .last_enqueued_sequence
-                    .unwrap_or_default()
-                    .max(last_fragment.sequence),
-            );
-            watermark.last_received_lsn = Some(last_fragment.commit_lsn.clone());
-            watermark.last_relevant_change_seen_at = Some(Utc::now());
-            watermark.updated_at = Some(Utc::now());
-            self.state_handle
-                .save_cdc_watermark_state(&watermark)
-                .await
-                .map_err(|err| {
-                    etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to persist CDC watermark enqueue state",
-                        err.to_string()
-                    )
-                })?;
-        }
-
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .await
-            .entry(persisted_record.job_id.clone())
+            .entry(record.job_id.clone())
             .or_default()
             .push(tx);
+        let persisted_record = match self
+            .state_handle
+            .enqueue_cdc_batch_load_bundle(&record, &fragment_records)
+            .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                let _ = self.waiters.lock().await.remove(&record.job_id);
+                return Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to persist CDC batch-load job",
+                    err.to_string()
+                ));
+            }
+        };
         match persisted_record.status {
             CdcBatchLoadJobStatus::Succeeded => {
                 if let Some(waiters) = self.waiters.lock().await.remove(&persisted_record.job_id) {
@@ -574,6 +560,7 @@ impl CdcBatchLoadManager {
                     .await;
             }
             Err(err) => {
+                let retry_class = classify_sync_retry(&anyhow::Error::new(err.clone()));
                 crate::telemetry::record_cdc_batch_load_job(
                     self.state_handle.connection_id(),
                     &table_key,
@@ -592,16 +579,62 @@ impl CdcBatchLoadManager {
                 );
                 let _ = self
                     .state_handle
-                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string())
+                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string(), retry_class)
                     .await;
-                let _ = self
-                    .state_handle
-                    .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
-                    .await;
+                if should_mark_cdc_batch_load_fragments_failed(
+                    retry_class,
+                    self.local_retry_retryable_failures,
+                ) {
+                    let _ = self
+                        .state_handle
+                        .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
+                        .await;
+                } else {
+                    let state_handle = self.state_handle.clone();
+                    let notify = Arc::clone(&self.notify);
+                    let retry_job_id = job_id.clone();
+                    let retry_table = table_key.clone();
+                    let retry_delay =
+                        cdc_batch_load_retry_delay(job.record.attempt_count, &retry_table);
+                    info!(
+                        component = "consumer",
+                        event = "cdc_consumer_job_retry_scheduled",
+                        connection_id = self.state_handle.connection_id(),
+                        job_id = %retry_job_id,
+                        table = %retry_table,
+                        retry_class = retry_class.as_str(),
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        "scheduled queued CDC batch-load job for local retry"
+                    );
+                    tokio::spawn(async move {
+                        tokio::time::sleep(retry_delay).await;
+                        match state_handle.requeue_cdc_batch_load_job(&retry_job_id).await {
+                            Ok(true) => notify.notify_one(),
+                            Ok(false) => {}
+                            Err(err) => warn!(
+                                component = "consumer",
+                                event = "cdc_consumer_job_retry_requeue_failed",
+                                connection_id = state_handle.connection_id(),
+                                job_id = %retry_job_id,
+                                table = %retry_table,
+                                error = %err,
+                                "failed to requeue queued CDC batch-load job for retry"
+                            ),
+                        }
+                    });
+                }
             }
         }
 
-        if let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
+        let resolve_waiters = match &result {
+            Ok(()) => true,
+            Err(err) => should_resolve_cdc_batch_load_waiters(
+                classify_sync_retry(&anyhow::Error::new(err.clone())),
+                self.local_retry_retryable_failures,
+            ),
+        };
+
+        if resolve_waiters && let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
             for waiter in waiters {
                 let waiter_result = match &result {
                     Ok(()) => Ok(()),
@@ -615,5 +648,53 @@ impl CdcBatchLoadManager {
             }
         }
         self.notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_batch_load_failures_keep_waiters_and_fragments_open() {
+        assert!(!should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Backpressure,
+            true
+        ));
+        assert!(!should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Transient,
+            true
+        ));
+    }
+
+    #[test]
+    fn permanent_batch_load_failures_resolve_waiters_and_fail_fragments() {
+        assert!(should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Permanent,
+            true
+        ));
+        assert!(should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Permanent,
+            true
+        ));
+    }
+
+    #[test]
+    fn one_shot_batch_load_failures_surface_retryable_errors() {
+        assert!(should_resolve_cdc_batch_load_waiters(
+            SyncRetryClass::Backpressure,
+            false
+        ));
+        assert!(should_mark_cdc_batch_load_fragments_failed(
+            SyncRetryClass::Transient,
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_load_retry_delay_uses_bounded_retry_backoff() {
+        let delay = cdc_batch_load_retry_delay(1, "public.accounts");
+        assert!(delay >= Duration::from_secs(16));
+        assert!(delay <= Duration::from_secs(20));
     }
 }

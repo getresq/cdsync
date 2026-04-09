@@ -1,11 +1,14 @@
 use super::*;
+use crate::retry::SyncRetryClass;
 
 impl SyncStateStore {
-    pub async fn enqueue_cdc_batch_load_job(
+    pub async fn enqueue_cdc_batch_load_bundle(
         &self,
         connection_id: &str,
         job: &CdcBatchLoadJobRecord,
+        fragments: &[CdcCommitFragmentRecord],
     ) -> anyhow::Result<CdcBatchLoadJobRecord> {
+        let mut tx = self.pool.begin().await?;
         let table = self.table("cdc_batch_load_jobs");
         let row = sqlx::query(&format!(
             r#"
@@ -17,10 +20,11 @@ impl SyncStateStore {
                 status,
                 payload_json,
                 attempt_count,
+                retry_class,
                 last_error,
                 created_at,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             on conflict(job_id) do update set
                 table_key = case
                     when {table}.status = 'failed' then excluded.table_key
@@ -39,6 +43,10 @@ impl SyncStateStore {
                     else {table}.payload_json
                 end,
                 attempt_count = {table}.attempt_count,
+                retry_class = case
+                    when {table}.status = 'failed' then excluded.retry_class
+                    else {table}.retry_class
+                end,
                 last_error = case
                     when {table}.status = 'failed' then null
                     else {table}.last_error
@@ -48,7 +56,7 @@ impl SyncStateStore {
                     else {table}.updated_at
                 end
             returning job_id, table_key, first_sequence, status, payload_json, attempt_count,
-                      last_error, created_at, updated_at
+                      retry_class, last_error, created_at, updated_at
             "#,
             table = table,
         ))
@@ -59,11 +67,107 @@ impl SyncStateStore {
         .bind(job.status.as_str())
         .bind(&job.payload_json)
         .bind(job.attempt_count)
+        .bind(job.retry_class.map(SyncRetryClass::as_str))
         .bind(job.last_error.clone())
         .bind(job.created_at)
         .bind(job.updated_at)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        let fragment_table = self.table("cdc_commit_fragments");
+        for fragment in fragments {
+            sqlx::query(&format!(
+                r#"
+                insert into {fragment_table} (
+                    connection_id,
+                    fragment_id,
+                    job_id,
+                    sequence,
+                    commit_lsn,
+                    table_key,
+                    status,
+                    row_count,
+                    upserted_count,
+                    deleted_count,
+                    last_error,
+                    created_at,
+                    updated_at
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                on conflict(fragment_id) do update set
+                    job_id = excluded.job_id,
+                    sequence = excluded.sequence,
+                    commit_lsn = excluded.commit_lsn,
+                    table_key = excluded.table_key,
+                    status = case
+                        when {fragment_table}.status = 'failed' then excluded.status
+                        else {fragment_table}.status
+                    end,
+                    row_count = excluded.row_count,
+                    upserted_count = excluded.upserted_count,
+                    deleted_count = excluded.deleted_count,
+                    last_error = case
+                        when {fragment_table}.status = 'failed' then excluded.last_error
+                        else {fragment_table}.last_error
+                    end,
+                    updated_at = case
+                        when {fragment_table}.status = 'failed' then excluded.updated_at
+                        else {fragment_table}.updated_at
+                    end
+                "#,
+                fragment_table = fragment_table,
+            ))
+            .bind(connection_id)
+            .bind(&fragment.fragment_id)
+            .bind(&fragment.job_id)
+            .bind(saturating_u64_to_i64(fragment.sequence))
+            .bind(&fragment.commit_lsn)
+            .bind(&fragment.table_key)
+            .bind(fragment.status.as_str())
+            .bind(fragment.row_count)
+            .bind(fragment.upserted_count)
+            .bind(fragment.deleted_count)
+            .bind(fragment.last_error.clone())
+            .bind(fragment.created_at)
+            .bind(fragment.updated_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if let Some(last_fragment) = fragments.last() {
+            let watermark_table = self.table("cdc_watermark_state");
+            let updated_at = now_millis();
+            sqlx::query(&format!(
+                r#"
+                insert into {watermark_table} (
+                    connection_id,
+                    next_sequence_to_ack,
+                    last_enqueued_sequence,
+                    last_received_lsn,
+                    last_relevant_change_seen_at,
+                    updated_at
+                ) values ($1, $2, $3, $4, $5, $6)
+                on conflict(connection_id) do update set
+                    last_enqueued_sequence = greatest(
+                        coalesce({watermark_table}.last_enqueued_sequence, 0),
+                        excluded.last_enqueued_sequence
+                    ),
+                    last_received_lsn = excluded.last_received_lsn,
+                    last_relevant_change_seen_at = excluded.last_relevant_change_seen_at,
+                    updated_at = excluded.updated_at
+                "#,
+                watermark_table = watermark_table,
+            ))
+            .bind(connection_id)
+            .bind(0_i64)
+            .bind(saturating_u64_to_i64(last_fragment.sequence))
+            .bind(&last_fragment.commit_lsn)
+            .bind(Utc::now().timestamp_millis())
+            .bind(updated_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         cdc_batch_load_job_record_from_row(&row)
     }
 
@@ -75,7 +179,7 @@ impl SyncStateStore {
         let status_values: Vec<&str> = statuses.iter().map(|status| status.as_str()).collect();
         let rows = sqlx::query(&format!(
             r#"
-            select job_id, table_key, first_sequence, status, payload_json, attempt_count, last_error, created_at, updated_at
+            select job_id, table_key, first_sequence, status, payload_json, attempt_count, retry_class, last_error, created_at, updated_at
             from {}
             where connection_id = $1
               and status = any($2)
@@ -129,13 +233,14 @@ impl SyncStateStore {
             update {} jobs
             set status = $3,
                 attempt_count = jobs.attempt_count + 1,
+                retry_class = jobs.retry_class,
                 last_error = null,
                 updated_at = $6
             from candidate
             where jobs.connection_id = $1
               and jobs.job_id = candidate.job_id
             returning jobs.job_id, jobs.table_key, jobs.first_sequence, jobs.status,
-                      jobs.payload_json, jobs.attempt_count, jobs.last_error,
+                      jobs.payload_json, jobs.attempt_count, jobs.retry_class, jobs.last_error,
                       jobs.created_at, jobs.updated_at
             "#,
             self.table("cdc_batch_load_jobs"),
@@ -188,6 +293,7 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $2,
+                retry_class = retry_class,
                 updated_at = $3
             where connection_id = $1
               and status = $4
@@ -211,15 +317,12 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $2,
+                retry_class = retry_class,
                 last_error = null,
                 updated_at = $3
             where connection_id = $1
               and status = $4
-              and (
-                last_error ilike '%failed to process CDC batch-load job%'
-                or last_error ilike '%merging staging BigQuery table%'
-                or last_error ilike '%BigQuery query returned errors%'
-              )
+              and retry_class = any($5)
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -227,9 +330,46 @@ impl SyncStateStore {
         .bind(CdcBatchLoadJobStatus::Pending.as_str())
         .bind(now_millis())
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind([
+            SyncRetryClass::Backpressure.as_str(),
+            SyncRetryClass::Transient.as_str(),
+        ])
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    pub async fn requeue_cdc_batch_load_job(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                retry_class = retry_class,
+                last_error = null,
+                updated_at = $4
+            where connection_id = $1
+              and job_id = $2
+              and status = $5
+              and retry_class = any($6)
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(now_millis())
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind([
+            SyncRetryClass::Backpressure.as_str(),
+            SyncRetryClass::Transient.as_str(),
+        ])
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn mark_cdc_batch_load_job_succeeded(
@@ -241,6 +381,7 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $3,
+                retry_class = null,
                 last_error = null,
                 updated_at = $4
             where connection_id = $1 and job_id = $2
@@ -261,13 +402,15 @@ impl SyncStateStore {
         connection_id: &str,
         job_id: &str,
         error: &str,
+        retry_class: SyncRetryClass,
     ) -> anyhow::Result<()> {
         sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
-                last_error = $4,
-                updated_at = $5
+                retry_class = $4,
+                last_error = $5,
+                updated_at = $6
             where connection_id = $1 and job_id = $2
             "#,
             self.table("cdc_batch_load_jobs")
@@ -275,6 +418,7 @@ impl SyncStateStore {
         .bind(connection_id)
         .bind(job_id)
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind(retry_class.as_str())
         .bind(error)
         .bind(now_millis())
         .execute(&self.pool)
@@ -463,72 +607,6 @@ impl SyncStateStore {
                 .and_then(|row| row.try_get::<i64, _>("updated_at").ok())
                 .and_then(datetime_from_millis),
         })
-    }
-
-    pub async fn upsert_cdc_commit_fragments(
-        &self,
-        connection_id: &str,
-        fragments: &[CdcCommitFragmentRecord],
-    ) -> anyhow::Result<()> {
-        let table = self.table("cdc_commit_fragments");
-        for fragment in fragments {
-            sqlx::query(&format!(
-                r#"
-                insert into {table} (
-                    connection_id,
-                    fragment_id,
-                    job_id,
-                    sequence,
-                    commit_lsn,
-                    table_key,
-                    status,
-                    row_count,
-                    upserted_count,
-                    deleted_count,
-                    last_error,
-                    created_at,
-                    updated_at
-                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                on conflict(fragment_id) do update set
-                    job_id = excluded.job_id,
-                    sequence = excluded.sequence,
-                    commit_lsn = excluded.commit_lsn,
-                    table_key = excluded.table_key,
-                    status = case
-                        when {table}.status = 'failed' then excluded.status
-                        else {table}.status
-                    end,
-                    row_count = excluded.row_count,
-                    upserted_count = excluded.upserted_count,
-                    deleted_count = excluded.deleted_count,
-                    last_error = case
-                        when {table}.status = 'failed' then excluded.last_error
-                        else {table}.last_error
-                    end,
-                    updated_at = case
-                        when {table}.status = 'failed' then excluded.updated_at
-                        else {table}.updated_at
-                    end
-                "#,
-                table = table,
-            ))
-            .bind(connection_id)
-            .bind(&fragment.fragment_id)
-            .bind(&fragment.job_id)
-            .bind(saturating_u64_to_i64(fragment.sequence))
-            .bind(&fragment.commit_lsn)
-            .bind(&fragment.table_key)
-            .bind(fragment.status.as_str())
-            .bind(fragment.row_count)
-            .bind(fragment.upserted_count)
-            .bind(fragment.deleted_count)
-            .bind(fragment.last_error.clone())
-            .bind(fragment.created_at)
-            .bind(fragment.updated_at)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
     }
 
     pub async fn load_cdc_commit_fragments(

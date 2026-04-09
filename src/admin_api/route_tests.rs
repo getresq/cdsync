@@ -543,6 +543,42 @@ async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_sca
 }
 
 #[tokio::test]
+async fn sample_and_publish_postgres_cdc_state_marks_cache_unknown_when_slot_sampling_fails() {
+    let cfg = test_config();
+    let mut connection = cfg.connections[0].clone();
+    let SourceConfig::Postgres(pg) = &mut connection.source;
+    pg.url = "postgres://127.0.0.1:1/postgres".to_string();
+
+    let backend: Arc<dyn AdminStateBackend> = Arc::new(FakeStateBackend {
+        state: test_state(),
+        ping_error: None,
+        load_delay: None,
+        batch_load_queue_summary: None,
+        cdc_coordinator_summary: None,
+        requested_resyncs: Arc::new(Mutex::new(Vec::new())),
+    });
+    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::sampled(Some(
+        PostgresCdcSlotSnapshot {
+            slot_name: Some("slot_app".to_string()),
+            active: true,
+            restart_lsn: Some("0/16B6C40".to_string()),
+            confirmed_flush_lsn: Some("0/16B6C50".to_string()),
+            current_wal_lsn: Some("0/16B6C60".to_string()),
+            wal_bytes_retained_by_slot: Some(16),
+            wal_bytes_behind_confirmed: Some(16),
+            continuity_lost: false,
+        },
+    )));
+
+    super::sample_and_publish_postgres_cdc_state(&connection, &backend, &tx).await;
+
+    let updated = tx.borrow().clone();
+    assert_eq!(updated.sampler_status, "unknown");
+    assert!(updated.snapshot.is_none());
+    assert!(updated.sampled_at.is_some());
+}
+
+#[tokio::test]
 async fn cdc_slot_sampler_samples_queue_and_coordinator_summaries_for_batch_load_connections() {
     let cfg = test_config();
     let mut connection = cfg.connections[0].clone();
@@ -826,6 +862,68 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
     let body = String::from_utf8(first_chunk.to_vec()).expect("utf8 chunk");
     assert!(body.contains("event: service.heartbeat"));
     assert!(body.contains("\"connection_id\":\"app\""));
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state() -> anyhow::Result<()> {
+    let mut cfg = test_config();
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source;
+    pg.cdc = Some(false);
+
+    let mut sync_state = test_state();
+    let connection_state = sync_state
+        .connections
+        .get_mut("app")
+        .expect("seed connection state");
+    connection_state.last_sync_status = Some("running".to_string());
+    connection_state.last_sync_finished_at = None;
+    connection_state.postgres_cdc = None;
+
+    let state = test_admin_state_with_config(
+        cfg,
+        Arc::new(FakeStateBackend {
+            state: sync_state,
+            ping_error: None,
+            load_delay: None,
+            batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
+            requested_resyncs: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .get(format!("{base_url}/v1/stream?connection=app"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut bytes_stream = response.bytes_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut body = String::new();
+    while !body.contains("event: connection.runtime") && tokio::time::Instant::now() < deadline {
+        let chunk = timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            bytes_stream.next(),
+        )
+        .await?
+        .context("missing SSE chunk")??;
+        body.push_str(std::str::from_utf8(&chunk).expect("utf8 chunk"));
+    }
+
+    assert!(body.contains("event: connection.runtime"));
+    assert!(body.contains("\"phase\":\"syncing\""));
+    assert!(body.contains("\"reason_code\":\"sync_in_progress\""));
+    assert!(!body.contains("cdc_state_unknown"));
 
     handle.abort();
     let _ = handle.await;

@@ -1,4 +1,7 @@
 use super::*;
+use crate::retry::{
+    SyncRetryClass, classify_error_reason, classify_sync_retry, compute_sync_retry_backoff,
+};
 
 pub(crate) fn select_sync_connections<'a>(
     connections: &'a [crate::config::ConnectionConfig],
@@ -224,6 +227,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         let state_handle = state_store.handle(&connection.id);
         connection_state.last_sync_started_at = Some(Utc::now());
         connection_state.last_sync_status = Some("running".to_string());
+        connection_state.last_error_reason = None;
         connection_state.last_error = None;
         state_handle.save_connection_meta(connection_state).await?;
 
@@ -246,7 +250,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
             "starting connection sync"
         );
 
-        let result = sync_connection(SyncConnectionRequest {
+        let result = Box::pin(sync_connection(SyncConnectionRequest {
             connection,
             state: connection_state,
             state_handle: state_handle.clone(),
@@ -262,7 +266,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
             run_id: run_id.clone(),
             stats: stats_handle.clone(),
             shutdown: shutdown.clone(),
-        })
+        }))
         .await;
 
         connection_state.last_sync_finished_at = Some(Utc::now());
@@ -270,6 +274,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
         match &result {
             Ok(()) => {
                 connection_state.last_sync_status = Some("success".to_string());
+                connection_state.last_error_reason = None;
                 info!(
                     connection = %connection.id,
                     run_id = run_id.as_deref().unwrap_or("none"),
@@ -278,6 +283,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
             }
             Err(err) => {
                 connection_state.last_sync_status = Some("failed".to_string());
+                connection_state.last_error_reason = Some(classify_error_reason(err));
                 connection_state.last_error = error_string.clone();
                 error!(
                     connection = %connection.id,
@@ -372,34 +378,46 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                     "syncing postgres via CDC"
                 );
                 let mut attempt = 0;
-                let mut backoff = Duration::from_millis(retry_backoff_ms);
                 loop {
                     attempt += 1;
-                    let result = source
-                        .sync_cdc(CdcSyncRequest {
-                            dest: &dest,
-                            state,
-                            state_handle: Some(state_handle.clone()),
-                            mode,
-                            dry_run,
-                            follow,
-                            default_batch_size,
-                            snapshot_concurrency: max_concurrency,
-                            tables: &tables,
-                            schema_diff_enabled,
-                            stats: stats.clone(),
-                            shutdown: shutdown.clone(),
-                        })
-                        .await
-                        .with_context(|| "syncing postgres CDC");
+                    let result = Box::pin(source.sync_cdc(CdcSyncRequest {
+                        dest: &dest,
+                        state,
+                        state_handle: Some(state_handle.clone()),
+                        mode,
+                        dry_run,
+                        follow,
+                        default_batch_size,
+                        retry_backoff_ms,
+                        snapshot_concurrency: max_concurrency,
+                        tables: &tables,
+                        schema_diff_enabled,
+                        stats: stats.clone(),
+                        shutdown: shutdown.clone(),
+                    }))
+                    .await
+                    .with_context(|| "syncing postgres CDC");
                     match result {
                         Ok(()) => break,
-                        Err(err) if follow || attempt < max_retries => {
+                        Err(err)
+                            if (follow || attempt < max_retries)
+                                && !matches!(
+                                    classify_sync_retry(&err),
+                                    SyncRetryClass::Permanent
+                                ) =>
+                        {
+                            let retry_class = classify_sync_retry(&err);
+                            let backoff = compute_sync_retry_backoff(
+                                &format!("{}:postgres_cdc", connection.id),
+                                attempt,
+                                retry_backoff_ms,
+                            );
                             telemetry::record_retry_attempt(&connection.id, "postgres_cdc");
                             warn!(
                                 connection = %connection.id,
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
+                                retry_class = ?retry_class,
                                 backoff_ms = backoff.as_millis() as u64,
                                 error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed; retrying"
@@ -413,13 +431,14 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                 );
                                 return Ok(());
                             }
-                            backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                         }
                         Err(err) => {
+                            let retry_class = classify_sync_retry(&err);
                             error!(
                                 connection = %connection.id,
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
+                                retry_class = ?retry_class,
                                 error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed permanently"
                             );
@@ -461,7 +480,6 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                         };
                         let _permit = permit;
                         let mut attempt = 0;
-                        let mut backoff = Duration::from_millis(retry_backoff_ms);
                         let result = loop {
                             attempt += 1;
                             let attempt_result = source
@@ -480,13 +498,26 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                 .with_context(|| format!("syncing postgres table {}", table.name));
                             match attempt_result {
                                 Ok(next_checkpoint) => break Ok(next_checkpoint),
-                                Err(err) if attempt < max_retries => {
+                                Err(err)
+                                    if attempt < max_retries
+                                        && !matches!(
+                                            classify_sync_retry(&err),
+                                            SyncRetryClass::Permanent
+                                        ) =>
+                                {
+                                    let retry_class = classify_sync_retry(&err);
+                                    let backoff = compute_sync_retry_backoff(
+                                        &format!("{}:postgres_table:{}", connection_id, table.name),
+                                        attempt,
+                                        retry_backoff_ms,
+                                    );
                                     telemetry::record_retry_attempt(&connection_id, "postgres_table");
                                     warn!(
                                         connection = %connection_id,
                                         run_id = run_id.as_deref().unwrap_or("none"),
                                         table = %table.name,
                                         attempt,
+                                        retry_class = ?retry_class,
                                         backoff_ms = backoff.as_millis() as u64,
                                         last_synced_at = ?checkpoint.last_synced_at,
                                         last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
@@ -510,14 +541,15 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                                             .await,
                                         );
                                     }
-                                    backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                                 }
                                 Err(err) => {
+                                    let retry_class = classify_sync_retry(&err);
                                     error!(
                                         connection = %connection_id,
                                         run_id = run_id.as_deref().unwrap_or("none"),
                                         table = %table.name,
                                         attempt,
+                                        retry_class = ?retry_class,
                                         last_synced_at = ?checkpoint.last_synced_at,
                                         last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
                                         error = %err,

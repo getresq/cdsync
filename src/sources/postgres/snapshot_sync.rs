@@ -1,10 +1,53 @@
 use super::*;
+use crate::retry::CdcSyncPolicyError;
 use rustls::pki_types::pem::PemObject;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SnapshotCopyExit {
     Completed,
     Interrupted,
+}
+
+const SNAPSHOT_BATCH_BUILD_BLOCKING_ROWS: usize = 512;
+
+async fn rows_to_snapshot_batch(
+    schema: &TableSchema,
+    rows: Vec<PgRow>,
+    table: &ResolvedPostgresTable,
+    synced_at: DateTime<Utc>,
+    metadata: &MetadataColumns,
+) -> Result<DataFrame> {
+    if rows.len() < SNAPSHOT_BATCH_BUILD_BLOCKING_ROWS {
+        return rows_to_batch(schema, &rows, table, synced_at, metadata);
+    }
+
+    let schema = schema.clone();
+    let table = table.clone();
+    let metadata = metadata.clone();
+    tokio::task::spawn_blocking(move || rows_to_batch(&schema, &rows, &table, synced_at, &metadata))
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to join snapshot batch build task: {}", err))?
+}
+
+async fn tokio_rows_to_snapshot_batch(
+    schema: &TableSchema,
+    rows: Vec<TokioPgRow>,
+    table: &ResolvedPostgresTable,
+    synced_at: DateTime<Utc>,
+    metadata: &MetadataColumns,
+) -> Result<DataFrame> {
+    if rows.len() < SNAPSHOT_BATCH_BUILD_BLOCKING_ROWS {
+        return tokio_rows_to_batch(schema, &rows, table, synced_at, metadata);
+    }
+
+    let schema = schema.clone();
+    let table = table.clone();
+    let metadata = metadata.clone();
+    tokio::task::spawn_blocking(move || {
+        tokio_rows_to_batch(&schema, &rows, &table, synced_at, &metadata)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to join exported snapshot batch build task: {}", err))?
 }
 
 pub(super) async fn write_snapshot_batch(
@@ -195,17 +238,17 @@ impl PostgresSource {
             }
             match policy {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
                     if diff.has_incompatible() || primary_key_changed_detected {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table.name
-                        );
+                        return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                            table: table.name.clone(),
+                        }
+                        .into());
                     }
                     info!(table = %table.name, "schema change detected; auto-altering destination");
                 }
@@ -225,16 +268,16 @@ impl PostgresSource {
             );
             match policy {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
-                    anyhow::bail!(
-                        "incompatible schema change detected for {}; trigger a manual table resync",
-                        table.name
-                    );
+                    return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                        table: table.name.clone(),
+                    }
+                    .into());
                 }
             }
         }
@@ -346,10 +389,16 @@ impl PostgresSource {
                 break;
             }
 
-            let batch = rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
+            let row_count = rows.len();
+            let last_value: String = rows
+                .last()
+                .and_then(|row| row.try_get(pk_alias).ok())
+                .context("missing primary key value for keyset pagination")?;
+            let batch =
+                rows_to_snapshot_batch(schema, rows, table, Utc::now(), &self.metadata).await?;
             if let Some(stats) = options.stats {
                 stats
-                    .record_extract(&table.name, rows.len(), extract_ms)
+                    .record_extract(&table.name, row_count, extract_ms)
                     .await;
             }
             if !options.dry_run {
@@ -365,15 +414,11 @@ impl PostgresSource {
                 if let Some(stats) = options.stats {
                     let load_ms = load_start.elapsed().as_millis() as u64;
                     stats
-                        .record_load(&table.name, rows.len(), 0, 0, load_ms)
+                        .record_load(&table.name, row_count, 0, 0, load_ms)
                         .await;
                 }
             }
 
-            let last_value: String = rows
-                .last()
-                .and_then(|row| row.try_get(pk_alias).ok())
-                .context("missing primary key value for keyset pagination")?;
             last_pk = Some(last_value);
             checkpoint.last_synced_at = Some(Utc::now());
             if let Some(state_handle) = &options.state_handle {
@@ -449,11 +494,20 @@ impl PostgresSource {
                 break;
             }
 
+            let row_count = rows.len();
+            let last_row = rows
+                .last()
+                .context("incremental batch empty after non-empty check")?;
+            let next_seen = read_updated_at(last_row, updated_at)
+                .context("missing updated_at value for incremental paging")?;
+            let next_pk = read_primary_key(last_row, &table.primary_key)?;
             let batch_synced_at = Utc::now();
-            let batch = rows_to_batch(schema, &rows, table, batch_synced_at, &self.metadata)?;
+            let batch =
+                rows_to_snapshot_batch(schema, rows, table, batch_synced_at, &self.metadata)
+                    .await?;
             if let Some(stats) = options.stats {
                 stats
-                    .record_extract(&table.name, rows.len(), extract_ms)
+                    .record_extract(&table.name, row_count, extract_ms)
                     .await;
             }
             if !options.dry_run {
@@ -469,17 +523,11 @@ impl PostgresSource {
                 if let Some(stats) = options.stats {
                     let load_ms = load_start.elapsed().as_millis() as u64;
                     stats
-                        .record_load(&table.name, rows.len(), rows.len(), 0, load_ms)
+                        .record_load(&table.name, row_count, row_count, 0, load_ms)
                         .await;
                 }
             }
 
-            let last_row = rows
-                .last()
-                .context("incremental batch empty after non-empty check")?;
-            let next_seen = read_updated_at(last_row, updated_at)
-                .context("missing updated_at value for incremental paging")?;
-            let next_pk = read_primary_key(last_row, &table.primary_key)?;
             last_seen = next_seen;
             last_pk = Some(next_pk.clone());
             checkpoint.last_synced_at = Some(last_seen);
@@ -672,12 +720,23 @@ impl PostgresSource {
                     break;
                 }
 
-                extracted_rows += rows.len();
-                let batch =
-                    tokio_rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
+                let row_count = rows.len();
+                let next_last_pk = rows
+                    .last()
+                    .and_then(|row| row.try_get::<_, String>(pk_alias).ok())
+                    .context("missing primary key value for snapshot pagination")?;
+                extracted_rows += row_count;
+                let batch = tokio_rows_to_snapshot_batch(
+                    schema,
+                    rows,
+                    table,
+                    Utc::now(),
+                    &self.metadata,
+                )
+                .await?;
                 if let Some(stats) = &stats {
                     stats
-                        .record_extract(&table.name, rows.len(), extract_ms)
+                        .record_extract(&table.name, row_count, extract_ms)
                         .await;
                 }
 
@@ -685,14 +744,14 @@ impl PostgresSource {
                 write_snapshot_batch(dest, schema, &batch, write_mode, &table.primary_key).await?;
                 if let Some(stats) = &stats {
                     let upserted = if matches!(write_mode, WriteMode::Upsert) {
-                        rows.len()
+                        row_count
                     } else {
                         0
                     };
                     stats
                         .record_load(
                             &table.name,
-                            rows.len(),
+                            row_count,
                             upserted,
                             0,
                             load_start.elapsed().as_millis() as u64,
@@ -713,11 +772,7 @@ impl PostgresSource {
                     );
                 }
 
-                last_pk = Some(
-                    rows.last()
-                        .and_then(|row| row.try_get::<_, String>(pk_alias).ok())
-                        .context("missing primary key value for snapshot pagination")?,
-                );
+                last_pk = Some(next_last_pk);
                 save_snapshot_progress(
                     &checkpoint_state,
                     &table.name,

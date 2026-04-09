@@ -1,4 +1,5 @@
 use super::*;
+use crate::retry::CdcSyncPolicyError;
 
 pub(super) fn relation_change_requires_destination_ensure(
     prev_snapshot_exists: bool,
@@ -83,6 +84,16 @@ impl PostgresSource {
         let new_hash = schema_fingerprint(&info.schema);
         let current_primary_key = info.schema.primary_key.clone();
         let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
+        if let Some(state_handle) = &runtime.state_handle
+            && let Some(latest_checkpoint) = state_handle
+                .load_postgres_checkpoint(&table_cfg.name)
+                .await?
+        {
+            runtime
+                .state
+                .postgres
+                .insert(table_cfg.name.clone(), latest_checkpoint);
+        }
         let entry = runtime
             .state
             .postgres
@@ -113,17 +124,17 @@ impl PostgresSource {
             }
             match runtime.schema_policy.clone() {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table_cfg.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table_cfg.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
                     if diff.has_incompatible() || primary_key_changed_detected {
-                        anyhow::bail!(
-                            "incompatible schema change detected for {}; trigger a manual table resync",
-                            table_cfg.name
-                        );
+                        return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                            table: table_cfg.name.clone(),
+                        }
+                        .into());
                     }
                     info!(
                         table = %table_cfg.name,
@@ -140,16 +151,16 @@ impl PostgresSource {
             );
             match runtime.schema_policy.clone() {
                 SchemaChangePolicy::Fail => {
-                    anyhow::bail!(
-                        "schema change detected for {}; set schema_changes=auto for additive changes or trigger a manual table resync",
-                        table_cfg.name
-                    );
+                    return Err(CdcSyncPolicyError::SchemaChangeDetected {
+                        table: table_cfg.name.clone(),
+                    }
+                    .into());
                 }
                 SchemaChangePolicy::Auto => {
-                    anyhow::bail!(
-                        "incompatible schema change detected for {}; trigger a manual table resync",
-                        table_cfg.name
-                    );
+                    return Err(CdcSyncPolicyError::IncompatibleSchemaChange {
+                        table: table_cfg.name.clone(),
+                    }
+                    .into());
                 }
             }
         }

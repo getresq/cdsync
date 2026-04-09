@@ -1,4 +1,6 @@
 use super::*;
+use crate::retry::ErrorReasonCode;
+use crate::types::{TableRuntimeState, TableRuntimeStatus};
 
 pub(super) const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -53,7 +55,7 @@ pub(super) async fn sample_cached_postgres_cdc_slot_state(
     };
     match load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await {
         Ok(snapshot) => Some(CachedPostgresCdcSlotState::sampled(snapshot)),
-        Err(()) => None,
+        Err(()) => Some(CachedPostgresCdcSlotState::unknown()),
     }
 }
 
@@ -152,15 +154,14 @@ pub(super) fn cached_postgres_cdc_slot_state(
     state: &AdminApiState,
     connection: &ConnectionConfig,
 ) -> Option<CachedPostgresCdcSlotState> {
+    if !is_postgres_cdc_connection(connection) {
+        return None;
+    }
+
     state
         .cdc_slot_sampler_cache
         .get(&connection.id)
         .map(|sender| sender.borrow().clone())
-        .or(Some(CachedPostgresCdcSlotState {
-            sampler_status: "disabled",
-            sampled_at: None,
-            snapshot: None,
-        }))
 }
 
 pub(super) fn cached_postgres_cdc_runtime_state(
@@ -222,22 +223,6 @@ pub(super) fn max_checkpoint_age_seconds(
             .filter_map(|checkpoint| checkpoint_age_seconds(Some(checkpoint), now))
             .max()
     })
-}
-
-pub(super) fn classify_error_reason(error: Option<&str>) -> &'static str {
-    let Some(error) = error else {
-        return "healthy";
-    };
-    let normalized = error.to_ascii_lowercase();
-    if normalized.contains("schema change") || normalized.contains("incompatible schema") {
-        "schema_blocked"
-    } else if normalized.contains("publication") {
-        "publication_blocked"
-    } else if normalized.contains("already locked") {
-        "lock_contention"
-    } else {
-        "last_run_failed"
-    }
 }
 
 pub(super) async fn load_postgres_cdc_slot_snapshot(
@@ -402,7 +387,10 @@ pub(super) fn derive_connection_runtime(
             None => ("syncing", "sync_in_progress"),
         },
         Some("failed") => {
-            let reason = classify_error_reason(state.and_then(|state| state.last_error.as_deref()));
+            let reason = state
+                .and_then(|state| state.last_error_reason)
+                .unwrap_or(ErrorReasonCode::LastRunFailed)
+                .as_str();
             if matches!(reason, "schema_blocked" | "publication_blocked") {
                 ("blocked", reason)
             } else {
@@ -472,37 +460,45 @@ pub(super) fn build_table_progress(
                     .filter(|chunk| chunk.complete)
                     .count()
             });
-            let (phase, reason_code) = match state
-                .and_then(|state| state.last_sync_status.as_deref())
-            {
-                Some("failed")
-                    if matches!(
-                        connection_reason_code,
-                        "schema_blocked" | "publication_blocked"
-                    ) =>
-                {
-                    ("blocked", connection_reason_code)
-                }
-                Some("failed") => ("error", connection_reason_code),
-                Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
-                    ("snapshotting", "snapshot_in_progress")
-                }
-                Some("running") => match cdc_runtime_state {
-                    Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
-                    Some(PostgresCdcRuntimeState::ContinuityLost) => {
-                        ("blocked", "cdc_continuity_lost")
+            let runtime = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.runtime.clone());
+            let (phase, reason_code) = if let Some(runtime) = runtime.as_ref() {
+                table_runtime_phase_and_reason(runtime)
+            } else {
+                match state.and_then(|state| state.last_sync_status.as_deref()) {
+                    Some("failed")
+                        if matches!(
+                            connection_reason_code,
+                            "schema_blocked" | "publication_blocked"
+                        ) =>
+                    {
+                        ("blocked", connection_reason_code)
                     }
-                    Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
-                    Some(PostgresCdcRuntimeState::Initializing) => ("pending", "cdc_initializing"),
-                    None => ("syncing", "sync_in_progress"),
-                },
-                Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
-                _ => ("pending", "never_synced"),
+                    Some("failed") => ("error", connection_reason_code),
+                    Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
+                        ("snapshotting", "snapshot_in_progress")
+                    }
+                    Some("running") => match cdc_runtime_state {
+                        Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
+                        Some(PostgresCdcRuntimeState::ContinuityLost) => {
+                            ("blocked", "cdc_continuity_lost")
+                        }
+                        Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
+                        Some(PostgresCdcRuntimeState::Initializing) => {
+                            ("pending", "cdc_initializing")
+                        }
+                        None => ("syncing", "sync_in_progress"),
+                    },
+                    Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
+                    _ => ("pending", "never_synced"),
+                }
             };
 
             TableProgress {
                 table_name,
                 checkpoint,
+                runtime,
                 stats: table_stats,
                 phase,
                 reason_code,
@@ -513,4 +509,15 @@ pub(super) fn build_table_progress(
             }
         })
         .collect()
+}
+
+fn table_runtime_phase_and_reason(runtime: &TableRuntimeState) -> (&'static str, &'static str) {
+    let reason = runtime.reason.unwrap_or(match runtime.status {
+        TableRuntimeStatus::Retrying => ErrorReasonCode::SnapshotRetryScheduled,
+        TableRuntimeStatus::Blocked => ErrorReasonCode::SnapshotBlocked,
+    });
+    match runtime.status {
+        TableRuntimeStatus::Retrying => ("retrying", reason.as_str()),
+        TableRuntimeStatus::Blocked => ("blocked", reason.as_str()),
+    }
 }

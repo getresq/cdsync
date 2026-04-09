@@ -8,6 +8,7 @@ mod main_tests;
 #[cfg(feature = "monitor-ui")]
 mod monitor;
 mod ops;
+mod retry;
 mod runner;
 mod sources;
 mod state;
@@ -167,7 +168,7 @@ async fn main() -> Result<()> {
             schema_diff,
             follow,
         } => {
-            cmd_run(RunCommandRequest {
+            Box::pin(cmd_run(RunCommandRequest {
                 config_path: config,
                 connection_filter: connection,
                 once,
@@ -177,7 +178,7 @@ async fn main() -> Result<()> {
                 schema_diff_enabled: schema_diff,
                 follow,
                 shutdown: None,
-            })
+            }))
             .await
         }
         Commands::Migrate { config } => cmd_migrate(config).await,

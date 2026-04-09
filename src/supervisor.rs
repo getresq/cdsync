@@ -55,7 +55,7 @@ pub(crate) async fn run_connection_worker(
                     }
                 });
 
-                let result = cmd_run_once(RunCommandRequest {
+                let result = Box::pin(cmd_run_once(RunCommandRequest {
                     config_path: config_path.clone(),
                     connection_filter: Some(connection.id.clone()),
                     once: true,
@@ -65,7 +65,7 @@ pub(crate) async fn run_connection_worker(
                     schema_diff_enabled: false,
                     follow: true,
                     shutdown: Some(run_shutdown_signal),
-                })
+                }))
                 .await;
 
                 relay.abort();
@@ -110,7 +110,7 @@ pub(crate) async fn run_connection_worker(
                     telemetry::record_connection_worker_event(&connection.id, mode, "stopped");
                     break;
                 }
-                let result = cmd_run_once(RunCommandRequest {
+                let result = Box::pin(cmd_run_once(RunCommandRequest {
                     config_path: config_path.clone(),
                     connection_filter: Some(connection.id.clone()),
                     once: true,
@@ -120,7 +120,7 @@ pub(crate) async fn run_connection_worker(
                     schema_diff_enabled: false,
                     follow: false,
                     shutdown: Some(shutdown_signal.clone()),
-                })
+                }))
                 .await;
                 if result.is_err() {
                     telemetry::record_connection_worker_event(&connection.id, mode, "failed");
@@ -292,7 +292,7 @@ pub(crate) async fn cmd_run(request: RunCommandRequest) -> Result<()> {
         shutdown,
     } = request;
     if once {
-        return cmd_run_once(RunCommandRequest {
+        return Box::pin(cmd_run_once(RunCommandRequest {
             config_path,
             connection_filter,
             once,
@@ -302,7 +302,7 @@ pub(crate) async fn cmd_run(request: RunCommandRequest) -> Result<()> {
             schema_diff_enabled,
             follow,
             shutdown,
-        })
+        }))
         .await;
     }
     if full || incremental || dry_run || schema_diff_enabled || follow || shutdown.is_some() {
@@ -346,12 +346,12 @@ pub(crate) async fn cmd_run(request: RunCommandRequest) -> Result<()> {
     .await?;
 
     let result = if selected_connections.len() == 1 {
-        run_connection_worker(
+        Box::pin(run_connection_worker(
             config_path,
             (*selected_connections[0]).clone(),
             shutdown_signal.clone(),
             restart_registry.subscribe(&selected_connections[0].id),
-        )
+        ))
         .await
     } else {
         let mut workers = FuturesUnordered::new();

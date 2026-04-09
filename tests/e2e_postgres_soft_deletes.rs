@@ -4,7 +4,12 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
+use etl_postgres::replication::slots::APPLY_WORKER_PREFIX;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 #[path = "support/dotenv.rs"]
 mod dotenv_support;
@@ -13,8 +18,15 @@ mod emulator_delete_support;
 #[path = "support/emulator_read.rs"]
 mod emulator_read_support;
 
+static SOFT_DELETE_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn soft_delete_test_mutex() -> &'static Mutex<()> {
+    SOFT_DELETE_TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
 #[tokio::test]
 async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
+    let _guard = soft_delete_test_mutex().lock().await;
     dotenv_support::load_dotenv()?;
     let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL")
         .ok()
@@ -53,6 +65,7 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
         .max_connections(1)
         .connect(&pg_url)
         .await?;
+    cleanup_stale_apply_slots(&pool).await?;
     sqlx::query(&format!("drop table if exists {}", qualified_table))
         .execute(&pool)
         .await?;
@@ -137,79 +150,115 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Full,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
-        .await?;
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Full,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
 
     sqlx::query(&format!("delete from {} where id = 1", qualified_table))
         .execute(&pool)
         .await?;
 
-    source
-        .sync_cdc(CdcSyncRequest {
-            dest: &dest,
-            state: &mut state,
-            state_handle: None,
-            mode: SyncMode::Incremental,
-            dry_run: false,
-            follow: false,
-            default_batch_size: 1000,
-            snapshot_concurrency: 1,
-            tables: &tables,
-            schema_diff_enabled: false,
-            stats: None,
-            shutdown: None,
-        })
+    Box::pin(source.sync_cdc(CdcSyncRequest {
+        dest: &dest,
+        state: &mut state,
+        state_handle: None,
+        mode: SyncMode::Incremental,
+        dry_run: false,
+        follow: false,
+        default_batch_size: 1000,
+        retry_backoff_ms: 1_000,
+        snapshot_concurrency: 1,
+        tables: &tables,
+        schema_diff_enabled: false,
+        stats: None,
+        shutdown: None,
+    }))
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let has_deleted_at = loop {
+        let fields = emulator_read_support::fetch_table_fields(
+            &http_client,
+            &bq_http,
+            &project_id,
+            &dataset,
+            &dest_table,
+        )
         .await?;
+        let rows = emulator_read_support::fetch_table_rows(
+            &http_client,
+            &bq_http,
+            &project_id,
+            &dataset,
+            &dest_table,
+        )
+        .await?;
+        let mapped = emulator_read_support::map_rows(&fields, rows)?;
 
-    let fields = emulator_read_support::fetch_table_fields(
-        &http_client,
-        &bq_http,
-        &project_id,
-        &dataset,
-        &dest_table,
-    )
-    .await?;
-    let rows = emulator_read_support::fetch_table_rows(
-        &http_client,
-        &bq_http,
-        &project_id,
-        &dataset,
-        &dest_table,
-    )
-    .await?;
-    let mapped = emulator_read_support::map_rows(&fields, rows)?;
-
-    let deleted_rows: Vec<_> = mapped
-        .iter()
-        .filter(|row| {
-            emulator_read_support::value_to_string(row.get("id").unwrap()) == Some("1".to_string())
-        })
-        .collect();
-    anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
-    let has_deleted_at = deleted_rows.iter().any(|row| {
-        row.get("_cdsync_deleted_at")
-            .is_some_and(serde_json::Value::is_string)
-    });
+        let deleted_rows: Vec<_> = mapped
+            .iter()
+            .filter(|row| {
+                emulator_read_support::value_to_string(row.get("id").unwrap())
+                    == Some("1".to_string())
+            })
+            .collect();
+        anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
+        if deleted_rows.len() < 2 && Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let has_deleted_at = deleted_rows.iter().any(|row| {
+            row.get("_cdsync_deleted_at")
+                .is_some_and(serde_json::Value::is_string)
+        });
+        if has_deleted_at || Instant::now() >= deadline {
+            break has_deleted_at;
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
     assert!(has_deleted_at, "expected _cdsync_deleted_at to be set");
+    Ok(())
+}
+
+async fn cleanup_stale_apply_slots(pool: &sqlx::PgPool) -> Result<()> {
+    let slot_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        select slot_name
+        from pg_replication_slots
+        where slot_type = 'logical'
+          and active = false
+          and slot_name like $1
+        "#,
+    )
+    .bind(format!("{APPLY_WORKER_PREFIX}_%"))
+    .fetch_all(pool)
+    .await?;
+
+    for slot_name in slot_names {
+        sqlx::query("select pg_drop_replication_slot($1)")
+            .bind(slot_name)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
 #[tokio::test]
 async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
+    let _guard = soft_delete_test_mutex().lock().await;
     dotenv_support::load_dotenv()?;
     let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL")
         .ok()
