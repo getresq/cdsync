@@ -18,6 +18,8 @@ metadata:
   deleted_at_column: "_cdsync_deleted_at"
 ```
 
+For the full field-by-field config reference, see [configuration.md](configuration.md).
+
 ## Core Commands
 
 Apply state and stats migrations:

@@ -46,6 +46,7 @@ Notes:
 
 ## Docs
 
+- [Configuration Reference](docs/configuration.md)
 - [How CDSync Works](docs/how-cdsync-works.md)
 - [Operations](docs/operations.md)
 - [End-to-End Tests](docs/e2e.md)
