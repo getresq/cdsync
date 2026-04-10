@@ -30,11 +30,6 @@ const LOCK_HEARTBEAT_SECONDS: u64 = 15;
 static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/state");
 
 impl SyncState {
-    pub async fn load_with_config(config: &StateConfig) -> anyhow::Result<Self> {
-        let store = SyncStateStore::open_with_config(config, 16).await?;
-        store.load_state().await
-    }
-
     pub async fn load_with_config_and_pool(
         config: &StateConfig,
         max_connections: u32,

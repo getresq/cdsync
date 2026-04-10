@@ -131,10 +131,13 @@ connections:
         .context("runner did not exit in time")??;
     assert!(status.success());
 
-    let state = SyncState::load_with_config(&StateConfig {
-        url: pg_url.clone(),
-        schema: Some(state_schema.clone()),
-    })
+    let state = SyncState::load_with_config_and_pool(
+        &StateConfig {
+            url: pg_url.clone(),
+            schema: Some(state_schema.clone()),
+        },
+        16,
+    )
     .await?;
     let connection = state
         .connections
@@ -273,10 +276,13 @@ connections:
         .context("runner did not exit in time")??;
     assert!(status.success());
 
-    let state = SyncState::load_with_config(&StateConfig {
-        url: pg_url.clone(),
-        schema: Some(state_schema.clone()),
-    })
+    let state = SyncState::load_with_config_and_pool(
+        &StateConfig {
+            url: pg_url.clone(),
+            schema: Some(state_schema.clone()),
+        },
+        16,
+    )
     .await?;
     let connection = state
         .connections

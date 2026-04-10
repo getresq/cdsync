@@ -781,7 +781,7 @@ async fn wait_for_lsn_advance(
 ) -> Result<String> {
     let start = Instant::now();
     loop {
-        let state = SyncState::load_with_config(state_config).await?;
+        let state = SyncState::load_with_config_and_pool(state_config, 16).await?;
         if let Some(current_lsn) = state
             .connections
             .get(connection_id)

@@ -578,8 +578,8 @@ async fn postgres_state_store_requeues_retryable_batch_load_job_by_id() -> anyho
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -624,8 +624,8 @@ async fn postgres_state_store_enqueue_bundle_persists_job_fragments_and_watermar
     let Some(config) = test_state_config() else {
         return Ok(());
     };
-    SyncStateStore::migrate_with_config(&config).await?;
-    let store = SyncStateStore::open_with_config(&config).await?;
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
     let handle = store.handle("app");
     let now = chrono::Utc::now().timestamp_millis();
 
