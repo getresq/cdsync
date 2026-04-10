@@ -1,6 +1,8 @@
 use super::*;
 use crate::destinations::bigquery;
 use crate::retry::{SyncRetryClass, classify_sync_retry, compute_sync_retry_backoff};
+use crate::types::TableCheckpoint;
+use crate::types::TableRuntimeStatus;
 
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
@@ -62,6 +64,20 @@ fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
         attempt_count.max(1) as u32,
         1_000,
     )
+}
+
+fn checkpoint_has_incomplete_snapshot(checkpoint: &TableCheckpoint) -> bool {
+    !checkpoint.snapshot_chunks.is_empty()
+        && checkpoint
+            .snapshot_chunks
+            .iter()
+            .any(|chunk| !chunk.complete)
+}
+
+enum CdcApplyReadiness {
+    Ready,
+    Snapshotting,
+    Blocked,
 }
 
 impl EtlBigQueryDestination {
@@ -240,6 +256,26 @@ impl CdcBatchLoadManager {
                 manager.worker_loop(worker_index).await;
             });
         }
+    }
+
+    async fn table_apply_readiness(&self, source_table: &str) -> anyhow::Result<CdcApplyReadiness> {
+        let checkpoint = self
+            .state_handle
+            .load_postgres_checkpoint(source_table)
+            .await?;
+        Ok(match checkpoint.as_ref() {
+            Some(checkpoint)
+                if checkpoint.runtime.as_ref().is_some_and(|runtime| {
+                    matches!(&runtime.status, TableRuntimeStatus::Blocked)
+                }) =>
+            {
+                CdcApplyReadiness::Blocked
+            }
+            Some(checkpoint) if checkpoint_has_incomplete_snapshot(checkpoint) => {
+                CdcApplyReadiness::Snapshotting
+            }
+            _ => CdcApplyReadiness::Ready,
+        })
     }
 
     async fn worker_loop(&self, worker_index: usize) {
@@ -495,17 +531,27 @@ impl CdcBatchLoadManager {
                 }
             })
         };
-        let result = self
-            .inner
-            .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to process CDC batch-load job",
-                    err.to_string()
-                )
-            });
+        let result: anyhow::Result<()> =
+            match self.table_apply_readiness(&job.payload.source_table).await {
+                Ok(CdcApplyReadiness::Ready) => self
+                    .inner
+                    .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+                    .await
+                    .map_err(anyhow::Error::from),
+                Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
+                    "CDC batch-load waiting for snapshot handoff for {}",
+                    job.payload.source_table
+                )),
+                Ok(CdcApplyReadiness::Blocked) => Err(anyhow::anyhow!(
+                    "CDC batch-load waiting for blocked table manual resync for {}",
+                    job.payload.source_table
+                )),
+                Err(err) => Err(anyhow::anyhow!(
+                    "failed to inspect CDC apply readiness for {}: {}",
+                    job.payload.source_table,
+                    err
+                )),
+            };
         let _ = heartbeat_stop_tx.send(());
         let _ = heartbeat_handle.await;
 
@@ -560,7 +606,7 @@ impl CdcBatchLoadManager {
                     .await;
             }
             Err(err) => {
-                let retry_class = classify_sync_retry(&anyhow::Error::new(err.clone()));
+                let retry_class = classify_sync_retry(err);
                 crate::telemetry::record_cdc_batch_load_job(
                     self.state_handle.connection_id(),
                     &table_key,
@@ -629,7 +675,7 @@ impl CdcBatchLoadManager {
         let resolve_waiters = match &result {
             Ok(()) => true,
             Err(err) => should_resolve_cdc_batch_load_waiters(
-                classify_sync_retry(&anyhow::Error::new(err.clone())),
+                classify_sync_retry(err),
                 self.local_retry_retryable_failures,
             ),
         };

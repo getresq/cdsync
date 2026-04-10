@@ -5,7 +5,7 @@ use crate::config::{
     PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
 use crate::retry::ErrorReasonCode;
-use crate::types::{TableCheckpoint, TableRuntimeState, TableRuntimeStatus};
+use crate::types::{SnapshotChunkCheckpoint, TableCheckpoint, TableRuntimeState, TableRuntimeStatus};
 use chrono::TimeZone;
 use std::collections::HashMap;
 
@@ -429,6 +429,46 @@ fn derive_connection_runtime_surfaces_unknown_cdc_probe_state() {
 
     assert_eq!(runtime.phase, "starting");
     assert_eq!(runtime.reason_code, "cdc_state_unknown");
+}
+
+#[test]
+fn derive_connection_runtime_uses_mixed_mode_when_snapshot_and_cdc_overlap() {
+    let connection = test_postgres_cdc_connection();
+    let mut state = ConnectionState {
+        last_sync_status: Some("running".to_string()),
+        ..Default::default()
+    };
+    state.postgres.insert(
+        "public.accounts".to_string(),
+        TableCheckpoint {
+            snapshot_chunks: vec![
+                SnapshotChunkCheckpoint {
+                    start_primary_key: Some("1".to_string()),
+                    end_primary_key: Some("100".to_string()),
+                    last_primary_key: Some("50".to_string()),
+                    complete: false,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+
+    let runtime = derive_connection_runtime(
+        &connection,
+        Some(&state),
+        None,
+        Some(PostgresCdcRuntimeState::Following),
+        Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+        RuntimeMetadata {
+            config_hash: "hash",
+            deploy_revision: Some("deploy"),
+            last_restart_reason: "startup",
+        },
+    );
+
+    assert_eq!(runtime.mode, "mixed");
+    assert_eq!(runtime.phase, "snapshotting");
+    assert_eq!(runtime.reason_code, "snapshot_in_progress");
 }
 
 #[test]

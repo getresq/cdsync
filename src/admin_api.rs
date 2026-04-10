@@ -617,6 +617,7 @@ async fn connections(
             last_sync_finished_at: current_ref.and_then(|c| c.last_sync_finished_at),
             last_sync_status: current_ref.and_then(|c| c.last_sync_status.clone()),
             last_error: current_ref.and_then(|c| c.last_error.clone()),
+            mode: runtime.mode,
             phase: runtime.phase,
             reason_code: runtime.reason_code,
             max_checkpoint_age_seconds: runtime.max_checkpoint_age_seconds,

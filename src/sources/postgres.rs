@@ -93,6 +93,7 @@ pub(crate) fn admin_cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>)
     cdc_sync::cdc_slot_name(connection_id, pipeline_id)
 }
 
+#[derive(Clone)]
 pub struct PostgresSource {
     config: PostgresConfig,
     metadata: MetadataColumns,

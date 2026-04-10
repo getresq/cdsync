@@ -218,6 +218,14 @@ pub(super) fn snapshot_phase_should_proceed_to_cdc(
     follow && blocked_table_count > 0
 }
 
+pub(super) fn should_run_mixed_mode(
+    follow: bool,
+    has_snapshot_work: bool,
+    supports_mixed_mode: bool,
+) -> bool {
+    follow && has_snapshot_work && supports_mixed_mode
+}
+
 pub(super) fn next_snapshot_task_table(
     table_order: &[String],
     next_cursor: usize,
@@ -1031,13 +1039,14 @@ impl PostgresSource {
             etl_schemas.insert(*table_id, etl_schema);
         }
 
-        let cdc_dest = EtlBigQueryDestination::new(
+        let mut cdc_dest = EtlBigQueryDestination::new(
             dest.clone(),
             table_info_map.clone(),
             stats.clone(),
             cdc_apply_concurrency,
             cdc_batch_load_worker_count,
             state_handle.clone(),
+            false,
             follow,
         )
         .await?;
@@ -1141,6 +1150,7 @@ impl PostgresSource {
             "computed CDC snapshot decision"
         );
 
+        let mut stream_already_ran = false;
         if needs_snapshot {
             let snapshot_table_ids = snapshot_table_ids(
                 &include_tables,
@@ -1339,6 +1349,10 @@ impl PostgresSource {
                 }
             }
 
+            let has_snapshot_work = !snapshot_tasks_to_run.is_empty();
+            let run_mixed_mode =
+                should_run_mixed_mode(follow, has_snapshot_work, cdc_dest.supports_mixed_mode());
+            cdc_dest.set_ack_cdc_on_enqueue(run_mixed_mode);
             let preferred_start_lsn = if preserve_existing_backlog {
                 None
             } else {
@@ -1346,77 +1360,226 @@ impl PostgresSource {
                     anyhow::anyhow!("invalid snapshot start LSN '{}'", snapshot_start_lsn)
                 })?)
             };
-
-            let snapshot_outcome = run_cdc_snapshot_phase(
-                self,
-                connection_label,
-                snapshot_tasks_to_run,
-                snapshot_checkpoint_states.clone(),
-                &manual_resync_table_names,
-                snapshot_name,
-                slot_guard,
-                snapshot_slot_name,
-                preserve_existing_backlog,
-                dest,
-                batch_size,
-                snapshot_concurrency,
-                retry_backoff_ms,
-                stats.clone(),
-                state_handle.clone(),
-                shutdown.clone(),
-                follow,
-            )
-            .await?;
-            if !snapshot_outcome.completed {
-                for (table_name, checkpoint_state) in &snapshot_checkpoint_states {
-                    let checkpoint = checkpoint_state.lock().await.clone();
-                    state.postgres.insert(table_name.clone(), checkpoint);
-                }
-                info!(
-                    connection = %connection_label,
-                    snapshot_table_count = snapshot_checkpoint_states.len(),
-                    "shutdown requested during CDC snapshot; preserving resumable snapshot progress"
-                );
-                return Ok(());
-            }
-            if !snapshot_outcome.blocked_tables.is_empty() {
-                let blocked_table_ids: HashSet<TableId> = table_ids
-                    .iter()
-                    .filter_map(|(table_id, table_cfg)| {
-                        snapshot_outcome
-                            .blocked_tables
-                            .contains(&table_cfg.name)
-                            .then_some(*table_id)
-                    })
-                    .collect();
-                if blocked_table_ids.len() == include_tables.len() {
-                    return Err(CdcSyncPolicyError::SnapshotBlocked {
-                        tables: snapshot_outcome.blocked_tables.iter().cloned().collect(),
+            if run_mixed_mode {
+                if !preserve_existing_backlog {
+                    let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
+                    cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
+                    if let Some(state_handle) = &state_handle {
+                        state_handle.save_postgres_cdc_state(cdc_state).await?;
                     }
-                    .into());
+                    start_lsn = preferred_start_lsn;
+                    last_lsn = Some(snapshot_start_lsn.clone());
                 }
-                for blocked_table_id in blocked_table_ids {
-                    include_tables.remove(&blocked_table_id);
-                }
-                warn!(
-                    connection = %connection_label,
-                    blocked_tables = ?snapshot_outcome.blocked_tables,
-                    remaining_cdc_tables = include_tables.len(),
-                    "starting CDC while excluding blocked snapshot tables until manual resync"
+
+                let source = self.clone();
+                let snapshot_connection_label = connection_label.to_string();
+                let snapshot_connection_label_for_task = snapshot_connection_label.clone();
+                let snapshot_manual_resync_table_names = manual_resync_table_names.clone();
+                let snapshot_dest = dest.clone();
+                let snapshot_stats = stats.clone();
+                let snapshot_state_handle = state_handle.clone();
+                let snapshot_shutdown = shutdown.clone();
+                let snapshot_slot_name_for_task = snapshot_slot_name.clone();
+                let snapshot_cleanup_slot_name =
+                    (snapshot_slot_name != slot_name).then_some(snapshot_slot_name.clone());
+                let snapshot_checkpoint_state_count = snapshot_checkpoint_states.len();
+                let snapshot_task = tokio::spawn(async move {
+                    run_cdc_snapshot_phase(
+                        &source,
+                        &snapshot_connection_label_for_task,
+                        snapshot_tasks_to_run,
+                        snapshot_checkpoint_states,
+                        &snapshot_manual_resync_table_names,
+                        snapshot_name,
+                        slot_guard,
+                        snapshot_slot_name_for_task,
+                        preserve_existing_backlog,
+                        &snapshot_dest,
+                        batch_size,
+                        snapshot_concurrency,
+                        retry_backoff_ms,
+                        snapshot_stats,
+                        snapshot_state_handle,
+                        snapshot_shutdown,
+                        follow,
+                    )
+                    .await
+                });
+                info!(
+                    connection = %snapshot_connection_label,
+                    snapshot_table_count = snapshot_checkpoint_state_count,
+                    "starting mixed-mode CDC while snapshot tasks continue in the background"
                 );
-            }
-            if !preserve_existing_backlog {
-                let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
-                cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
-                if let Some(state_handle) = &state_handle {
-                    state_handle.save_postgres_cdc_state(cdc_state).await?;
+                let start_lsn = match (start_lsn, last_lsn.as_deref()) {
+                    (Some(lsn), _) => lsn,
+                    (None, Some(lsn_str)) => lsn_str
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid LSN '{}'", lsn_str))?,
+                    (None, None) => {
+                        let slot = replication_client.get_or_create_slot(&slot_name).await?;
+                        slot.get_start_lsn()
+                    }
+                };
+
+                let stream_result = self
+                    .stream_cdc_changes(
+                        replication_client.clone(),
+                        CdcStreamConfig {
+                            publication,
+                            slot_name: &slot_name,
+                            start_lsn,
+                            pipeline_id: stream_pipeline_id,
+                            idle_timeout,
+                            max_pending_events,
+                            apply_batch_size: cdc_apply_batch_size,
+                            apply_max_fill: cdc_apply_max_fill,
+                            apply_concurrency: cdc_apply_concurrency,
+                            follow,
+                            shutdown: shutdown.clone(),
+                        },
+                        CdcStreamRuntime {
+                            include_tables: &include_tables,
+                            table_configs: &table_ids,
+                            store: &store,
+                            dest: &cdc_dest,
+                            table_info_map: &mut table_info_map,
+                            etl_schemas: &mut etl_schemas,
+                            table_hashes: &mut table_hashes,
+                            table_snapshots: &mut table_snapshots,
+                            state,
+                            schema_policy: policy.clone(),
+                            schema_diff_enabled,
+                            stats: stats.clone(),
+                            state_handle: state_handle.clone(),
+                        },
+                    )
+                    .await;
+
+                match stream_result {
+                    Ok(last_flushed) => {
+                        let snapshot_outcome = match snapshot_task.await {
+                            Ok(result) => result?,
+                            Err(err) => {
+                                return Err(anyhow::anyhow!(
+                                    "mixed-mode snapshot task join failed: {}",
+                                    err
+                                ));
+                            }
+                        };
+                        if let Some(state_handle) = &state_handle {
+                            state.postgres = state_handle.load_all_postgres_checkpoints().await?;
+                        }
+                        if !snapshot_outcome.completed {
+                            info!(
+                                connection = %snapshot_connection_label,
+                                "shutdown requested during mixed-mode CDC snapshot; preserving resumable snapshot progress"
+                            );
+                            return Ok(());
+                        }
+                        if let Ok(slot) = replication_client.get_slot(&slot_name).await {
+                            last_lsn = Some(slot.confirmed_flush_lsn.to_string());
+                        } else {
+                            last_lsn = Some(last_flushed.to_string());
+                        }
+                        stream_already_ran = true;
+                    }
+                    Err(err) => {
+                        snapshot_task.abort();
+                        let _ = snapshot_task.await;
+                        if let Some(cleanup_slot_name) = snapshot_cleanup_slot_name {
+                            if let Err(cleanup_err) =
+                                replication_client.delete_slot(&cleanup_slot_name).await
+                            {
+                                if cleanup_err.kind()
+                                    != etl::error::ErrorKind::ReplicationSlotNotFound
+                                {
+                                    warn!(
+                                        connection = %snapshot_connection_label,
+                                        slot_name = %cleanup_slot_name,
+                                        error = %cleanup_err,
+                                        "failed to clean up aborted mixed-mode snapshot slot"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(state_handle) = &state_handle {
+                            state.postgres = state_handle.load_all_postgres_checkpoints().await?;
+                        }
+                        return Err(err);
+                    }
                 }
-                start_lsn = preferred_start_lsn;
-                last_lsn = Some(snapshot_start_lsn.clone());
-            }
-            for (table_name, checkpoint_state) in snapshot_checkpoint_states {
-                let checkpoint = checkpoint_state.lock().await.clone();
-                state.postgres.insert(table_name, checkpoint);
+            } else {
+                let snapshot_outcome = run_cdc_snapshot_phase(
+                    self,
+                    connection_label,
+                    snapshot_tasks_to_run,
+                    snapshot_checkpoint_states.clone(),
+                    &manual_resync_table_names,
+                    snapshot_name,
+                    slot_guard,
+                    snapshot_slot_name,
+                    preserve_existing_backlog,
+                    dest,
+                    batch_size,
+                    snapshot_concurrency,
+                    retry_backoff_ms,
+                    stats.clone(),
+                    state_handle.clone(),
+                    shutdown.clone(),
+                    follow,
+                )
+                .await?;
+                if !snapshot_outcome.completed {
+                    for (table_name, checkpoint_state) in &snapshot_checkpoint_states {
+                        let checkpoint = checkpoint_state.lock().await.clone();
+                        state.postgres.insert(table_name.clone(), checkpoint);
+                    }
+                    info!(
+                        connection = %connection_label,
+                        snapshot_table_count = snapshot_checkpoint_states.len(),
+                        "shutdown requested during CDC snapshot; preserving resumable snapshot progress"
+                    );
+                    return Ok(());
+                }
+                if !snapshot_outcome.blocked_tables.is_empty() {
+                    let blocked_table_ids: HashSet<TableId> = table_ids
+                        .iter()
+                        .filter_map(|(table_id, table_cfg)| {
+                            snapshot_outcome
+                                .blocked_tables
+                                .contains(&table_cfg.name)
+                                .then_some(*table_id)
+                        })
+                        .collect();
+                    if blocked_table_ids.len() == include_tables.len() {
+                        return Err(CdcSyncPolicyError::SnapshotBlocked {
+                            tables: snapshot_outcome.blocked_tables.iter().cloned().collect(),
+                        }
+                        .into());
+                    }
+                    for blocked_table_id in blocked_table_ids {
+                        include_tables.remove(&blocked_table_id);
+                    }
+                    warn!(
+                        connection = %connection_label,
+                        blocked_tables = ?snapshot_outcome.blocked_tables,
+                        remaining_cdc_tables = include_tables.len(),
+                        "starting CDC while excluding blocked snapshot tables until manual resync"
+                    );
+                }
+                if !preserve_existing_backlog {
+                    let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
+                    cdc_state.last_lsn = Some(snapshot_start_lsn.clone());
+                    if let Some(state_handle) = &state_handle {
+                        state_handle.save_postgres_cdc_state(cdc_state).await?;
+                    }
+                    start_lsn = preferred_start_lsn;
+                    last_lsn = Some(snapshot_start_lsn.clone());
+                }
+                for (table_name, checkpoint_state) in snapshot_checkpoint_states {
+                    let checkpoint = checkpoint_state.lock().await.clone();
+                    state.postgres.insert(table_name, checkpoint);
+                }
             }
         } else {
             info!(
@@ -1426,55 +1589,57 @@ impl PostgresSource {
             );
         }
 
-        let start_lsn = match (start_lsn, last_lsn.as_deref()) {
-            (Some(lsn), _) => lsn,
-            (None, Some(lsn_str)) => lsn_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid LSN '{}'", lsn_str))?,
-            (None, None) => {
-                let slot = replication_client.get_or_create_slot(&slot_name).await?;
-                slot.get_start_lsn()
+        if !stream_already_ran {
+            let start_lsn = match (start_lsn, last_lsn.as_deref()) {
+                (Some(lsn), _) => lsn,
+                (None, Some(lsn_str)) => lsn_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid LSN '{}'", lsn_str))?,
+                (None, None) => {
+                    let slot = replication_client.get_or_create_slot(&slot_name).await?;
+                    slot.get_start_lsn()
+                }
+            };
+
+            let last_flushed = self
+                .stream_cdc_changes(
+                    replication_client.clone(),
+                    CdcStreamConfig {
+                        publication,
+                        slot_name: &slot_name,
+                        start_lsn,
+                        pipeline_id: stream_pipeline_id,
+                        idle_timeout,
+                        max_pending_events,
+                        apply_batch_size: cdc_apply_batch_size,
+                        apply_max_fill: cdc_apply_max_fill,
+                        apply_concurrency: cdc_apply_concurrency,
+                        follow,
+                        shutdown: shutdown.clone(),
+                    },
+                    CdcStreamRuntime {
+                        include_tables: &include_tables,
+                        table_configs: &table_ids,
+                        store: &store,
+                        dest: &cdc_dest,
+                        table_info_map: &mut table_info_map,
+                        etl_schemas: &mut etl_schemas,
+                        table_hashes: &mut table_hashes,
+                        table_snapshots: &mut table_snapshots,
+                        state,
+                        schema_policy: policy.clone(),
+                        schema_diff_enabled,
+                        stats: stats.clone(),
+                        state_handle: state_handle.clone(),
+                    },
+                )
+                .await?;
+
+            if let Ok(slot) = replication_client.get_slot(&slot_name).await {
+                last_lsn = Some(slot.confirmed_flush_lsn.to_string());
+            } else {
+                last_lsn = Some(last_flushed.to_string());
             }
-        };
-
-        let last_flushed = self
-            .stream_cdc_changes(
-                replication_client.clone(),
-                CdcStreamConfig {
-                    publication,
-                    slot_name: &slot_name,
-                    start_lsn,
-                    pipeline_id: stream_pipeline_id,
-                    idle_timeout,
-                    max_pending_events,
-                    apply_batch_size: cdc_apply_batch_size,
-                    apply_max_fill: cdc_apply_max_fill,
-                    apply_concurrency: cdc_apply_concurrency,
-                    follow,
-                    shutdown: shutdown.clone(),
-                },
-                CdcStreamRuntime {
-                    include_tables: &include_tables,
-                    table_configs: &table_ids,
-                    store: &store,
-                    dest: &cdc_dest,
-                    table_info_map: &mut table_info_map,
-                    etl_schemas: &mut etl_schemas,
-                    table_hashes: &mut table_hashes,
-                    table_snapshots: &mut table_snapshots,
-                    state,
-                    schema_policy: policy,
-                    schema_diff_enabled,
-                    stats: stats.clone(),
-                    state_handle: state_handle.clone(),
-                },
-            )
-            .await?;
-
-        if let Ok(slot) = replication_client.get_slot(&slot_name).await {
-            last_lsn = Some(slot.confirmed_flush_lsn.to_string());
-        } else {
-            last_lsn = Some(last_flushed.to_string());
         }
 
         if let Some(cdc_state) = state.postgres_cdc.as_mut() {

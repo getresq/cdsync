@@ -35,6 +35,7 @@ pub(super) struct ConnectionSummary {
     pub(super) last_sync_finished_at: Option<DateTime<Utc>>,
     pub(super) last_sync_status: Option<String>,
     pub(super) last_error: Option<String>,
+    pub(super) mode: &'static str,
     pub(super) phase: &'static str,
     pub(super) reason_code: &'static str,
     pub(super) max_checkpoint_age_seconds: Option<i64>,
@@ -81,6 +82,7 @@ pub(super) struct TableProgress {
 #[derive(Clone, Serialize)]
 pub(super) struct ConnectionRuntime {
     pub(super) connection_id: String,
+    pub(super) mode: &'static str,
     pub(super) phase: &'static str,
     pub(super) reason_code: &'static str,
     pub(super) last_sync_started_at: Option<DateTime<Utc>>,

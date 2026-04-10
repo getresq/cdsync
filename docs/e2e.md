@@ -1,6 +1,12 @@
 # End-to-End Tests
 
-Most integration tests are ignored by default. The local suite uses Postgres plus the BigQuery emulator. The live suite uses a real BigQuery dataset and a writable GCS batch-load bucket.
+`cdsync` now separates tests into three tiers:
+
+- normal tests: `cargo test`
+- emulator-backed integration tests: gated behind `--features integration-tests`
+- real BigQuery integration tests: gated behind `--features real-bq-tests`
+
+Normal `cargo test` does not build or run the heavy `e2e_*` targets. The local suite uses Postgres plus the BigQuery emulator. The live suite uses a real BigQuery dataset and a writable GCS batch-load bucket.
 
 ## Local Emulator Suite
 
@@ -26,14 +32,16 @@ export CDSYNC_E2E_BQ_PROJECT="cdsync"
 export CDSYNC_E2E_BQ_DATASET="cdsync_e2e"
 ```
 
-Representative emulator-backed tests:
+Run the emulator-backed e2e suite on request:
 
 ```bash
-cargo test --test e2e_postgres_bigquery -- --ignored --nocapture
-cargo test --test e2e_postgres_cdc -- --ignored --nocapture
-cargo test --test e2e_postgres_schema_changes -- --ignored --nocapture
-cargo test --test e2e_postgres_soft_deletes -- --ignored --nocapture
-cargo test --test e2e_runner_graceful_shutdown -- --ignored --nocapture
+scripts/run-e2e-suite.sh emulator
+```
+
+Or run one emulator-backed target directly:
+
+```bash
+cargo test --features integration-tests --test e2e_postgres_cdc -- --nocapture
 ```
 
 Notes:
@@ -56,12 +64,18 @@ export CDSYNC_REAL_BQ_BATCH_LOAD_BUCKET="your-cdsync-load-bucket"
 export CDSYNC_REAL_BQ_KEY_PATH="/absolute/path/to/service-account.json"
 ```
 
-Run the live suites:
+Run the live suites on request:
 
 ```bash
-cargo test --test e2e_postgres_bigquery_real -- --ignored --nocapture
-cargo test --test e2e_postgres_bigquery_real_cdc -- --ignored --nocapture
-cargo test --test e2e_postgres_follow_config_changes_real -- --nocapture
+scripts/run-e2e-suite.sh real-bq
+```
+
+The runner fails fast if the required live-test environment is not present. A successful `real-bq` run means the live suite actually executed; it no longer silently returns green because the environment was missing.
+
+Or run one real-BQ target directly:
+
+```bash
+cargo test --features real-bq-tests --test e2e_postgres_follow_config_changes_real -- --nocapture
 ```
 
 The live tests cover:
@@ -71,3 +85,10 @@ The live tests cover:
 - schema additions
 - soft deletes and hard deletes
 - adding and removing tables from an existing CDC config
+
+You can also run every explicit target suite directly:
+
+```bash
+scripts/run-e2e-suite.sh e2e_postgres_cdc
+scripts/run-e2e-suite.sh e2e_postgres_follow_config_changes_real
+```

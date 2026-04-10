@@ -1230,6 +1230,14 @@ fn snapshot_phase_proceeds_to_cdc_only_in_follow_mode_with_blocked_tables() {
 }
 
 #[test]
+fn mixed_mode_requires_follow_snapshot_work_and_queue_support() {
+    assert!(super::cdc_sync::should_run_mixed_mode(true, true, true));
+    assert!(!super::cdc_sync::should_run_mixed_mode(false, true, true));
+    assert!(!super::cdc_sync::should_run_mixed_mode(true, false, true));
+    assert!(!super::cdc_sync::should_run_mixed_mode(true, true, false));
+}
+
+#[test]
 fn snapshot_scheduler_round_robins_runnable_tables() {
     let now = Utc::now();
     let checkpoint = Arc::new(Mutex::new(TableCheckpoint::default()));

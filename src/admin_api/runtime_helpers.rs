@@ -361,6 +361,28 @@ pub(super) fn checkpoint_has_incomplete_snapshot(checkpoint: Option<&TableCheckp
     })
 }
 
+pub(super) fn derive_connection_mode(
+    state: Option<&ConnectionState>,
+    connection: &ConnectionConfig,
+    cdc_runtime_state: Option<PostgresCdcRuntimeState>,
+) -> &'static str {
+    let has_incomplete_snapshot = state.is_some_and(|state| {
+        active_checkpoint_map(state, &connection.source)
+            .values()
+            .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
+    });
+
+    if has_incomplete_snapshot {
+        if matches!(cdc_runtime_state, Some(PostgresCdcRuntimeState::Following)) {
+            "mixed"
+        } else {
+            "snapshot"
+        }
+    } else {
+        "cdc"
+    }
+}
+
 pub(super) fn derive_connection_runtime(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
@@ -369,6 +391,7 @@ pub(super) fn derive_connection_runtime(
     now: DateTime<Utc>,
     metadata: RuntimeMetadata<'_>,
 ) -> ConnectionRuntime {
+    let mode = derive_connection_mode(state, connection, cdc_runtime_state);
     let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref()) {
         Some("running")
             if state.is_some_and(|state| {
@@ -403,6 +426,7 @@ pub(super) fn derive_connection_runtime(
 
     ConnectionRuntime {
         connection_id: connection.id.clone(),
+        mode,
         phase,
         reason_code,
         last_sync_started_at: state.and_then(|state| state.last_sync_started_at),

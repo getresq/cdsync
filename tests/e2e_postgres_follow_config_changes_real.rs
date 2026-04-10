@@ -161,9 +161,7 @@ async fn run_cdc_once(
 
 #[tokio::test]
 async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() -> Result<()> {
-    let Ok(env) = RealCdcE2eEnv::load() else {
-        return Ok(());
-    };
+    let env = RealCdcE2eEnv::load()?;
     let suffix = Uuid::new_v4().simple().to_string();
     let table_a = format!("public.cdsync_cfg_add_real_a_{}", &suffix[..8]);
     let table_b = format!("public.cdsync_cfg_add_real_b_{}", &suffix[..8]);
@@ -273,9 +271,7 @@ async fn e2e_follow_adding_table_to_config_bootstraps_it_with_real_bigquery() ->
 #[tokio::test]
 async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigquery() -> Result<()>
 {
-    let Ok(env) = RealCdcE2eEnv::load() else {
-        return Ok(());
-    };
+    let env = RealCdcE2eEnv::load()?;
     let suffix = Uuid::new_v4().simple().to_string();
     let table_a = format!("public.cdsync_cfg_remove_real_a_{}", &suffix[..8]);
     let table_b = format!("public.cdsync_cfg_remove_real_b_{}", &suffix[..8]);
@@ -382,9 +378,7 @@ async fn e2e_follow_removing_table_from_config_stops_tracking_it_with_real_bigqu
 #[tokio::test]
 async fn e2e_follow_single_table_resync_preserves_other_table_backlog_with_real_bigquery()
 -> Result<()> {
-    let Ok(env) = RealCdcE2eEnv::load() else {
-        return Ok(());
-    };
+    let env = RealCdcE2eEnv::load()?;
     let suffix = Uuid::new_v4().simple().to_string();
     let table_a = format!("public.cdsync_resync_real_a_{}", &suffix[..8]);
     let table_b = format!("public.cdsync_resync_real_b_{}", &suffix[..8]);

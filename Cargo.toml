@@ -1,11 +1,14 @@
+[package]
+name = "cdsync"
+version = "0.3.0"
+edition = "2024"
+autotests = false
+
 [features]
 default = []
 monitor-ui = ["dep:crossterm", "dep:ratatui"]
-
-[package]
-name = "cdsync"
-version = "0.2.10"
-edition = "2024"
+integration-tests = []
+real-bq-tests = []
 
 [dependencies]
 async-trait = "0.1"
@@ -67,6 +70,63 @@ opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic-messages", "t
 tempfile = "3"
 temp-env = "0.3"
 wiremock = "0.6"
+
+[[test]]
+name = "state_store_integration"
+path = "tests/state_store_integration.rs"
+
+[[test]]
+name = "stats_db_integration"
+path = "tests/stats_db_integration.rs"
+
+[[test]]
+name = "telemetry_otlp_smoke"
+path = "tests/telemetry_otlp_smoke.rs"
+
+[[test]]
+name = "e2e_postgres_bigquery"
+path = "tests/e2e_postgres_bigquery.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_postgres_cdc"
+path = "tests/e2e_postgres_cdc.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_postgres_follow_config_changes"
+path = "tests/e2e_postgres_follow_config_changes.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_postgres_schema_changes"
+path = "tests/e2e_postgres_schema_changes.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_postgres_soft_deletes"
+path = "tests/e2e_postgres_soft_deletes.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_runner_graceful_shutdown"
+path = "tests/e2e_runner_graceful_shutdown.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "e2e_postgres_bigquery_real"
+path = "tests/e2e_postgres_bigquery_real.rs"
+required-features = ["real-bq-tests"]
+
+[[test]]
+name = "e2e_postgres_bigquery_real_cdc"
+path = "tests/e2e_postgres_bigquery_real_cdc.rs"
+required-features = ["real-bq-tests"]
+
+[[test]]
+name = "e2e_postgres_follow_config_changes_real"
+path = "tests/e2e_postgres_follow_config_changes_real.rs"
+required-features = ["real-bq-tests"]
 
 [lints.rust]
 unsafe_code = "deny"
