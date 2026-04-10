@@ -8,7 +8,6 @@ use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource};
 use cdsync::state::{ConnectionState, SyncState, SyncStateStore};
 use cdsync::stats::StatsDb;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
-use chrono::Utc;
 use etl_postgres::replication::slots::APPLY_WORKER_PREFIX;
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use sqlx::postgres::PgPoolOptions;
@@ -135,7 +134,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
     .execute(&pool)
     .await?;
 
-    let pipeline_id = Utc::now().timestamp_millis() as u64 % 1_000_000 + 10_000;
+    let pipeline_id = 10_000 + (Uuid::new_v4().as_u128() as u64 % 1_000_000);
     let pg_config = PostgresConfig {
         url: pg_url.clone(),
         tables: Some(vec![PostgresTableConfig {
@@ -418,7 +417,7 @@ async fn e2e_postgres_bigquery_real_cdc_follow_batch_load_relation_stress() -> R
 
     prepare_runner_state(&pg_url, &state_schema, &stats_schema).await?;
 
-    let pipeline_id = Utc::now().timestamp_millis() as u64 % 1_000_000 + 20_000;
+    let pipeline_id = 20_000 + (Uuid::new_v4().as_u128() as u64 % 1_000_000);
     let pg_config = PostgresConfig {
         url: pg_url.clone(),
         tables: Some(table_configs.clone()),

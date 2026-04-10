@@ -1487,8 +1487,7 @@ impl PostgresSource {
                         if let Some(cleanup_slot_name) = snapshot_cleanup_slot_name
                             && let Err(cleanup_err) =
                                 replication_client.delete_slot(&cleanup_slot_name).await
-                            && cleanup_err.kind()
-                                != etl::error::ErrorKind::ReplicationSlotNotFound
+                            && cleanup_err.kind() != etl::error::ErrorKind::ReplicationSlotNotFound
                         {
                             warn!(
                                 connection = %snapshot_connection_label,
