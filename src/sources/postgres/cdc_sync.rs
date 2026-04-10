@@ -1484,21 +1484,18 @@ impl PostgresSource {
                     Err(err) => {
                         snapshot_task.abort();
                         let _ = snapshot_task.await;
-                        if let Some(cleanup_slot_name) = snapshot_cleanup_slot_name {
-                            if let Err(cleanup_err) =
+                        if let Some(cleanup_slot_name) = snapshot_cleanup_slot_name
+                            && let Err(cleanup_err) =
                                 replication_client.delete_slot(&cleanup_slot_name).await
-                            {
-                                if cleanup_err.kind()
-                                    != etl::error::ErrorKind::ReplicationSlotNotFound
-                                {
-                                    warn!(
-                                        connection = %snapshot_connection_label,
-                                        slot_name = %cleanup_slot_name,
-                                        error = %cleanup_err,
-                                        "failed to clean up aborted mixed-mode snapshot slot"
-                                    );
-                                }
-                            }
+                            && cleanup_err.kind()
+                                != etl::error::ErrorKind::ReplicationSlotNotFound
+                        {
+                            warn!(
+                                connection = %snapshot_connection_label,
+                                slot_name = %cleanup_slot_name,
+                                error = %cleanup_err,
+                                "failed to clean up aborted mixed-mode snapshot slot"
+                            );
                         }
                         if let Some(state_handle) = &state_handle {
                             state.postgres = state_handle.load_all_postgres_checkpoints().await?;

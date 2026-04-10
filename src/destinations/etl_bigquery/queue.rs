@@ -541,8 +541,7 @@ impl CdcBatchLoadManager {
             Ok(CdcApplyReadiness::Ready) => self
                 .inner
                 .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
-                .await
-                .map_err(anyhow::Error::from),
+                .await,
             Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
                 "CDC batch-load waiting for snapshot handoff for {}",
                 job.payload.source_table
