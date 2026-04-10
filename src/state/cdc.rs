@@ -682,15 +682,17 @@ impl SyncStateStore {
             insert into {} (
                 connection_id,
                 next_sequence_to_ack,
+                last_received_lsn,
                 last_flushed_lsn,
                 last_persisted_lsn,
                 last_status_update_sent_at,
                 last_keepalive_reply_at,
                 last_slot_feedback_lsn,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             on conflict(connection_id) do update set
                 next_sequence_to_ack = excluded.next_sequence_to_ack,
+                last_received_lsn = excluded.last_received_lsn,
                 last_flushed_lsn = excluded.last_flushed_lsn,
                 last_persisted_lsn = excluded.last_persisted_lsn,
                 last_status_update_sent_at = excluded.last_status_update_sent_at,
@@ -702,6 +704,7 @@ impl SyncStateStore {
         ))
         .bind(connection_id)
         .bind(saturating_u64_to_i64(state.next_sequence_to_ack))
+        .bind(state.last_received_lsn.clone())
         .bind(state.last_flushed_lsn.clone())
         .bind(state.last_persisted_lsn.clone())
         .bind(
@@ -738,6 +741,7 @@ impl SyncStateStore {
         let row = sqlx::query(&format!(
             r#"
             select next_sequence_to_ack,
+                   last_received_lsn,
                    last_flushed_lsn, last_persisted_lsn,
                    last_status_update_sent_at,
                    last_keepalive_reply_at, last_slot_feedback_lsn,
@@ -757,7 +761,7 @@ impl SyncStateStore {
                 next_sequence_to_ack: u64::try_from(next_sequence_to_ack)
                     .context("cdc watermark next_sequence_to_ack must be non-negative")?,
                 last_enqueued_sequence: None,
-                last_received_lsn: None,
+                last_received_lsn: row.try_get("last_received_lsn")?,
                 last_flushed_lsn: row.try_get("last_flushed_lsn")?,
                 last_persisted_lsn: row.try_get("last_persisted_lsn")?,
                 last_relevant_change_seen_at: None,
@@ -1084,7 +1088,7 @@ fn merge_cdc_watermark_state(
         (Some(base), Some(feedback)) => Some(CdcWatermarkState {
             next_sequence_to_ack: feedback.next_sequence_to_ack,
             last_enqueued_sequence: base.last_enqueued_sequence,
-            last_received_lsn: base.last_received_lsn,
+            last_received_lsn: feedback.last_received_lsn.or(base.last_received_lsn),
             last_flushed_lsn: feedback.last_flushed_lsn.or(base.last_flushed_lsn),
             last_persisted_lsn: feedback.last_persisted_lsn.or(base.last_persisted_lsn),
             last_relevant_change_seen_at: base

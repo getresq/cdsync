@@ -563,6 +563,7 @@ pub(super) async fn apply_cdc_watermark_advance(
                 .await?
                 .unwrap_or_default();
             feedback_state.next_sequence_to_ack = advance.next_sequence_to_ack;
+            feedback_state.last_received_lsn = Some(last_received_lsn.to_string());
             feedback_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
             feedback_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
             feedback_state.last_status_update_sent_at = Some(chrono::Utc::now());

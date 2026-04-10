@@ -270,6 +270,7 @@ pub(super) async fn handle_primary_keepalive_reply(
             .await?
             .unwrap_or_default();
         let now = chrono::Utc::now();
+        feedback_state.last_received_lsn = Some(last_received_lsn.to_string());
         feedback_state.last_status_update_sent_at = Some(now);
         feedback_state.last_keepalive_reply_at = Some(now);
         feedback_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
