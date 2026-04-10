@@ -15,6 +15,12 @@ pub struct PostgresCdcState {
     pub slot_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CdcReplayCleanupSummary {
+    pub discarded_jobs: u64,
+    pub discarded_fragments: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CdcBatchLoadJobStatus {
     Pending,

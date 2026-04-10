@@ -9,6 +9,22 @@ const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn next_cdc_commit_sequence_from_watermark(
+    watermark: Option<&crate::state::CdcWatermarkState>,
+) -> u64 {
+    watermark
+        .map(|state| state.next_sequence_to_ack)
+        .unwrap_or(0)
+}
+
+async fn load_next_cdc_commit_sequence(state_handle: Option<&StateHandle>) -> Result<u64> {
+    let watermark = match state_handle {
+        Some(state_handle) => state_handle.load_cdc_watermark_state().await?,
+        None => None,
+    };
+    Ok(next_cdc_commit_sequence_from_watermark(watermark.as_ref()))
+}
+
 impl PostgresSource {
     pub(super) async fn stream_cdc_changes(
         &self,
@@ -62,13 +78,14 @@ impl PostgresSource {
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
         let mut shutdown = shutdown;
         let mut shutdown_requested = false;
-        let mut next_commit_sequence = 0u64;
+        let initial_commit_sequence = load_next_cdc_commit_sequence(state_handle.as_ref()).await?;
+        let mut next_commit_sequence = initial_commit_sequence;
         let mut queued_batches: VecDeque<CommittedCdcBatch> = VecDeque::new();
         let mut pending_table_batches: HashMap<TableId, PendingTableApplyBatch> = HashMap::new();
         let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
         let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
         let (coordinator_tx, mut coordinator_advances_rx, coordinator_state_rx, coordinator_task) =
-            spawn_cdc_coordinator();
+            spawn_cdc_coordinator(initial_commit_sequence);
         let mut table_apply_locks: HashMap<TableId, Arc<Mutex<()>>> = HashMap::new();
         let mut active_table_applies: HashSet<TableId> = HashSet::new();
         let max_active_applies = apply_concurrency.max(1);
@@ -952,5 +969,24 @@ impl PostgresSource {
             &mut last_flushed_lsn,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_cdc_commit_sequence_uses_next_sequence_to_ack() {
+        let watermark = crate::state::CdcWatermarkState {
+            next_sequence_to_ack: 41,
+            last_enqueued_sequence: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            next_cdc_commit_sequence_from_watermark(Some(&watermark)),
+            41
+        );
+        assert_eq!(next_cdc_commit_sequence_from_watermark(None), 0);
     }
 }

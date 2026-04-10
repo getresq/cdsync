@@ -251,58 +251,60 @@ impl SyncStateStore {
         Ok(())
     }
 
-    pub async fn requeue_cdc_batch_load_running_jobs(
+    pub async fn discard_inflight_cdc_batch_load_state_for_replay(
         &self,
         connection_id: &str,
-    ) -> anyhow::Result<u64> {
-        let result = sqlx::query(&format!(
-            r#"
-            update {}
-            set status = $2,
-                retry_class = retry_class,
-                updated_at = $3
-            where connection_id = $1
-              and status = $4
-            "#,
-            self.table("cdc_batch_load_jobs")
-        ))
-        .bind(connection_id)
-        .bind(CdcBatchLoadJobStatus::Pending.as_str())
-        .bind(now_millis())
-        .bind(CdcBatchLoadJobStatus::Running.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
+    ) -> anyhow::Result<CdcReplayCleanupSummary> {
+        let doomed_jobs = self
+            .load_cdc_batch_load_jobs(
+                connection_id,
+                &[
+                    CdcBatchLoadJobStatus::Pending,
+                    CdcBatchLoadJobStatus::Running,
+                ],
+            )
+            .await?;
+        let doomed_job_ids: Vec<String> = doomed_jobs.into_iter().map(|job| job.job_id).collect();
 
-    pub async fn requeue_retryable_failed_cdc_batch_load_jobs(
-        &self,
-        connection_id: &str,
-    ) -> anyhow::Result<u64> {
-        let result = sqlx::query(&format!(
+        if doomed_job_ids.is_empty() {
+            return Ok(CdcReplayCleanupSummary::default());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let jobs_table = self.table("cdc_batch_load_jobs");
+        let fragment_table = self.table("cdc_commit_fragments");
+
+        let fragment_result = sqlx::query(&format!(
             r#"
-            update {}
-            set status = $2,
-                retry_class = retry_class,
-                last_error = null,
-                updated_at = $3
+            delete from {}
             where connection_id = $1
-              and status = $4
-              and retry_class = any($5)
+              and job_id = any($2)
             "#,
-            self.table("cdc_batch_load_jobs")
+            fragment_table
         ))
         .bind(connection_id)
-        .bind(CdcBatchLoadJobStatus::Pending.as_str())
-        .bind(now_millis())
-        .bind(CdcBatchLoadJobStatus::Failed.as_str())
-        .bind([
-            SyncRetryClass::Backpressure.as_str(),
-            SyncRetryClass::Transient.as_str(),
-        ])
-        .execute(&self.pool)
+        .bind(&doomed_job_ids)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+
+        let job_result = sqlx::query(&format!(
+            r#"
+            delete from {}
+            where connection_id = $1
+              and job_id = any($2)
+            "#,
+            jobs_table
+        ))
+        .bind(connection_id)
+        .bind(&doomed_job_ids)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(CdcReplayCleanupSummary {
+            discarded_jobs: job_result.rows_affected(),
+            discarded_fragments: fragment_result.rows_affected(),
+        })
     }
 
     pub async fn requeue_cdc_batch_load_job(

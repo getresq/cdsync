@@ -249,7 +249,7 @@ impl CdcBatchLoadManager {
             notify: Arc::new(Notify::new()),
             local_retry_retryable_failures,
         };
-        manager.restore_pending_jobs().await?;
+        manager.discard_inflight_jobs_for_replay().await?;
         manager.start_workers(worker_count.max(1));
         Ok(manager)
     }
@@ -333,30 +333,20 @@ impl CdcBatchLoadManager {
         }
     }
 
-    async fn restore_pending_jobs(&self) -> Result<()> {
-        let requeued_running = self
+    async fn discard_inflight_jobs_for_replay(&self) -> Result<()> {
+        let cleanup = self
             .state_handle
-            .requeue_cdc_batch_load_running_jobs()
+            .discard_inflight_cdc_batch_load_state_for_replay()
             .await?;
-        let requeued_failed = self
-            .state_handle
-            .requeue_retryable_failed_cdc_batch_load_jobs()
-            .await?;
-        let pending_jobs = self
-            .state_handle
-            .load_cdc_batch_load_jobs(&[CdcBatchLoadJobStatus::Pending])
-            .await?;
-        if requeued_running > 0 || requeued_failed > 0 || !pending_jobs.is_empty() {
+        if cleanup.discarded_jobs > 0 || cleanup.discarded_fragments > 0 {
             info!(
                 component = "consumer",
-                event = "cdc_consumer_restored_jobs",
+                event = "cdc_consumer_discarded_inflight_jobs_for_replay",
                 connection_id = self.state_handle.connection_id(),
-                requeued_running_jobs = requeued_running,
-                requeued_failed_jobs = requeued_failed,
-                pending_jobs = pending_jobs.len(),
-                "restored queued CDC batch-load jobs from durable state"
+                discarded_jobs = cleanup.discarded_jobs,
+                discarded_fragments = cleanup.discarded_fragments,
+                "discarded in-flight queued CDC batch-load state so CDC can replay from durable feedback"
             );
-            self.notify.notify_waiters();
         }
         Ok(())
     }

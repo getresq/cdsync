@@ -152,7 +152,9 @@ impl CdcWatermarkTracker {
     }
 }
 
-pub(super) fn spawn_cdc_coordinator() -> (
+pub(super) fn spawn_cdc_coordinator(
+    initial_next_sequence: u64,
+) -> (
     mpsc::UnboundedSender<CdcCoordinatorCommand>,
     mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
     watch::Receiver<CdcCoordinatorRuntimeState>,
@@ -160,9 +162,15 @@ pub(super) fn spawn_cdc_coordinator() -> (
 ) {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (advance_tx, advance_rx) = mpsc::unbounded_channel();
-    let (state_tx, state_rx) = watch::channel(CdcCoordinatorRuntimeState::default());
+    let (state_tx, state_rx) = watch::channel(CdcCoordinatorRuntimeState {
+        inflight_commits: 0,
+        next_sequence_to_ack: initial_next_sequence,
+    });
     let task = tokio::spawn(async move {
-        let mut tracker = CdcWatermarkTracker::default();
+        let mut tracker = CdcWatermarkTracker {
+            next_sequence: initial_next_sequence,
+            commits: BTreeMap::new(),
+        };
         while let Some(command) = command_rx.recv().await {
             match command {
                 CdcCoordinatorCommand::RegisterCommit {
@@ -198,6 +206,35 @@ pub(super) fn spawn_cdc_coordinator() -> (
         Ok(())
     });
     (command_tx, advance_rx, state_rx, task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn seeded_cdc_coordinator_advances_from_initial_sequence() -> anyhow::Result<()> {
+        let (tx, mut advances_rx, state_rx, task) = spawn_cdc_coordinator(41);
+
+        tx.send(CdcCoordinatorCommand::RegisterCommit {
+            sequence: 41,
+            commit_lsn: etl::types::PgLsn::from(0x16B6C50u64),
+            stats: HashMap::new(),
+            extract_ms: 0,
+            fragment_count: 1,
+        })?;
+        tx.send(CdcCoordinatorCommand::CompleteFragments {
+            sequences: vec![41],
+        })?;
+
+        let advance = advances_rx.recv().await.expect("watermark advance");
+        assert_eq!(advance.next_sequence_to_ack, 42);
+        assert_eq!(state_rx.borrow().next_sequence_to_ack, 42);
+
+        drop(tx);
+        task.await??;
+        Ok(())
+    }
 }
 
 pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableApplyBatch> {

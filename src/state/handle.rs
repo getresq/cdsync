@@ -49,15 +49,6 @@ impl StateHandle {
             .await
     }
 
-    pub async fn load_cdc_batch_load_jobs(
-        &self,
-        statuses: &[CdcBatchLoadJobStatus],
-    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
-        self.store
-            .load_cdc_batch_load_jobs(&self.connection_id, statuses)
-            .await
-    }
-
     pub async fn claim_next_cdc_batch_load_job(
         &self,
         stale_running_before_ms: i64,
@@ -73,15 +64,11 @@ impl StateHandle {
             .await
     }
 
-    pub async fn requeue_cdc_batch_load_running_jobs(&self) -> anyhow::Result<u64> {
+    pub async fn discard_inflight_cdc_batch_load_state_for_replay(
+        &self,
+    ) -> anyhow::Result<CdcReplayCleanupSummary> {
         self.store
-            .requeue_cdc_batch_load_running_jobs(&self.connection_id)
-            .await
-    }
-
-    pub async fn requeue_retryable_failed_cdc_batch_load_jobs(&self) -> anyhow::Result<u64> {
-        self.store
-            .requeue_retryable_failed_cdc_batch_load_jobs(&self.connection_id)
+            .discard_inflight_cdc_batch_load_state_for_replay(&self.connection_id)
             .await
     }
 
@@ -153,6 +140,12 @@ impl StateHandle {
     pub async fn load_cdc_feedback_state(&self) -> anyhow::Result<Option<CdcWatermarkState>> {
         self.store
             .load_cdc_feedback_state(&self.connection_id)
+            .await
+    }
+
+    pub async fn load_cdc_watermark_state(&self) -> anyhow::Result<Option<CdcWatermarkState>> {
+        self.store
+            .load_cdc_watermark_state(&self.connection_id)
             .await
     }
 
