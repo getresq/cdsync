@@ -12,9 +12,7 @@ const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 fn next_cdc_commit_sequence_from_watermark(
     watermark: Option<&crate::state::CdcWatermarkState>,
 ) -> u64 {
-    watermark
-        .map(|state| state.next_sequence_to_ack)
-        .unwrap_or(0)
+    watermark.map_or(0, |state| state.next_sequence_to_ack)
 }
 
 async fn load_next_cdc_commit_sequence(state_handle: Option<&StateHandle>) -> Result<u64> {

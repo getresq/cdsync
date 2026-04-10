@@ -208,35 +208,6 @@ pub(super) fn spawn_cdc_coordinator(
     (command_tx, advance_rx, state_rx, task)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn seeded_cdc_coordinator_advances_from_initial_sequence() -> anyhow::Result<()> {
-        let (tx, mut advances_rx, state_rx, task) = spawn_cdc_coordinator(41);
-
-        tx.send(CdcCoordinatorCommand::RegisterCommit {
-            sequence: 41,
-            commit_lsn: etl::types::PgLsn::from(0x16B6C50u64),
-            stats: HashMap::new(),
-            extract_ms: 0,
-            fragment_count: 1,
-        })?;
-        tx.send(CdcCoordinatorCommand::CompleteFragments {
-            sequences: vec![41],
-        })?;
-
-        let advance = advances_rx.recv().await.expect("watermark advance");
-        assert_eq!(advance.next_sequence_to_ack, 42);
-        assert_eq!(state_rx.borrow().next_sequence_to_ack, 42);
-
-        drop(tx);
-        task.await??;
-        Ok(())
-    }
-}
-
 pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableApplyBatch> {
     let mut order = Vec::new();
     let mut table_batches: HashMap<TableId, Vec<Event>> = HashMap::new();
@@ -646,5 +617,34 @@ where
     match timeout(duration, fut).await {
         Ok(result) => result.map_err(Into::into).with_context(|| label.clone()),
         Err(_) => anyhow::bail!("{} timed out after {}s", label, duration.as_secs()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn seeded_cdc_coordinator_advances_from_initial_sequence() -> anyhow::Result<()> {
+        let (tx, mut advances_rx, state_rx, task) = spawn_cdc_coordinator(41);
+
+        tx.send(CdcCoordinatorCommand::RegisterCommit {
+            sequence: 41,
+            commit_lsn: etl::types::PgLsn::from(0x016B_6C50_u64),
+            stats: HashMap::new(),
+            extract_ms: 0,
+            fragment_count: 1,
+        })?;
+        tx.send(CdcCoordinatorCommand::CompleteFragments {
+            sequences: vec![41],
+        })?;
+
+        let advance = advances_rx.recv().await.expect("watermark advance");
+        assert_eq!(advance.next_sequence_to_ack, 42);
+        assert_eq!(state_rx.borrow().next_sequence_to_ack, 42);
+
+        drop(tx);
+        task.await??;
+        Ok(())
     }
 }
