@@ -24,6 +24,7 @@ use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, Pl
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, oneshot};
 use tokio::task;
@@ -95,6 +96,7 @@ struct CdcBatchLoadManager {
     inner: BigQueryDestination,
     stats: Option<StatsHandle>,
     state_handle: StateHandle,
+    mixed_mode_gate_enabled: Arc<AtomicBool>,
     waiters: Arc<Mutex<CdcBatchLoadJobWaiters>>,
     notify: Arc<Notify>,
     local_retry_retryable_failures: bool,
@@ -178,6 +180,12 @@ impl CdcTableInfo {
 impl EtlBigQueryDestination {
     pub(crate) fn supports_mixed_mode(&self) -> bool {
         self.cdc_batch_load_manager.is_some()
+    }
+
+    pub(crate) fn set_mixed_mode_gate_enabled(&self, enabled: bool) {
+        if let Some(manager) = &self.cdc_batch_load_manager {
+            manager.set_mixed_mode_gate_enabled(enabled);
+        }
     }
 
     pub async fn new(
@@ -465,18 +473,20 @@ impl EtlBigQueryDestination {
                 .await?;
             let first_sequence = fragments.first().map_or(0, |fragment| fragment.sequence);
             let rx = manager.enqueue(first_sequence, payload, fragments).await?;
-            let readiness = manager
-                .table_apply_readiness(&info.source_name)
-                .await
-                .map_err(|err| {
-                    etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "failed to inspect CDC table readiness",
-                        err.to_string()
-                    )
-                })?;
-            if !matches!(readiness, CdcApplyReadiness::Ready) {
-                return Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate);
+            if queue::should_check_table_apply_readiness(manager.mixed_mode_gate_enabled()) {
+                let readiness = manager
+                    .table_apply_readiness(&info.source_name)
+                    .await
+                    .map_err(|err| {
+                        etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "failed to inspect CDC table readiness",
+                            err.to_string()
+                        )
+                    })?;
+                if !matches!(readiness, CdcApplyReadiness::Ready) {
+                    return Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate);
+                }
             }
             return Ok(crate::sources::postgres::CdcTableApplyExecution::Deferred(
                 rx,

@@ -1351,6 +1351,7 @@ impl PostgresSource {
             let has_snapshot_work = !snapshot_tasks_to_run.is_empty();
             let run_mixed_mode =
                 should_run_mixed_mode(follow, has_snapshot_work, cdc_dest.supports_mixed_mode());
+            cdc_dest.set_mixed_mode_gate_enabled(run_mixed_mode);
             let preferred_start_lsn = if preserve_existing_backlog {
                 None
             } else {
@@ -1458,6 +1459,7 @@ impl PostgresSource {
                         let snapshot_outcome = match snapshot_task.await {
                             Ok(result) => result?,
                             Err(err) => {
+                                cdc_dest.set_mixed_mode_gate_enabled(false);
                                 return Err(anyhow::anyhow!(
                                     "mixed-mode snapshot task join failed: {}",
                                     err
@@ -1468,12 +1470,14 @@ impl PostgresSource {
                             state.postgres = state_handle.load_all_postgres_checkpoints().await?;
                         }
                         if !snapshot_outcome.completed {
+                            cdc_dest.set_mixed_mode_gate_enabled(false);
                             info!(
                                 connection = %snapshot_connection_label,
                                 "shutdown requested during mixed-mode CDC snapshot; preserving resumable snapshot progress"
                             );
                             return Ok(());
                         }
+                        cdc_dest.set_mixed_mode_gate_enabled(false);
                         if let Ok(slot) = replication_client.get_slot(&slot_name).await {
                             last_lsn = Some(slot.confirmed_flush_lsn.to_string());
                         } else {
@@ -1499,6 +1503,7 @@ impl PostgresSource {
                         if let Some(state_handle) = &state_handle {
                             state.postgres = state_handle.load_all_postgres_checkpoints().await?;
                         }
+                        cdc_dest.set_mixed_mode_gate_enabled(false);
                         return Err(err);
                     }
                 }

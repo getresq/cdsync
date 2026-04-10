@@ -80,6 +80,10 @@ pub(super) enum CdcApplyReadiness {
     Blocked,
 }
 
+pub(super) fn should_check_table_apply_readiness(mixed_mode_gate_enabled: bool) -> bool {
+    mixed_mode_gate_enabled
+}
+
 impl EtlBigQueryDestination {
     pub(super) async fn prepare_cdc_batch_load_job(
         &self,
@@ -240,6 +244,7 @@ impl CdcBatchLoadManager {
             inner,
             stats,
             state_handle,
+            mixed_mode_gate_enabled: Arc::new(AtomicBool::new(false)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
             local_retry_retryable_failures,
@@ -256,6 +261,15 @@ impl CdcBatchLoadManager {
                 manager.worker_loop(worker_index).await;
             });
         }
+    }
+
+    pub(super) fn mixed_mode_gate_enabled(&self) -> bool {
+        self.mixed_mode_gate_enabled.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_mixed_mode_gate_enabled(&self, enabled: bool) {
+        self.mixed_mode_gate_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub(super) async fn table_apply_readiness(
@@ -534,35 +548,40 @@ impl CdcBatchLoadManager {
                 }
             })
         };
-        let result: anyhow::Result<()> = match self
-            .table_apply_readiness(&job.payload.source_table)
-            .await
-        {
-            Ok(CdcApplyReadiness::Ready) => {
-                self.inner
-                    .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
-                    .await
+        let result: anyhow::Result<()> = if should_check_table_apply_readiness(
+            self.mixed_mode_gate_enabled(),
+        ) {
+            match self.table_apply_readiness(&job.payload.source_table).await {
+                Ok(CdcApplyReadiness::Ready) => {
+                    self.inner
+                        .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+                        .await
+                }
+                Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
+                    "CDC batch-load waiting for snapshot handoff for {}",
+                    job.payload.source_table
+                )),
+                Ok(CdcApplyReadiness::Blocked) => {
+                    info!(
+                        component = "consumer",
+                        event = "cdc_consumer_job_skipped_blocked_table",
+                        connection_id = self.state_handle.connection_id(),
+                        job_id = %job_id,
+                        table = %table_key,
+                        "skipping queued CDC batch-load job because table is blocked until manual resync"
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(anyhow::anyhow!(
+                    "failed to inspect CDC apply readiness for {}: {}",
+                    job.payload.source_table,
+                    err
+                )),
             }
-            Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
-                "CDC batch-load waiting for snapshot handoff for {}",
-                job.payload.source_table
-            )),
-            Ok(CdcApplyReadiness::Blocked) => {
-                info!(
-                    component = "consumer",
-                    event = "cdc_consumer_job_skipped_blocked_table",
-                    connection_id = self.state_handle.connection_id(),
-                    job_id = %job_id,
-                    table = %table_key,
-                    "skipping queued CDC batch-load job because table is blocked until manual resync"
-                );
-                Ok(())
-            }
-            Err(err) => Err(anyhow::anyhow!(
-                "failed to inspect CDC apply readiness for {}: {}",
-                job.payload.source_table,
-                err
-            )),
+        } else {
+            self.inner
+                .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+                .await
         };
         let _ = heartbeat_stop_tx.send(());
         let _ = heartbeat_handle.await;
@@ -754,5 +773,11 @@ mod tests {
         let delay = cdc_batch_load_retry_delay(1, "public.accounts");
         assert!(delay >= Duration::from_secs(16));
         assert!(delay <= Duration::from_secs(20));
+    }
+
+    #[test]
+    fn checkpoint_readiness_checks_only_run_in_mixed_mode() {
+        assert!(!should_check_table_apply_readiness(false));
+        assert!(should_check_table_apply_readiness(true));
     }
 }

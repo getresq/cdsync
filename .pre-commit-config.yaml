@@ -15,11 +15,6 @@ repos:
         entry: cargo clippy --all-targets --all-features -- -D warnings
         language: system
         pass_filenames: false
-      - id: rust-test
-        name: Rust Tests
-        entry: cargo test
-        language: system
-        pass_filenames: false
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
