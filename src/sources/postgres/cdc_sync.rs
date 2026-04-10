@@ -1039,14 +1039,13 @@ impl PostgresSource {
             etl_schemas.insert(*table_id, etl_schema);
         }
 
-        let mut cdc_dest = EtlBigQueryDestination::new(
+        let cdc_dest = EtlBigQueryDestination::new(
             dest.clone(),
             table_info_map.clone(),
             stats.clone(),
             cdc_apply_concurrency,
             cdc_batch_load_worker_count,
             state_handle.clone(),
-            false,
             follow,
         )
         .await?;
@@ -1352,7 +1351,6 @@ impl PostgresSource {
             let has_snapshot_work = !snapshot_tasks_to_run.is_empty();
             let run_mixed_mode =
                 should_run_mixed_mode(follow, has_snapshot_work, cdc_dest.supports_mixed_mode());
-            cdc_dest.set_ack_cdc_on_enqueue(run_mixed_mode);
             let preferred_start_lsn = if preserve_existing_backlog {
                 None
             } else {

@@ -339,6 +339,7 @@ pub(super) struct ServiceHeartbeatData {
     pub(super) started_at: DateTime<Utc>,
     pub(super) uptime_seconds: i64,
     pub(super) mode: String,
+    pub(super) managed_connections: usize,
     pub(super) deploy_revision: Option<String>,
     pub(super) config_hash: String,
     pub(super) last_restart_reason: String,

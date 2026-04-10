@@ -117,6 +117,7 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
             started_at: cursor.state.started_at,
             uptime_seconds: (now - cursor.state.started_at).num_seconds().max(0),
             mode: cursor.state.mode.clone(),
+            managed_connections: cursor.state.managed_connection_count,
             deploy_revision: cursor.state.deploy_revision.clone(),
             config_hash: cursor.state.config_hash.clone(),
             last_restart_reason: cursor.state.last_restart_reason.clone(),

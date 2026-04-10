@@ -33,6 +33,7 @@ mod frame;
 mod queue;
 
 use self::frame::*;
+use self::queue::CdcApplyReadiness;
 
 #[derive(Clone)]
 pub struct EtlBigQueryDestination {
@@ -41,7 +42,6 @@ pub struct EtlBigQueryDestination {
     stats: Option<StatsHandle>,
     apply_concurrency: usize,
     cdc_batch_load_manager: Option<Arc<CdcBatchLoadManager>>,
-    ack_cdc_on_enqueue: bool,
 }
 
 #[derive(Clone)]
@@ -180,10 +180,6 @@ impl EtlBigQueryDestination {
         self.cdc_batch_load_manager.is_some()
     }
 
-    pub(crate) fn set_ack_cdc_on_enqueue(&mut self, enabled: bool) {
-        self.ack_cdc_on_enqueue = enabled;
-    }
-
     pub async fn new(
         inner: BigQueryDestination,
         tables: HashMap<TableId, CdcTableInfo>,
@@ -191,7 +187,6 @@ impl EtlBigQueryDestination {
         apply_concurrency: usize,
         cdc_batch_load_worker_count: usize,
         state_handle: Option<StateHandle>,
-        ack_cdc_on_enqueue: bool,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let cdc_batch_load_manager = if inner.cdc_batch_load_queue_enabled() {
@@ -218,7 +213,6 @@ impl EtlBigQueryDestination {
             stats,
             apply_concurrency: apply_concurrency.max(1),
             cdc_batch_load_manager,
-            ack_cdc_on_enqueue,
         })
     }
 
@@ -471,7 +465,17 @@ impl EtlBigQueryDestination {
                 .await?;
             let first_sequence = fragments.first().map_or(0, |fragment| fragment.sequence);
             let rx = manager.enqueue(first_sequence, payload, fragments).await?;
-            if self.ack_cdc_on_enqueue {
+            let readiness = manager
+                .table_apply_readiness(&info.source_name)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to inspect CDC table readiness",
+                        err.to_string()
+                    )
+                })?;
+            if !matches!(readiness, CdcApplyReadiness::Ready) {
                 return Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate);
             }
             return Ok(crate::sources::postgres::CdcTableApplyExecution::Deferred(

@@ -74,7 +74,7 @@ fn checkpoint_has_incomplete_snapshot(checkpoint: &TableCheckpoint) -> bool {
             .any(|chunk| !chunk.complete)
 }
 
-enum CdcApplyReadiness {
+pub(super) enum CdcApplyReadiness {
     Ready,
     Snapshotting,
     Blocked,
@@ -258,7 +258,10 @@ impl CdcBatchLoadManager {
         }
     }
 
-    async fn table_apply_readiness(&self, source_table: &str) -> anyhow::Result<CdcApplyReadiness> {
+    pub(super) async fn table_apply_readiness(
+        &self,
+        source_table: &str,
+    ) -> anyhow::Result<CdcApplyReadiness> {
         let checkpoint = self
             .state_handle
             .load_postgres_checkpoint(source_table)
@@ -531,27 +534,36 @@ impl CdcBatchLoadManager {
                 }
             })
         };
-        let result: anyhow::Result<()> =
-            match self.table_apply_readiness(&job.payload.source_table).await {
-                Ok(CdcApplyReadiness::Ready) => self
-                    .inner
-                    .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
-                    .await
-                    .map_err(anyhow::Error::from),
-                Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
-                    "CDC batch-load waiting for snapshot handoff for {}",
-                    job.payload.source_table
-                )),
-                Ok(CdcApplyReadiness::Blocked) => Err(anyhow::anyhow!(
-                    "CDC batch-load waiting for blocked table manual resync for {}",
-                    job.payload.source_table
-                )),
-                Err(err) => Err(anyhow::anyhow!(
-                    "failed to inspect CDC apply readiness for {}: {}",
-                    job.payload.source_table,
-                    err
-                )),
-            };
+        let result: anyhow::Result<()> = match self
+            .table_apply_readiness(&job.payload.source_table)
+            .await
+        {
+            Ok(CdcApplyReadiness::Ready) => self
+                .inner
+                .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+                .await
+                .map_err(anyhow::Error::from),
+            Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
+                "CDC batch-load waiting for snapshot handoff for {}",
+                job.payload.source_table
+            )),
+            Ok(CdcApplyReadiness::Blocked) => {
+                info!(
+                    component = "consumer",
+                    event = "cdc_consumer_job_skipped_blocked_table",
+                    connection_id = self.state_handle.connection_id(),
+                    job_id = %job_id,
+                    table = %table_key,
+                    "skipping queued CDC batch-load job because table is blocked until manual resync"
+                );
+                Ok(())
+            }
+            Err(err) => Err(anyhow::anyhow!(
+                "failed to inspect CDC apply readiness for {}: {}",
+                job.payload.source_table,
+                err
+            )),
+        };
         let _ = heartbeat_stop_tx.send(());
         let _ = heartbeat_handle.await;
 
