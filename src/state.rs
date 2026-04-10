@@ -421,6 +421,7 @@ impl SyncStateStore {
         ensure_table_exists(&mut conn, &self.schema, "cdc_batch_load_jobs").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_commit_fragments").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_watermark_state").await?;
+        ensure_table_exists(&mut conn, &self.schema, "cdc_feedback_state").await?;
         ensure_table_exists(&mut conn, &self.schema, "postgres_table_resync_requests").await?;
         Ok(())
     }

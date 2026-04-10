@@ -265,17 +265,17 @@ pub(super) async fn handle_primary_keepalive_reply(
     )
     .await?;
     if let Some(state_handle) = state_handle {
-        let mut watermark_state = state_handle
-            .load_cdc_watermark_state()
+        let mut feedback_state = state_handle
+            .load_cdc_feedback_state()
             .await?
             .unwrap_or_default();
         let now = chrono::Utc::now();
-        watermark_state.last_status_update_sent_at = Some(now);
-        watermark_state.last_keepalive_reply_at = Some(now);
-        watermark_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
-        watermark_state.updated_at = Some(now);
+        feedback_state.last_status_update_sent_at = Some(now);
+        feedback_state.last_keepalive_reply_at = Some(now);
+        feedback_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
+        feedback_state.updated_at = Some(now);
         state_handle
-            .save_cdc_watermark_state(&watermark_state)
+            .save_cdc_feedback_state(&feedback_state)
             .await?;
     }
     Ok(())

@@ -127,9 +127,9 @@ impl StateHandle {
             .await
     }
 
-    pub async fn save_cdc_watermark_state(&self, state: &CdcWatermarkState) -> anyhow::Result<()> {
+    pub async fn save_cdc_feedback_state(&self, state: &CdcWatermarkState) -> anyhow::Result<()> {
         self.store
-            .save_cdc_watermark_state(&self.connection_id, state)
+            .save_cdc_feedback_state(&self.connection_id, state)
             .await
     }
 
@@ -150,9 +150,9 @@ impl StateHandle {
             .await
     }
 
-    pub async fn load_cdc_watermark_state(&self) -> anyhow::Result<Option<CdcWatermarkState>> {
+    pub async fn load_cdc_feedback_state(&self) -> anyhow::Result<Option<CdcWatermarkState>> {
         self.store
-            .load_cdc_watermark_state(&self.connection_id)
+            .load_cdc_feedback_state(&self.connection_id)
             .await
     }
 

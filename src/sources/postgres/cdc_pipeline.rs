@@ -558,19 +558,18 @@ pub(super) async fn apply_cdc_watermark_advance(
     if let Some(state_handle) = runtime.state_handle {
         match timeout(CDC_STATE_SAVE_TIMEOUT, async {
             state_handle.save_postgres_cdc_state(cdc_state).await?;
-            let mut watermark_state = state_handle
-                .load_cdc_watermark_state()
+            let mut feedback_state = state_handle
+                .load_cdc_feedback_state()
                 .await?
                 .unwrap_or_default();
-            watermark_state.next_sequence_to_ack = advance.next_sequence_to_ack;
-            watermark_state.last_received_lsn = Some(last_received_lsn.to_string());
-            watermark_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
-            watermark_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
-            watermark_state.last_status_update_sent_at = Some(chrono::Utc::now());
-            watermark_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
-            watermark_state.updated_at = Some(chrono::Utc::now());
+            feedback_state.next_sequence_to_ack = advance.next_sequence_to_ack;
+            feedback_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
+            feedback_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
+            feedback_state.last_status_update_sent_at = Some(chrono::Utc::now());
+            feedback_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
+            feedback_state.updated_at = Some(chrono::Utc::now());
             state_handle
-                .save_cdc_watermark_state(&watermark_state)
+                .save_cdc_feedback_state(&feedback_state)
                 .await?;
             Ok::<(), anyhow::Error>(())
         })

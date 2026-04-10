@@ -133,40 +133,6 @@ impl SyncStateStore {
             .await?;
         }
 
-        if let Some(last_fragment) = fragments.last() {
-            let watermark_table = self.table("cdc_watermark_state");
-            let updated_at = now_millis();
-            sqlx::query(&format!(
-                r#"
-                insert into {watermark_table} (
-                    connection_id,
-                    next_sequence_to_ack,
-                    last_enqueued_sequence,
-                    last_received_lsn,
-                    last_relevant_change_seen_at,
-                    updated_at
-                ) values ($1, $2, $3, $4, $5, $6)
-                on conflict(connection_id) do update set
-                    last_enqueued_sequence = greatest(
-                        coalesce({watermark_table}.last_enqueued_sequence, 0),
-                        excluded.last_enqueued_sequence
-                    ),
-                    last_received_lsn = excluded.last_received_lsn,
-                    last_relevant_change_seen_at = excluded.last_relevant_change_seen_at,
-                    updated_at = excluded.updated_at
-                "#,
-                watermark_table = watermark_table,
-            ))
-            .bind(connection_id)
-            .bind(0_i64)
-            .bind(saturating_u64_to_i64(last_fragment.sequence))
-            .bind(&last_fragment.commit_lsn)
-            .bind(Utc::now().timestamp_millis())
-            .bind(updated_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-
         tx.commit().await?;
         cdc_batch_load_job_record_from_row(&row)
     }
@@ -703,7 +669,7 @@ impl SyncStateStore {
         Ok(())
     }
 
-    pub async fn save_cdc_watermark_state(
+    pub async fn save_cdc_feedback_state(
         &self,
         connection_id: &str,
         state: &CdcWatermarkState,
@@ -716,41 +682,28 @@ impl SyncStateStore {
             insert into {} (
                 connection_id,
                 next_sequence_to_ack,
-                last_enqueued_sequence,
-                last_received_lsn,
                 last_flushed_lsn,
                 last_persisted_lsn,
-                last_relevant_change_seen_at,
                 last_status_update_sent_at,
                 last_keepalive_reply_at,
                 last_slot_feedback_lsn,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8)
             on conflict(connection_id) do update set
                 next_sequence_to_ack = excluded.next_sequence_to_ack,
-                last_enqueued_sequence = excluded.last_enqueued_sequence,
-                last_received_lsn = excluded.last_received_lsn,
                 last_flushed_lsn = excluded.last_flushed_lsn,
                 last_persisted_lsn = excluded.last_persisted_lsn,
-                last_relevant_change_seen_at = excluded.last_relevant_change_seen_at,
                 last_status_update_sent_at = excluded.last_status_update_sent_at,
                 last_keepalive_reply_at = excluded.last_keepalive_reply_at,
                 last_slot_feedback_lsn = excluded.last_slot_feedback_lsn,
                 updated_at = excluded.updated_at
             "#,
-            self.table("cdc_watermark_state")
+            self.table("cdc_feedback_state")
         ))
         .bind(connection_id)
         .bind(saturating_u64_to_i64(state.next_sequence_to_ack))
-        .bind(state.last_enqueued_sequence.map(saturating_u64_to_i64))
-        .bind(state.last_received_lsn.clone())
         .bind(state.last_flushed_lsn.clone())
         .bind(state.last_persisted_lsn.clone())
-        .bind(
-            state
-                .last_relevant_change_seen_at
-                .map(|value| value.timestamp_millis()),
-        )
         .bind(
             state
                 .last_status_update_sent_at
@@ -772,6 +725,62 @@ impl SyncStateStore {
         &self,
         connection_id: &str,
     ) -> anyhow::Result<Option<CdcWatermarkState>> {
+        let legacy = self.load_legacy_cdc_watermark_state(connection_id).await?;
+        let enqueue = self.load_cdc_enqueue_state(connection_id).await?;
+        let feedback = self.load_cdc_feedback_state(connection_id).await?;
+        Ok(merge_cdc_watermark_state(legacy, enqueue, feedback))
+    }
+
+    pub async fn load_cdc_feedback_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<CdcWatermarkState>> {
+        let row = sqlx::query(&format!(
+            r#"
+            select next_sequence_to_ack,
+                   last_flushed_lsn, last_persisted_lsn,
+                   last_status_update_sent_at,
+                   last_keepalive_reply_at, last_slot_feedback_lsn,
+                   updated_at
+            from {}
+            where connection_id = $1
+            "#,
+            self.table("cdc_feedback_state")
+        ))
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let next_sequence_to_ack = row.try_get::<i64, _>("next_sequence_to_ack")?;
+            Ok(CdcWatermarkState {
+                next_sequence_to_ack: u64::try_from(next_sequence_to_ack)
+                    .context("cdc watermark next_sequence_to_ack must be non-negative")?,
+                last_enqueued_sequence: None,
+                last_received_lsn: None,
+                last_flushed_lsn: row.try_get("last_flushed_lsn")?,
+                last_persisted_lsn: row.try_get("last_persisted_lsn")?,
+                last_relevant_change_seen_at: None,
+                last_status_update_sent_at: row
+                    .try_get::<Option<i64>, _>("last_status_update_sent_at")?
+                    .and_then(datetime_from_millis),
+                last_keepalive_reply_at: row
+                    .try_get::<Option<i64>, _>("last_keepalive_reply_at")?
+                    .and_then(datetime_from_millis),
+                last_slot_feedback_lsn: row.try_get("last_slot_feedback_lsn")?,
+                updated_at: row
+                    .try_get::<i64, _>("updated_at")
+                    .ok()
+                    .and_then(datetime_from_millis),
+            })
+        })
+        .transpose()
+    }
+
+    async fn load_legacy_cdc_watermark_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<CdcWatermarkState>> {
         let row = sqlx::query(&format!(
             r#"
             select next_sequence_to_ack, last_enqueued_sequence, last_received_lsn,
@@ -788,35 +797,80 @@ impl SyncStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
+        row.map(|row| legacy_cdc_watermark_state_from_row(&row))
+            .transpose()
+    }
+
+    async fn load_cdc_enqueue_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<CdcWatermarkState>> {
+        let row = sqlx::query(&format!(
+            r#"
+            select sequence, commit_lsn, created_at
+            from (
+                (
+                select sequence, commit_lsn, created_at
+                from {}
+                where connection_id = $1
+                  and status = $2
+                order by sequence desc, created_at desc
+                limit 1
+                )
+
+                union all
+
+                (
+                select sequence, commit_lsn, created_at
+                from {}
+                where connection_id = $1
+                  and status = $3
+                order by sequence desc, created_at desc
+                limit 1
+                )
+
+                union all
+
+                (
+                select sequence, commit_lsn, created_at
+                from {}
+                where connection_id = $1
+                  and status = $4
+                order by sequence desc, created_at desc
+                limit 1
+                )
+            ) latest
+            order by sequence desc, created_at desc
+            limit 1
+            "#,
+            self.table("cdc_commit_fragments"),
+            self.table("cdc_commit_fragments"),
+            self.table("cdc_commit_fragments")
+        ))
+        .bind(connection_id)
+        .bind(CdcCommitFragmentStatus::Pending.as_str())
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .bind(CdcCommitFragmentStatus::Failed.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+
         row.map(|row| {
-            let next_sequence_to_ack = row.try_get::<i64, _>("next_sequence_to_ack")?;
+            let sequence = row.try_get::<i64, _>("sequence")?;
+            let created_at = row.try_get::<i64, _>("created_at").ok();
             Ok(CdcWatermarkState {
-                next_sequence_to_ack: u64::try_from(next_sequence_to_ack)
-                    .context("cdc watermark next_sequence_to_ack must be non-negative")?,
-                last_enqueued_sequence: row
-                    .try_get::<Option<i64>, _>("last_enqueued_sequence")?
-                    .map(|value| {
-                        u64::try_from(value)
-                            .context("cdc watermark last_enqueued_sequence must be non-negative")
-                    })
-                    .transpose()?,
-                last_received_lsn: row.try_get("last_received_lsn")?,
-                last_flushed_lsn: row.try_get("last_flushed_lsn")?,
-                last_persisted_lsn: row.try_get("last_persisted_lsn")?,
-                last_relevant_change_seen_at: row
-                    .try_get::<Option<i64>, _>("last_relevant_change_seen_at")?
-                    .and_then(datetime_from_millis),
-                last_status_update_sent_at: row
-                    .try_get::<Option<i64>, _>("last_status_update_sent_at")?
-                    .and_then(datetime_from_millis),
-                last_keepalive_reply_at: row
-                    .try_get::<Option<i64>, _>("last_keepalive_reply_at")?
-                    .and_then(datetime_from_millis),
-                last_slot_feedback_lsn: row.try_get("last_slot_feedback_lsn")?,
-                updated_at: row
-                    .try_get::<i64, _>("updated_at")
-                    .ok()
-                    .and_then(datetime_from_millis),
+                next_sequence_to_ack: 0,
+                last_enqueued_sequence: Some(
+                    u64::try_from(sequence)
+                        .context("cdc enqueue state last_enqueued_sequence must be non-negative")?,
+                ),
+                last_received_lsn: row.try_get("commit_lsn")?,
+                last_flushed_lsn: None,
+                last_persisted_lsn: None,
+                last_relevant_change_seen_at: created_at.and_then(datetime_from_millis),
+                last_status_update_sent_at: None,
+                last_keepalive_reply_at: None,
+                last_slot_feedback_lsn: None,
+                updated_at: created_at.and_then(datetime_from_millis),
             })
         })
         .transpose()
@@ -955,5 +1009,182 @@ impl SyncStateStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+fn legacy_cdc_watermark_state_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> anyhow::Result<CdcWatermarkState> {
+    let next_sequence_to_ack = row.try_get::<i64, _>("next_sequence_to_ack")?;
+    Ok(CdcWatermarkState {
+        next_sequence_to_ack: u64::try_from(next_sequence_to_ack)
+            .context("cdc watermark next_sequence_to_ack must be non-negative")?,
+        last_enqueued_sequence: row
+            .try_get::<Option<i64>, _>("last_enqueued_sequence")?
+            .map(|value| {
+                u64::try_from(value)
+                    .context("cdc watermark last_enqueued_sequence must be non-negative")
+            })
+            .transpose()?,
+        last_received_lsn: row.try_get("last_received_lsn")?,
+        last_flushed_lsn: row.try_get("last_flushed_lsn")?,
+        last_persisted_lsn: row.try_get("last_persisted_lsn")?,
+        last_relevant_change_seen_at: row
+            .try_get::<Option<i64>, _>("last_relevant_change_seen_at")?
+            .and_then(datetime_from_millis),
+        last_status_update_sent_at: row
+            .try_get::<Option<i64>, _>("last_status_update_sent_at")?
+            .and_then(datetime_from_millis),
+        last_keepalive_reply_at: row
+            .try_get::<Option<i64>, _>("last_keepalive_reply_at")?
+            .and_then(datetime_from_millis),
+        last_slot_feedback_lsn: row.try_get("last_slot_feedback_lsn")?,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .ok()
+            .and_then(datetime_from_millis),
+    })
+}
+
+fn merge_cdc_watermark_state(
+    legacy: Option<CdcWatermarkState>,
+    enqueue: Option<CdcWatermarkState>,
+    feedback: Option<CdcWatermarkState>,
+) -> Option<CdcWatermarkState> {
+    let base = match (legacy, enqueue) {
+        (None, None) => None,
+        (Some(legacy), None) => Some(legacy),
+        (None, Some(enqueue)) => Some(enqueue),
+        (Some(legacy), Some(enqueue)) => Some(CdcWatermarkState {
+            next_sequence_to_ack: legacy.next_sequence_to_ack,
+            last_enqueued_sequence: enqueue
+                .last_enqueued_sequence
+                .or(legacy.last_enqueued_sequence),
+            last_received_lsn: enqueue.last_received_lsn.or(legacy.last_received_lsn),
+            last_flushed_lsn: legacy.last_flushed_lsn,
+            last_persisted_lsn: legacy.last_persisted_lsn,
+            last_relevant_change_seen_at: enqueue
+                .last_relevant_change_seen_at
+                .or(legacy.last_relevant_change_seen_at),
+            last_status_update_sent_at: legacy.last_status_update_sent_at,
+            last_keepalive_reply_at: legacy.last_keepalive_reply_at,
+            last_slot_feedback_lsn: legacy.last_slot_feedback_lsn,
+            updated_at: match (legacy.updated_at, enqueue.updated_at) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            },
+        }),
+    };
+
+    match (base, feedback) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(feedback)) => Some(feedback),
+        (Some(base), Some(feedback)) => Some(CdcWatermarkState {
+            next_sequence_to_ack: feedback.next_sequence_to_ack,
+            last_enqueued_sequence: base.last_enqueued_sequence,
+            last_received_lsn: base.last_received_lsn,
+            last_flushed_lsn: feedback.last_flushed_lsn.or(base.last_flushed_lsn),
+            last_persisted_lsn: feedback.last_persisted_lsn.or(base.last_persisted_lsn),
+            last_relevant_change_seen_at: base
+                .last_relevant_change_seen_at
+                .or(feedback.last_relevant_change_seen_at),
+            last_status_update_sent_at: feedback
+                .last_status_update_sent_at
+                .or(base.last_status_update_sent_at),
+            last_keepalive_reply_at: feedback
+                .last_keepalive_reply_at
+                .or(base.last_keepalive_reply_at),
+            last_slot_feedback_lsn: feedback
+                .last_slot_feedback_lsn
+                .or(base.last_slot_feedback_lsn),
+            updated_at: match (base.updated_at, feedback.updated_at) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            },
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_cdc_watermark_state_prefers_feedback_fields_and_keeps_enqueue_fields() {
+        let legacy = CdcWatermarkState {
+            next_sequence_to_ack: 7,
+            last_enqueued_sequence: Some(11),
+            last_received_lsn: Some("0/BBB".to_string()),
+            last_flushed_lsn: Some("0/AAA".to_string()),
+            last_persisted_lsn: Some("0/AAA".to_string()),
+            last_relevant_change_seen_at: Some(Utc::now()),
+            last_status_update_sent_at: None,
+            last_keepalive_reply_at: None,
+            last_slot_feedback_lsn: None,
+            updated_at: Some(Utc::now()),
+        };
+        let feedback = CdcWatermarkState {
+            next_sequence_to_ack: 12,
+            last_enqueued_sequence: None,
+            last_received_lsn: None,
+            last_flushed_lsn: Some("0/CCC".to_string()),
+            last_persisted_lsn: Some("0/DDD".to_string()),
+            last_relevant_change_seen_at: None,
+            last_status_update_sent_at: Some(Utc::now()),
+            last_keepalive_reply_at: Some(Utc::now()),
+            last_slot_feedback_lsn: Some("0/EEE".to_string()),
+            updated_at: Some(Utc::now()),
+        };
+
+        let merged = merge_cdc_watermark_state(Some(legacy), None, Some(feedback))
+            .expect("merged watermark state");
+
+        assert_eq!(merged.next_sequence_to_ack, 12);
+        assert_eq!(merged.last_enqueued_sequence, Some(11));
+        assert_eq!(merged.last_received_lsn.as_deref(), Some("0/BBB"));
+        assert_eq!(merged.last_flushed_lsn.as_deref(), Some("0/CCC"));
+        assert_eq!(merged.last_persisted_lsn.as_deref(), Some("0/DDD"));
+        assert_eq!(merged.last_slot_feedback_lsn.as_deref(), Some("0/EEE"));
+        assert!(merged.last_status_update_sent_at.is_some());
+        assert!(merged.last_keepalive_reply_at.is_some());
+    }
+
+    #[test]
+    fn merge_cdc_watermark_state_prefers_append_only_enqueue_facts_over_legacy() {
+        let legacy = CdcWatermarkState {
+            next_sequence_to_ack: 3,
+            last_enqueued_sequence: Some(4),
+            last_received_lsn: Some("0/AAA".to_string()),
+            last_flushed_lsn: None,
+            last_persisted_lsn: None,
+            last_relevant_change_seen_at: None,
+            last_status_update_sent_at: None,
+            last_keepalive_reply_at: None,
+            last_slot_feedback_lsn: None,
+            updated_at: None,
+        };
+        let enqueue = CdcWatermarkState {
+            next_sequence_to_ack: 0,
+            last_enqueued_sequence: Some(9),
+            last_received_lsn: Some("0/BBB".to_string()),
+            last_flushed_lsn: None,
+            last_persisted_lsn: None,
+            last_relevant_change_seen_at: Some(Utc::now()),
+            last_status_update_sent_at: None,
+            last_keepalive_reply_at: None,
+            last_slot_feedback_lsn: None,
+            updated_at: Some(Utc::now()),
+        };
+
+        let merged = merge_cdc_watermark_state(Some(legacy), Some(enqueue), None)
+            .expect("merged watermark state");
+
+        assert_eq!(merged.next_sequence_to_ack, 3);
+        assert_eq!(merged.last_enqueued_sequence, Some(9));
+        assert_eq!(merged.last_received_lsn.as_deref(), Some("0/BBB"));
+        assert!(merged.last_relevant_change_seen_at.is_some());
     }
 }

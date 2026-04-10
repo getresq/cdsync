@@ -5,6 +5,7 @@ use cdsync::state::{
     CdcWatermarkState, ConnectionState, PostgresCdcState, SyncStateStore,
 };
 use cdsync::types::{DataType, SchemaFieldSnapshot, SnapshotChunkCheckpoint, TableCheckpoint};
+use chrono::Utc;
 use uuid::Uuid;
 
 fn test_state_config() -> Option<StateConfig> {
@@ -223,7 +224,7 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
         .await?;
 
     handle
-        .save_cdc_watermark_state(&CdcWatermarkState {
+        .save_cdc_feedback_state(&CdcWatermarkState {
             next_sequence_to_ack: 41,
             last_enqueued_sequence: Some(42),
             last_received_lsn: Some("0/AAB".to_string()),
@@ -245,8 +246,8 @@ async fn postgres_state_store_persists_cdc_fragments_and_watermark_state() -> an
     assert_eq!(fragments[0].sequence, 41);
     assert_eq!(fragments[1].sequence, 42);
 
-    let watermark = handle
-        .load_cdc_watermark_state()
+    let watermark = store
+        .load_cdc_watermark_state("app")
         .await?
         .expect("watermark state should be persisted");
     assert_eq!(watermark.next_sequence_to_ack, 41);
@@ -673,11 +674,90 @@ async fn postgres_state_store_enqueue_bundle_persists_job_fragments_and_watermar
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].fragment_id, fragment.fragment_id);
 
-    let watermark = handle.load_cdc_watermark_state().await?;
+    let watermark = store.load_cdc_watermark_state("app").await?;
     assert_eq!(
         watermark.and_then(|state| state.last_enqueued_sequence),
         Some(42)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_composes_enqueue_and_feedback_watermark_state() -> anyhow::Result<()>
+{
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-compose".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 77,
+        status: CdcBatchLoadJobStatus::Pending,
+        payload_json: "{\"v\":1}".to_string(),
+        attempt_count: 0,
+        retry_class: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-compose:77".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 77,
+        commit_lsn: "0/BEE".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Pending,
+        row_count: 10,
+        upserted_count: 10,
+        deleted_count: 0,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    handle
+        .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+        .await?;
+
+    handle
+        .save_cdc_feedback_state(&CdcWatermarkState {
+            next_sequence_to_ack: 77,
+            last_enqueued_sequence: None,
+            last_received_lsn: None,
+            last_flushed_lsn: Some("0/BEF".to_string()),
+            last_persisted_lsn: Some("0/BEF".to_string()),
+            last_relevant_change_seen_at: None,
+            last_status_update_sent_at: Some(Utc::now()),
+            last_keepalive_reply_at: Some(Utc::now()),
+            last_slot_feedback_lsn: Some("0/BEF".to_string()),
+            updated_at: Some(Utc::now()),
+        })
+        .await?;
+
+    let watermark = store
+        .load_cdc_watermark_state("app")
+        .await?
+        .expect("watermark state should be composed");
+    let feedback = handle
+        .load_cdc_feedback_state()
+        .await?
+        .expect("feedback state should be persisted");
+    assert_eq!(watermark.next_sequence_to_ack, 77);
+    assert_eq!(watermark.last_enqueued_sequence, Some(77));
+    assert_eq!(watermark.last_received_lsn.as_deref(), Some("0/BEE"));
+    assert_eq!(watermark.last_flushed_lsn.as_deref(), Some("0/BEF"));
+    assert_eq!(watermark.last_persisted_lsn.as_deref(), Some("0/BEF"));
+    assert!(watermark.last_status_update_sent_at.is_some());
+    assert!(watermark.last_keepalive_reply_at.is_some());
+    assert_eq!(watermark.last_slot_feedback_lsn.as_deref(), Some("0/BEF"));
+    assert_eq!(feedback.next_sequence_to_ack, 77);
+    assert_eq!(feedback.last_enqueued_sequence, None);
+    assert_eq!(feedback.last_received_lsn, None);
 
     Ok(())
 }
