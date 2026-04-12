@@ -289,7 +289,8 @@ pub(super) fn build_cdc_progress_insight(
         (
             "watch",
             "unattributed_wal_gap",
-            "WAL is behind confirmed flush, but no queued CDC work is attributed yet".to_string(),
+            "Current WAL is ahead of confirmed flush while no queued CDC work is visible"
+                .to_string(),
         )
     } else if pending_fragments.unwrap_or_default() > 0
         || pending_jobs.unwrap_or_default() > 0

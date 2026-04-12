@@ -11,6 +11,64 @@ pub(super) struct CdcIdleState {
     pub(super) inflight_apply_empty: bool,
 }
 
+pub(super) struct CdcKeepaliveFeedbackState {
+    pub(super) in_tx: bool,
+    pub(super) pending_events_empty: bool,
+    pub(super) queued_batches_empty: bool,
+    pub(super) pending_table_batches_empty: bool,
+    pub(super) inflight_dispatch_empty: bool,
+    pub(super) inflight_apply_empty: bool,
+    pub(super) active_table_applies_empty: bool,
+    pub(super) coordinator_inflight_commits: usize,
+    pub(super) durable_backlog_empty: bool,
+}
+
+impl CdcKeepaliveFeedbackState {
+    fn can_ack_idle_wal(&self) -> bool {
+        !self.in_tx
+            && self.pending_events_empty
+            && self.queued_batches_empty
+            && self.pending_table_batches_empty
+            && self.inflight_dispatch_empty
+            && self.inflight_apply_empty
+            && self.active_table_applies_empty
+            && self.coordinator_inflight_commits == 0
+            && self.durable_backlog_empty
+    }
+}
+
+pub(super) fn cdc_keepalive_feedback_lsn(
+    last_received_lsn: etl::types::PgLsn,
+    last_flushed_lsn: etl::types::PgLsn,
+    state: &CdcKeepaliveFeedbackState,
+) -> etl::types::PgLsn {
+    if state.can_ack_idle_wal() && last_received_lsn > last_flushed_lsn {
+        last_received_lsn
+    } else {
+        last_flushed_lsn
+    }
+}
+
+pub(super) async fn cdc_durable_idle_backlog_empty(
+    slot_name: &str,
+    state_handle: Option<&StateHandle>,
+) -> bool {
+    let Some(state_handle) = state_handle else {
+        return true;
+    };
+    match state_handle.load_cdc_coordinator_summary(None).await {
+        Ok(summary) => summary.pending_fragments == 0 && summary.failed_fragments == 0,
+        Err(err) => {
+            warn!(
+                slot_name = slot_name,
+                error = %err,
+                "failed to inspect durable CDC backlog before idle keepalive feedback"
+            );
+            false
+        }
+    }
+}
+
 pub(super) fn next_cdc_wait_timeout(
     idle_timeout: Duration,
     apply_max_fill: Duration,
@@ -319,29 +377,38 @@ pub(super) async fn handle_primary_keepalive_reply(
     wal_end: etl::types::PgLsn,
     last_received_lsn: etl::types::PgLsn,
     last_flushed_lsn: etl::types::PgLsn,
+    last_feedback_lsn: &mut etl::types::PgLsn,
+    feedback_lsn: etl::types::PgLsn,
+    force: bool,
     mut stream: Pin<&mut EventsStream>,
     state_handle: Option<&StateHandle>,
 ) -> Result<()> {
     info!(
-        event = "cdc_keepalive_reply_requested",
+        event = "cdc_keepalive_feedback",
         component = "coordinator",
         slot_name = slot_name,
         wal_end = %wal_end,
         last_received_lsn = %last_received_lsn,
         last_flushed_lsn = %last_flushed_lsn,
-        "postgres requested logical replication keepalive reply"
+        last_feedback_lsn = %*last_feedback_lsn,
+        feedback_lsn = %feedback_lsn,
+        force,
+        "sending logical replication keepalive feedback"
     );
     await_cdc_timeout(
         format!("sending CDC keepalive status update for slot {slot_name}"),
         CDC_STATUS_UPDATE_TIMEOUT,
         stream.as_mut().send_status_update(
             last_received_lsn,
-            last_flushed_lsn,
-            true,
+            feedback_lsn,
+            force,
             StatusUpdateType::KeepAlive,
         ),
     )
     .await?;
+    if feedback_lsn > *last_feedback_lsn {
+        *last_feedback_lsn = feedback_lsn;
+    }
     if let Some(state_handle) = state_handle {
         let mut feedback_state = state_handle
             .load_cdc_feedback_state()
@@ -349,9 +416,11 @@ pub(super) async fn handle_primary_keepalive_reply(
             .unwrap_or_default();
         let now = chrono::Utc::now();
         feedback_state.last_received_lsn = Some(last_received_lsn.to_string());
+        feedback_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
+        feedback_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
         feedback_state.last_status_update_sent_at = Some(now);
         feedback_state.last_keepalive_reply_at = Some(now);
-        feedback_state.last_slot_feedback_lsn = Some(last_flushed_lsn.to_string());
+        feedback_state.last_slot_feedback_lsn = Some(feedback_lsn.to_string());
         feedback_state.updated_at = Some(now);
         state_handle
             .save_cdc_feedback_state(&feedback_state)
@@ -520,6 +589,78 @@ pub(super) async fn finalize_cdc_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keepalive_feedback_advances_idle_flush_to_received_lsn() {
+        let state = CdcKeepaliveFeedbackState {
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: true,
+            pending_table_batches_empty: true,
+            inflight_dispatch_empty: true,
+            inflight_apply_empty: true,
+            active_table_applies_empty: true,
+            coordinator_inflight_commits: 0,
+            durable_backlog_empty: true,
+        };
+
+        assert_eq!(
+            cdc_keepalive_feedback_lsn(
+                etl::types::PgLsn::from(0x20_u64),
+                etl::types::PgLsn::from(0x10_u64),
+                &state,
+            ),
+            etl::types::PgLsn::from(0x20_u64)
+        );
+    }
+
+    #[test]
+    fn keepalive_feedback_keeps_durable_frontier_when_work_is_inflight() {
+        let state = CdcKeepaliveFeedbackState {
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: true,
+            pending_table_batches_empty: true,
+            inflight_dispatch_empty: true,
+            inflight_apply_empty: false,
+            active_table_applies_empty: false,
+            coordinator_inflight_commits: 1,
+            durable_backlog_empty: true,
+        };
+
+        assert_eq!(
+            cdc_keepalive_feedback_lsn(
+                etl::types::PgLsn::from(0x20_u64),
+                etl::types::PgLsn::from(0x10_u64),
+                &state,
+            ),
+            etl::types::PgLsn::from(0x10_u64)
+        );
+    }
+
+    #[test]
+    fn keepalive_feedback_keeps_durable_frontier_when_durable_backlog_exists() {
+        let state = CdcKeepaliveFeedbackState {
+            in_tx: false,
+            pending_events_empty: true,
+            queued_batches_empty: true,
+            pending_table_batches_empty: true,
+            inflight_dispatch_empty: true,
+            inflight_apply_empty: true,
+            active_table_applies_empty: true,
+            coordinator_inflight_commits: 0,
+            durable_backlog_empty: false,
+        };
+
+        assert_eq!(
+            cdc_keepalive_feedback_lsn(
+                etl::types::PgLsn::from(0x20_u64),
+                etl::types::PgLsn::from(0x10_u64),
+                &state,
+            ),
+            etl::types::PgLsn::from(0x10_u64)
+        );
+    }
 
     fn test_state_config() -> Option<crate::config::StateConfig> {
         let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;

@@ -523,6 +523,35 @@ fn cdc_progress_insight_treats_legacy_unclassified_failures_as_watch() {
 }
 
 #[test]
+fn cdc_progress_insight_describes_idle_wal_gap_direction() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: Some("0/20".to_string()),
+        restart_lsn: Some("0/10".to_string()),
+        confirmed_flush_lsn: Some("0/10".to_string()),
+        wal_bytes_retained_by_slot: Some(16),
+        wal_bytes_behind_confirmed: Some(16),
+    };
+
+    let insight = build_cdc_progress_insight(
+        &cdc,
+        Some(&CdcBatchLoadQueueSummary::default()),
+        Some(&CdcCoordinatorSummary::default()),
+    )
+    .expect("progress insight");
+
+    assert_eq!(insight.status, "watch");
+    assert_eq!(insight.primary_blocker, "unattributed_wal_gap");
+    assert_eq!(
+        insight.detail,
+        "Current WAL is ahead of confirmed flush while no queued CDC work is visible"
+    );
+}
+
+#[test]
 fn build_table_progress_prefers_table_runtime_retry_state() {
     let connection = test_postgres_cdc_connection();
     let mut state = ConnectionState {

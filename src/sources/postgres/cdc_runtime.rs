@@ -70,6 +70,7 @@ impl PostgresSource {
         let mut pending_stats: HashMap<TableId, usize> = HashMap::new();
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
+        let mut last_feedback_lsn = start_lsn;
         let mut last_xlog_activity = Instant::now();
         let mut last_replication_message = Instant::now();
         let mut last_heartbeat_log = Instant::now();
@@ -486,12 +487,45 @@ impl PostgresSource {
                     if wal_end > last_received_lsn {
                         last_received_lsn = wal_end;
                     }
-                    if keepalive.reply() == 1 {
+                    let coordinator_inflight_commits =
+                        coordinator_inflight_commits(&coordinator_state_rx);
+                    let in_memory_idle = !in_tx
+                        && pending_events.is_empty()
+                        && queued_batches.is_empty()
+                        && pending_table_batches.is_empty()
+                        && inflight_dispatch.is_empty()
+                        && inflight_apply.is_empty()
+                        && active_table_applies.is_empty()
+                        && coordinator_inflight_commits == 0;
+                    let durable_backlog_empty = if in_memory_idle {
+                        cdc_durable_idle_backlog_empty(slot_name, state_handle.as_ref()).await
+                    } else {
+                        false
+                    };
+                    let feedback_lsn = cdc_keepalive_feedback_lsn(
+                        last_received_lsn,
+                        last_flushed_lsn,
+                        &CdcKeepaliveFeedbackState {
+                            in_tx,
+                            pending_events_empty: pending_events.is_empty(),
+                            queued_batches_empty: queued_batches.is_empty(),
+                            pending_table_batches_empty: pending_table_batches.is_empty(),
+                            inflight_dispatch_empty: inflight_dispatch.is_empty(),
+                            inflight_apply_empty: inflight_apply.is_empty(),
+                            active_table_applies_empty: active_table_applies.is_empty(),
+                            coordinator_inflight_commits,
+                            durable_backlog_empty,
+                        },
+                    );
+                    if keepalive.reply() == 1 || feedback_lsn > last_feedback_lsn {
                         handle_primary_keepalive_reply(
                             slot_name,
                             wal_end,
                             last_received_lsn,
                             last_flushed_lsn,
+                            &mut last_feedback_lsn,
+                            feedback_lsn,
+                            keepalive.reply() == 1,
                             stream.as_mut(),
                             state_handle.as_ref(),
                         )
