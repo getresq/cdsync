@@ -8,6 +8,7 @@ use super::*;
 const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
+const CDC_IDLE_KEEPALIVE_FEEDBACK_INTERVAL: Duration = Duration::from_secs(10);
 
 fn next_cdc_commit_sequence_from_watermark(
     watermark: Option<&crate::state::CdcWatermarkState>,
@@ -71,6 +72,7 @@ impl PostgresSource {
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
         let mut last_feedback_lsn = start_lsn;
+        let mut last_idle_keepalive_feedback = Instant::now();
         let mut last_xlog_activity = Instant::now();
         let mut last_replication_message = Instant::now();
         let mut last_heartbeat_log = Instant::now();
@@ -517,7 +519,11 @@ impl PostgresSource {
                             durable_backlog_empty,
                         },
                     );
-                    if keepalive.reply() == 1 || feedback_lsn > last_feedback_lsn {
+                    let force_keepalive_reply = keepalive.reply() == 1;
+                    let idle_feedback_due = feedback_lsn > last_feedback_lsn
+                        && last_idle_keepalive_feedback.elapsed()
+                            >= CDC_IDLE_KEEPALIVE_FEEDBACK_INTERVAL;
+                    if force_keepalive_reply || idle_feedback_due {
                         handle_primary_keepalive_reply(
                             slot_name,
                             wal_end,
@@ -525,11 +531,12 @@ impl PostgresSource {
                             last_flushed_lsn,
                             &mut last_feedback_lsn,
                             feedback_lsn,
-                            keepalive.reply() == 1,
+                            force_keepalive_reply,
                             stream.as_mut(),
                             state_handle.as_ref(),
                         )
                         .await?;
+                        last_idle_keepalive_feedback = Instant::now();
                     }
                 }
                 ReplicationMessage::XLogData(xlog) => {
