@@ -1,5 +1,12 @@
 # Next
 
+## Staging BigQuery `totalRows` Decode Backlog
+
+- [x] Confirm `jobs.getQueryResults` decode fails before local query-response normalization when BigQuery omits `totalRows`.
+- [x] Add a lenient `getQueryResults` fetch path for completed DML/MERGE query jobs.
+- [x] Add regression coverage for missing `totalRows` in completed query results.
+- [x] Run focused CDSync checks.
+
 ## Milestone 3: Partial Snapshot + CDC Overlap
 
 Goal:

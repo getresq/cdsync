@@ -11,12 +11,10 @@ use chrono::{DateTime, Utc};
 use gcloud_bigquery::client::google_cloud_auth::credentials::CredentialsFile;
 use gcloud_bigquery::client::google_cloud_auth::project::Config as GoogleAuthConfig;
 use gcloud_bigquery::client::google_cloud_auth::token::DefaultTokenSourceProvider;
-use gcloud_bigquery::client::{Client, ClientConfig};
+use gcloud_bigquery::client::{Client, ClientConfig, HttpClientConfig};
 use gcloud_bigquery::http::error::Error as BqError;
 use gcloud_bigquery::http::job::get::GetJobRequest;
-use gcloud_bigquery::http::job::get_query_results::{
-    GetQueryResultsRequest, GetQueryResultsResponse,
-};
+use gcloud_bigquery::http::job::get_query_results::GetQueryResultsRequest;
 use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
 use gcloud_bigquery::http::job::{Job, JobReference, JobState};
 use gcloud_bigquery::http::table::{
@@ -48,6 +46,8 @@ use self::values::{
 #[derive(Clone)]
 pub struct BigQueryDestination {
     client: Client,
+    bq_http_token_source: Option<Arc<dyn TokenSource>>,
+    bq_query_results_base_url: String,
     gcs_token_source: Option<Arc<dyn TokenSource>>,
     config: BigQueryConfig,
     dry_run: bool,
@@ -113,9 +113,13 @@ impl BigQueryDestination {
             anyhow::bail!("bigquery.emulator_grpc requires emulator_http");
         }
 
-        let (client_config, gcs_token_source, _project_from_auth) = if let Some(raw_http) =
-            &config.emulator_http
-        {
+        let (
+            client_config,
+            bq_http_token_source,
+            bq_query_results_base_url,
+            gcs_token_source,
+            _project_from_auth,
+        ) = if let Some(raw_http) = &config.emulator_http {
             let emulator_http = if raw_http.contains("://") {
                 raw_http.to_string()
             } else {
@@ -149,10 +153,22 @@ impl BigQueryDestination {
             (
                 ClientConfig::new_with_emulator(&emulator_grpc, emulator_http),
                 None,
+                format!(
+                    "{}/bigquery/v2",
+                    config
+                        .emulator_http
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                ),
+                None,
                 None,
             )
         } else if let Some(path) = &config.service_account_key_path {
             let key = CredentialsFile::new_from_file(path.to_string_lossy().to_string()).await?;
+            let bq_http_token_source = HttpClientConfig::default_token_provider_with(key.clone())
+                .await?
+                .token_source();
             let (bq_config, project) = ClientConfig::new_with_credentials(key.clone()).await?;
             let token_source = DefaultTokenSourceProvider::new_with_credentials(
                 GoogleAuthConfig::default()
@@ -160,29 +176,55 @@ impl BigQueryDestination {
                 Box::new(key),
             )
             .await?;
-            (bq_config, Some(token_source.token_source()), project)
+            (
+                bq_config,
+                Some(bq_http_token_source),
+                "https://bigquery.googleapis.com/bigquery/v2".to_string(),
+                Some(token_source.token_source()),
+                project,
+            )
         } else if let Some(raw_key) = &config.service_account_key {
             let key = CredentialsFile::new_from_str(raw_key).await?;
-            let (bq_config, project) = ClientConfig::new_with_credentials(key).await?;
+            let bq_http_token_source = HttpClientConfig::default_token_provider_with(key.clone())
+                .await?
+                .token_source();
+            let (bq_config, project) = ClientConfig::new_with_credentials(key.clone()).await?;
             let token_source = DefaultTokenSourceProvider::new_with_credentials(
                 GoogleAuthConfig::default()
                     .with_scopes(&["https://www.googleapis.com/auth/devstorage.read_write"]),
-                Box::new(CredentialsFile::new_from_str(raw_key).await?),
+                Box::new(key),
             )
             .await?;
-            (bq_config, Some(token_source.token_source()), project)
+            (
+                bq_config,
+                Some(bq_http_token_source),
+                "https://bigquery.googleapis.com/bigquery/v2".to_string(),
+                Some(token_source.token_source()),
+                project,
+            )
         } else {
+            let bq_http_token_source = HttpClientConfig::default_token_provider()
+                .await?
+                .token_source();
             let (bq_config, project) = ClientConfig::new_with_auth().await?;
             let token_source = DefaultTokenSourceProvider::new(
                 GoogleAuthConfig::default()
                     .with_scopes(&["https://www.googleapis.com/auth/devstorage.read_write"]),
             )
             .await?;
-            (bq_config, Some(token_source.token_source()), project)
+            (
+                bq_config,
+                Some(bq_http_token_source),
+                "https://bigquery.googleapis.com/bigquery/v2".to_string(),
+                Some(token_source.token_source()),
+                project,
+            )
         };
         let client = Client::new(client_config).await?;
         Ok(Self {
             client,
+            bq_http_token_source,
+            bq_query_results_base_url,
             gcs_token_source,
             config,
             dry_run,
@@ -500,28 +542,18 @@ impl BigQueryDestination {
             .location
             .clone()
             .or_else(|| self.config.location.clone());
-        let project_id = query_job_project_id(&self.config.project_id, job_reference);
-        let result = BigQueryDestination::await_with_timeout(
-            format!(
-                "fetching BigQuery query results for {}",
-                job_reference.job_id
-            ),
-            BIGQUERY_REQUEST_TIMEOUT,
-            self.client.job().get_query_results(
-                project_id,
-                &job_reference.job_id,
-                &GetQueryResultsRequest {
-                    start_index: 0,
-                    page_token: None,
-                    max_results: None,
-                    timeout_ms: Some(BIGQUERY_QUERY_REQUEST_TIMEOUT.as_millis() as i64),
-                    location,
-                    format_options: None,
-                },
-            ),
+        let token_source = self
+            .bq_http_token_source
+            .as_ref()
+            .context("missing BigQuery HTTP token source")?;
+        fetch_query_results_response_from_http(
+            token_source.as_ref(),
+            &self.bq_query_results_base_url,
+            &self.config.project_id,
+            job_reference,
+            location,
         )
-        .await?;
-        get_query_results_to_query_response(result)
+        .await
     }
 
     async fn ensure_table_internal(
@@ -1501,50 +1533,127 @@ fn query_job_project_id<'a>(fallback: &'a str, job_reference: &'a JobReference) 
     }
 }
 
-fn get_query_results_to_query_response(result: GetQueryResultsResponse) -> Result<QueryResponse> {
+async fn fetch_query_results_response_from_http(
+    token_source: &dyn TokenSource,
+    base_url: &str,
+    fallback_project_id: &str,
+    job_reference: &JobReference,
+    location: Option<String>,
+) -> Result<QueryResponse> {
+    let project_id = query_job_project_id(fallback_project_id, job_reference);
+    let token = token_source
+        .token()
+        .await
+        .map_err(|err| anyhow::anyhow!("BigQuery HTTP token source failed: {err}"))?;
+    let mut url = Url::parse(base_url).context("building BigQuery getQueryResults URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("BigQuery getQueryResults URL cannot be a base"))?
+        .extend([
+            "projects",
+            project_id,
+            "queries",
+            job_reference.job_id.as_str(),
+        ]);
+    let request = GetQueryResultsRequest {
+        start_index: 0,
+        page_token: None,
+        max_results: None,
+        timeout_ms: Some(BIGQUERY_QUERY_REQUEST_TIMEOUT.as_millis() as i64),
+        location,
+        format_options: None,
+    };
+    let response = BigQueryDestination::await_with_timeout(
+        format!(
+            "fetching BigQuery query results for {}",
+            job_reference.job_id
+        ),
+        BIGQUERY_REQUEST_TIMEOUT,
+        reqwest::Client::new()
+            .get(url)
+            .header("X-Goog-Api-Client", "rust")
+            .header(reqwest::header::USER_AGENT, "google-cloud-bigquery")
+            .header(reqwest::header::AUTHORIZATION, token)
+            .query(&request)
+            .send(),
+    )
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = BigQueryDestination::await_with_timeout(
+            format!(
+                "decoding BigQuery query results error for {}",
+                job_reference.job_id
+            ),
+            BIGQUERY_REQUEST_TIMEOUT,
+            response.text(),
+        )
+        .await
+        .unwrap_or_else(|err| format!("<failed to decode response body: {err}>"));
+        anyhow::bail!(
+            "fetching BigQuery query results for {} failed with {}: {}",
+            job_reference.job_id,
+            status,
+            body
+        );
+    }
+    let result = BigQueryDestination::await_with_timeout(
+        format!(
+            "decoding BigQuery query results for {}",
+            job_reference.job_id
+        ),
+        BIGQUERY_REQUEST_TIMEOUT,
+        response.json::<QueryResponse>(),
+    )
+    .await?;
+    get_query_results_to_query_response(result)
+}
+
+fn get_query_results_to_query_response(result: QueryResponse) -> Result<QueryResponse> {
     if !result.job_complete {
         anyhow::bail!(
             "BigQuery query results for job {} were still incomplete after job reached DONE",
             result.job_reference.job_id
         );
     }
-    Ok(QueryResponse {
-        kind: result.kind,
-        schema: result.schema,
-        job_reference: result.job_reference,
-        total_rows: Some(result.total_rows),
-        page_token: result.page_token,
-        rows: result.rows,
-        total_bytes_processed: result.total_bytes_processed,
-        job_complete: result.job_complete,
-        errors: result.errors,
-        cache_hit: result.cache_hit,
-        num_dml_affected_rows: result.num_dml_affected_rows,
-        session_info: None,
-        dml_stats: None,
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, cdc_reducer_merge_sql,
-        drain_cleanup_task_handles, get_query_results_to_query_response, query_job_completed,
+        drain_cleanup_task_handles, fetch_query_results_response_from_http,
+        get_query_results_to_query_response, query_job_completed,
         reap_finished_cleanup_task_handles, stable_query_request_id, upsert_staging_table_id,
     };
     use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
     use gcloud_bigquery::http::error::Error as BqError;
-    use gcloud_bigquery::http::job::get_query_results::GetQueryResultsResponse;
     use gcloud_bigquery::http::job::query::QueryResponse;
     use gcloud_bigquery::http::job::{
         Job, JobConfiguration, JobReference, JobState, JobStatus, JobType,
     };
+    use serde_json::json;
     use std::future::pending;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use token_source::TokenSource;
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Debug)]
+    struct StaticTokenSource(&'static str);
+
+    #[async_trait::async_trait]
+    impl TokenSource for StaticTokenSource {
+        async fn token(
+            &self,
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.to_string())
+        }
+    }
 
     #[test]
     fn upsert_staging_table_id_is_unique_per_write() {
@@ -1690,14 +1799,14 @@ mod tests {
 
     #[test]
     fn get_query_results_response_preserves_final_rows() {
-        let response = get_query_results_to_query_response(GetQueryResultsResponse {
+        let response = get_query_results_to_query_response(QueryResponse {
             kind: "bigquery#queryResponse".to_string(),
             job_reference: JobReference {
                 project_id: "result-project".to_string(),
                 job_id: "query_job_1".to_string(),
                 location: Some("US".to_string()),
             },
-            total_rows: 2,
+            total_rows: Some(2),
             job_complete: true,
             ..Default::default()
         })
@@ -1709,8 +1818,72 @@ mod tests {
     }
 
     #[test]
+    fn get_query_results_response_allows_completed_dml_without_total_rows() {
+        let response: QueryResponse = serde_json::from_value(serde_json::json!({
+            "kind": "bigquery#queryResponse",
+            "jobReference": {
+                "projectId": "result-project",
+                "jobId": "query_job_1",
+                "location": "US"
+            },
+            "jobComplete": true,
+            "numDmlAffectedRows": "12"
+        }))
+        .expect("query results response");
+
+        let response =
+            get_query_results_to_query_response(response).expect("query results response");
+
+        assert!(response.job_complete);
+        assert_eq!(response.total_rows, None);
+        assert_eq!(response.num_dml_affected_rows, Some(12));
+        assert_eq!(response.job_reference.job_id, "query_job_1");
+    }
+
+    #[tokio::test]
+    async fn fetch_query_results_response_allows_http_dml_without_total_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/result-project/queries/query_job_1"))
+            .and(query_param("location", "US"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "bigquery#queryResponse",
+                "jobReference": {
+                    "projectId": "result-project",
+                    "jobId": "query_job_1",
+                    "location": "US"
+                },
+                "jobComplete": true,
+                "numDmlAffectedRows": "12"
+            })))
+            .mount(&server)
+            .await;
+
+        let token_source = StaticTokenSource("Bearer test-token");
+        let response = fetch_query_results_response_from_http(
+            &token_source,
+            &server.uri(),
+            "fallback-project",
+            &JobReference {
+                project_id: "result-project".to_string(),
+                job_id: "query_job_1".to_string(),
+                location: Some("US".to_string()),
+            },
+            Some("US".to_string()),
+        )
+        .await
+        .expect("query results response");
+
+        assert!(response.job_complete);
+        assert_eq!(response.total_rows, None);
+        assert_eq!(response.num_dml_affected_rows, Some(12));
+        assert_eq!(response.job_reference.job_id, "query_job_1");
+    }
+
+    #[test]
     fn get_query_results_response_rejects_incomplete_results() {
-        let err = get_query_results_to_query_response(GetQueryResultsResponse {
+        let err = get_query_results_to_query_response(QueryResponse {
             job_reference: JobReference {
                 project_id: "project".to_string(),
                 job_id: "query_job_1".to_string(),
