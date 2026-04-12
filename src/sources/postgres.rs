@@ -217,6 +217,9 @@ struct CdcStreamConfig<'a> {
     apply_batch_size: usize,
     apply_max_fill: Duration,
     apply_concurrency: usize,
+    max_inflight_commits: usize,
+    backlog_max_pending_fragments: Option<usize>,
+    backlog_max_oldest_pending: Option<Duration>,
     follow: bool,
     shutdown: Option<ShutdownSignal>,
 }

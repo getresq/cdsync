@@ -3,6 +3,27 @@ use crate::destinations::bigquery;
 use crate::retry::{SyncRetryClass, classify_sync_retry, compute_sync_retry_backoff};
 use crate::types::TableCheckpoint;
 use crate::types::TableRuntimeStatus;
+use tokio::time::timeout;
+
+async fn cdc_batch_load_job_with_timeout<F>(
+    duration: Duration,
+    job_id: &str,
+    table_key: &str,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    match timeout(duration, future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "CDC batch-load job {} for {} exceeded hard timeout of {}s",
+            job_id,
+            table_key,
+            duration.as_secs()
+        )),
+    }
+}
 
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
@@ -34,6 +55,18 @@ fn stable_cdc_batch_load_fragment_id(job_id: &str, sequence: u64) -> String {
     format!("{job_id}:{sequence}")
 }
 
+fn stable_cdc_batch_load_job_step_load_job_id(
+    job_id: &str,
+    step_kind: CdcBatchLoadStepKind,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(job_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(step_kind.as_str().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("cdsync_load_{}", &digest[..24])
+}
+
 fn stable_cdc_batch_load_object_name(
     prefix: Option<&str>,
     target_table: &str,
@@ -42,6 +75,45 @@ fn stable_cdc_batch_load_object_name(
 ) -> String {
     let suffix = format!("{}_{}", step_kind.as_str(), job_id);
     bigquery::stable_cdc_batch_load_object_name(prefix, target_table, &suffix)
+}
+
+#[derive(Clone, Copy)]
+enum CdcBatchLoadStagingStrategy {
+    PerJob,
+}
+
+impl CdcBatchLoadStagingStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PerJob => "per_job",
+        }
+    }
+}
+
+const CDC_BATCH_LOAD_STAGING_STRATEGY: CdcBatchLoadStagingStrategy =
+    CdcBatchLoadStagingStrategy::PerJob;
+
+fn cdc_batch_load_ledger_metadata_json(payload: &CdcBatchLoadJobPayload) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "staging_strategy": CDC_BATCH_LOAD_STAGING_STRATEGY.as_str(),
+        "scalar_metadata": "first_step_hints",
+        "steps": payload.steps.iter().map(|step| serde_json::json!({
+            "staging_table": &step.staging_table,
+            "object_uri": &step.object_uri,
+            "load_job_id": &step.load_job_id,
+            "row_count": step.row_count,
+            "upserted_count": step.upserted_count,
+            "deleted_count": step.deleted_count,
+        })).collect::<Vec<_>>(),
+    }))
+    .ok()
+}
+
+fn sequence_by_commit_lsn(fragments: &[CdcCommitFragmentMeta]) -> HashMap<String, u64> {
+    fragments
+        .iter()
+        .map(|fragment| (fragment.commit_lsn.clone(), fragment.sequence))
+        .collect()
 }
 
 fn should_resolve_cdc_batch_load_waiters(
@@ -84,6 +156,67 @@ pub(super) fn should_check_table_apply_readiness(mixed_mode_gate_enabled: bool) 
     mixed_mode_gate_enabled
 }
 
+impl CdcQueuedBatchLoadWindow {
+    fn first(&self) -> Option<&CdcQueuedBatchLoadJob> {
+        self.jobs.first()
+    }
+
+    fn table_key(&self) -> &str {
+        self.first().map_or("", |job| job.record.table_key.as_str())
+    }
+
+    fn first_sequence(&self) -> u64 {
+        self.first()
+            .map(|job| job.record.first_sequence)
+            .unwrap_or_default()
+    }
+
+    fn job_ids(&self) -> Vec<String> {
+        self.jobs
+            .iter()
+            .map(|job| job.record.job_id.clone())
+            .collect()
+    }
+
+    fn merged_payload(&self) -> EtlResult<CdcBatchLoadJobPayload> {
+        let first = self.first().ok_or_else(|| {
+            etl::etl_error!(
+                ErrorKind::DestinationError,
+                "CDC reducer window contained no jobs"
+            )
+        })?;
+        let mut payload = first.payload.clone();
+        payload.job_id = first.record.job_id.clone();
+        payload.truncate = false;
+        payload.steps.clear();
+
+        for job in &self.jobs {
+            if job.payload.source_table != first.payload.source_table
+                || job.payload.target_table != first.payload.target_table
+                || job.payload.primary_key != first.payload.primary_key
+            {
+                return Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "CDC reducer window contained mixed table payloads"
+                ));
+            }
+            if job.payload.truncate && self.jobs.len() > 1 {
+                return Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "CDC reducer window crossed a truncate barrier"
+                ));
+            }
+            payload.truncate |= job.payload.truncate;
+            if payload.staging_schema.is_none() || job.payload.staging_schema.is_none() {
+                payload.staging_schema = None;
+            }
+            payload.steps.extend(job.payload.steps.iter().cloned());
+        }
+
+        Ok(payload)
+    }
+}
+
 impl EtlBigQueryDestination {
     pub(super) async fn prepare_cdc_batch_load_job(
         &self,
@@ -96,6 +229,8 @@ impl EtlBigQueryDestination {
     ) -> EtlResult<CdcBatchLoadJobPayload> {
         let job_id =
             stable_cdc_batch_load_job_id(connection_id, &info.dest_name, work.truncate, fragments);
+        let staging_schema = cdc_staging_table_schema(&info.schema);
+        let sequence_by_lsn = sequence_by_commit_lsn(fragments);
         let mut steps = Vec::new();
 
         if !work.rows.is_empty() {
@@ -107,10 +242,15 @@ impl EtlBigQueryDestination {
                 rows = row_count,
                 mode = "upsert"
             );
-            let frame = {
-                let _build_frame_span = build_frame_span.enter();
-                build_cdc_frame(info.clone(), work.rows, synced_at, None).await?
-            };
+            let frame = build_cdc_staging_frame(
+                info.clone(),
+                work.rows,
+                sequence_by_lsn.clone(),
+                synced_at,
+                None,
+            )
+            .instrument(build_frame_span)
+            .await?;
             let staging_table = bigquery::stable_cdc_staging_table_id(
                 &info.dest_name,
                 &job_id,
@@ -130,26 +270,29 @@ impl EtlBigQueryDestination {
                 rows = row_count,
                 mode = "upsert"
             );
-            let object_uri = {
-                let _upload_span = upload_span.enter();
-                self.inner
-                    .upload_cdc_batch_load_artifact_with_object_name(
-                        &info.schema,
-                        &frame,
-                        &object_name,
+            let object_uri = self
+                .inner
+                .upload_cdc_batch_load_artifact_with_object_name(
+                    &staging_schema,
+                    &frame,
+                    &object_name,
+                )
+                .instrument(upload_span)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to upload CDC batch-load artifact",
+                        err.to_string()
                     )
-                    .await
-                    .map_err(|err| {
-                        etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "failed to upload CDC batch-load artifact",
-                            err.to_string()
-                        )
-                    })?
-            };
+                })?;
             steps.push(CdcBatchLoadJobStep {
                 staging_table,
                 object_uri,
+                load_job_id: Some(stable_cdc_batch_load_job_step_load_job_id(
+                    &job_id,
+                    CdcBatchLoadStepKind::Upsert,
+                )),
                 row_count,
                 upserted_count: row_count,
                 deleted_count: 0,
@@ -165,16 +308,15 @@ impl EtlBigQueryDestination {
                 rows = row_count,
                 mode = "delete"
             );
-            let frame = {
-                let _build_frame_span = build_frame_span.enter();
-                build_cdc_frame(
-                    info.clone(),
-                    work.delete_rows,
-                    delete_synced_at,
-                    Some(delete_synced_at),
-                )
-                .await?
-            };
+            let frame = build_cdc_staging_frame(
+                info.clone(),
+                work.delete_rows,
+                sequence_by_lsn.clone(),
+                delete_synced_at,
+                Some(delete_synced_at),
+            )
+            .instrument(build_frame_span)
+            .await?;
             let staging_table = bigquery::stable_cdc_staging_table_id(
                 &info.dest_name,
                 &job_id,
@@ -194,26 +336,29 @@ impl EtlBigQueryDestination {
                 rows = row_count,
                 mode = "delete"
             );
-            let object_uri = {
-                let _upload_span = upload_span.enter();
-                self.inner
-                    .upload_cdc_batch_load_artifact_with_object_name(
-                        &info.schema,
-                        &frame,
-                        &object_name,
+            let object_uri = self
+                .inner
+                .upload_cdc_batch_load_artifact_with_object_name(
+                    &staging_schema,
+                    &frame,
+                    &object_name,
+                )
+                .instrument(upload_span)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to upload CDC delete batch-load artifact",
+                        err.to_string()
                     )
-                    .await
-                    .map_err(|err| {
-                        etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "failed to upload CDC delete batch-load artifact",
-                            err.to_string()
-                        )
-                    })?
-            };
+                })?;
             steps.push(CdcBatchLoadJobStep {
                 staging_table,
                 object_uri,
+                load_job_id: Some(stable_cdc_batch_load_job_step_load_job_id(
+                    &job_id,
+                    CdcBatchLoadStepKind::Delete,
+                )),
                 row_count,
                 upserted_count: row_count,
                 deleted_count: row_count,
@@ -225,6 +370,7 @@ impl EtlBigQueryDestination {
             source_table: info.source_name.clone(),
             target_table: info.dest_name.clone(),
             schema: info.schema.clone(),
+            staging_schema: Some(staging_schema),
             primary_key: info.primary_key.clone(),
             truncate: work.truncate,
             steps,
@@ -237,7 +383,9 @@ impl CdcBatchLoadManager {
         inner: BigQueryDestination,
         stats: Option<StatsHandle>,
         state_handle: StateHandle,
-        worker_count: usize,
+        staging_worker_count: usize,
+        reducer_worker_count: usize,
+        reducer_max_jobs: usize,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let manager = Self {
@@ -247,18 +395,25 @@ impl CdcBatchLoadManager {
             mixed_mode_gate_enabled: Arc::new(AtomicBool::new(false)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            reducer_max_jobs: reducer_max_jobs.max(1),
             local_retry_retryable_failures,
         };
         manager.discard_inflight_jobs_for_replay().await?;
-        manager.start_workers(worker_count.max(1));
+        manager.start_workers(staging_worker_count.max(1), reducer_worker_count.max(1));
         Ok(manager)
     }
 
-    fn start_workers(&self, worker_count: usize) {
-        for worker_index in 0..worker_count {
+    fn start_workers(&self, staging_worker_count: usize, reducer_worker_count: usize) {
+        for worker_index in 0..staging_worker_count {
             let manager = self.clone();
             tokio::spawn(async move {
-                manager.worker_loop(worker_index).await;
+                Box::pin(manager.staging_worker_loop(worker_index)).await;
+            });
+        }
+        for worker_index in 0..reducer_worker_count {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                Box::pin(manager.apply_worker_loop(worker_index)).await;
             });
         }
     }
@@ -295,9 +450,9 @@ impl CdcBatchLoadManager {
         })
     }
 
-    async fn worker_loop(&self, worker_index: usize) {
+    async fn staging_worker_loop(&self, worker_index: usize) {
         loop {
-            let job = match self.claim_next_job().await {
+            let job = match self.claim_next_staging_job().await {
                 Ok(Some(job)) => job,
                 Ok(None) => {
                     tokio::select! {
@@ -309,11 +464,11 @@ impl CdcBatchLoadManager {
                 Err(err) => {
                     warn!(
                         component = "consumer",
-                        event = "cdc_consumer_claim_failed",
+                        event = "cdc_staging_worker_claim_failed",
                         connection_id = self.state_handle.connection_id(),
                         worker = worker_index,
                         error = %err,
-                        "consumer worker failed to claim queued CDC batch-load job"
+                        "staging worker failed to claim queued CDC batch-load job"
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
@@ -321,15 +476,53 @@ impl CdcBatchLoadManager {
             };
             info!(
                 component = "consumer",
-                event = "cdc_consumer_claimed_job",
+                event = "cdc_staging_worker_claimed_job",
                 connection_id = self.state_handle.connection_id(),
                 worker = worker_index,
                 job_id = %job.record.job_id,
                 table = %job.record.table_key,
                 first_sequence = job.record.first_sequence,
-                "consumer worker claimed queued CDC batch-load job"
+                "staging worker claimed queued CDC batch-load job"
             );
-            self.run_job(job).await;
+            Box::pin(self.run_staging_job(job)).await;
+        }
+    }
+
+    async fn apply_worker_loop(&self, worker_index: usize) {
+        loop {
+            let window = match self.claim_next_apply_window().await {
+                Ok(Some(window)) => window,
+                Ok(None) => {
+                    tokio::select! {
+                        () = self.notify.notified() => {}
+                        () = tokio::time::sleep(CDC_BATCH_LOAD_CLAIM_POLL_INTERVAL) => {}
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        component = "consumer",
+                        event = "cdc_apply_worker_claim_failed",
+                        connection_id = self.state_handle.connection_id(),
+                        worker = worker_index,
+                        error = %err,
+                        "apply worker failed to claim loaded CDC batch-load job"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            info!(
+                component = "consumer",
+                event = "cdc_apply_worker_claimed_job",
+                connection_id = self.state_handle.connection_id(),
+                worker = worker_index,
+                table = %window.table_key(),
+                first_sequence = window.first_sequence(),
+                job_count = window.jobs.len(),
+                "apply worker claimed loaded CDC batch-load reducer window"
+            );
+            Box::pin(self.run_apply_window(window)).await;
         }
     }
 
@@ -363,6 +556,7 @@ impl CdcBatchLoadManager {
             table_key: payload.target_table.clone(),
             first_sequence,
             status: CdcBatchLoadJobStatus::Pending,
+            stage: CdcLedgerStage::Received,
             payload_json: serde_json::to_string(&payload).map_err(|err| {
                 etl::etl_error!(
                     ErrorKind::DestinationError,
@@ -373,6 +567,13 @@ impl CdcBatchLoadManager {
             attempt_count: 0,
             retry_class: None,
             last_error: None,
+            staging_table: payload.steps.first().map(|step| step.staging_table.clone()),
+            artifact_uri: payload.steps.first().map(|step| step.object_uri.clone()),
+            load_job_id: None,
+            merge_job_id: None,
+            primary_key_lane: None,
+            barrier_kind: work_barrier_kind(payload.truncate),
+            ledger_metadata_json: cdc_batch_load_ledger_metadata_json(&payload),
             created_at: now,
             updated_at: now,
         };
@@ -402,6 +603,7 @@ impl CdcBatchLoadManager {
                 commit_lsn: fragment.commit_lsn,
                 table_key: record.table_key.clone(),
                 status: CdcCommitFragmentStatus::Pending,
+                stage: CdcLedgerStage::Received,
                 row_count: if fragment_count == 1 || index == 0 {
                     total_rows
                 } else {
@@ -418,6 +620,13 @@ impl CdcBatchLoadManager {
                     0
                 },
                 last_error: None,
+                artifact_uri: record.artifact_uri.clone(),
+                staging_table: record.staging_table.clone(),
+                load_job_id: None,
+                merge_job_id: None,
+                primary_key_lane: None,
+                barrier_kind: record.barrier_kind.clone(),
+                ledger_metadata_json: record.ledger_metadata_json.clone(),
                 created_at: now,
                 updated_at: now,
             })
@@ -472,17 +681,17 @@ impl CdcBatchLoadManager {
         Ok(rx)
     }
 
-    async fn claim_next_job(&self) -> EtlResult<Option<CdcQueuedBatchLoadJob>> {
+    async fn claim_next_staging_job(&self) -> EtlResult<Option<CdcQueuedBatchLoadJob>> {
         let stale_before_ms =
             Utc::now().timestamp_millis() - CDC_BATCH_LOAD_JOB_STALE_TIMEOUT.as_millis() as i64;
         let Some(record) = self
             .state_handle
-            .claim_next_cdc_batch_load_job(stale_before_ms)
+            .claim_next_cdc_batch_load_staging_job(stale_before_ms)
             .await
             .map_err(|err| {
                 etl::etl_error!(
                     ErrorKind::DestinationError,
-                    "failed to claim queued CDC batch-load job",
+                    "failed to claim CDC batch-load staging job",
                     err.to_string()
                 )
             })?
@@ -493,16 +702,317 @@ impl CdcBatchLoadManager {
             serde_json::from_str(&record.payload_json).map_err(|err| {
                 etl::etl_error!(
                     ErrorKind::DestinationError,
-                    "failed to deserialize claimed CDC batch-load job payload",
+                    "failed to deserialize claimed CDC batch-load staging job payload",
                     err.to_string()
                 )
             })?;
         Ok(Some(CdcQueuedBatchLoadJob { record, payload }))
     }
 
-    async fn run_job(&self, job: CdcQueuedBatchLoadJob) {
+    async fn claim_next_apply_window(&self) -> EtlResult<Option<CdcQueuedBatchLoadWindow>> {
+        let stale_before_ms =
+            Utc::now().timestamp_millis() - CDC_BATCH_LOAD_JOB_STALE_TIMEOUT.as_millis() as i64;
+        let records = self
+            .state_handle
+            .claim_next_loaded_cdc_batch_load_job_window_for_apply(
+                stale_before_ms,
+                self.reducer_max_jobs,
+            )
+            .await
+            .map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to claim loaded CDC batch-load apply job",
+                    err.to_string()
+                )
+            })?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let mut jobs = Vec::with_capacity(records.len());
+        for record in records {
+            let payload: CdcBatchLoadJobPayload = serde_json::from_str(&record.payload_json)
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to deserialize loaded CDC batch-load apply job payload",
+                        err.to_string()
+                    )
+                })?;
+            jobs.push(CdcQueuedBatchLoadJob { record, payload });
+        }
+        Ok(Some(CdcQueuedBatchLoadWindow { jobs }))
+    }
+
+    async fn run_staging_job(&self, job: CdcQueuedBatchLoadJob) {
         let job_id = job.record.job_id.clone();
         let table_key = job.record.table_key.clone();
+        let started_at = Instant::now();
+        let span = info_span!(
+            "cdc_batch_load_staging_job",
+            job_id = %job_id,
+            table = %table_key,
+            first_sequence = job.record.first_sequence,
+            step_count = job.payload.steps.len()
+        );
+        let result = self
+            .inner
+            .stage_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+            .instrument(span)
+            .await;
+        match result {
+            Ok(()) => {
+                info!(
+                    component = "consumer",
+                    event = "cdc_staging_worker_job_loaded",
+                    connection_id = self.state_handle.connection_id(),
+                    job_id = %job_id,
+                    table = %table_key,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "queued CDC batch-load job staged and loaded"
+                );
+                let _ = self
+                    .state_handle
+                    .mark_cdc_batch_load_job_loaded(&job_id)
+                    .await;
+                self.notify.notify_one();
+            }
+            Err(err) => {
+                self.fail_job(job.record, &table_key, started_at, &err)
+                    .await;
+            }
+        }
+    }
+
+    async fn run_apply_window(&self, mut window: CdcQueuedBatchLoadWindow) {
+        if window.jobs.len() <= 1 {
+            if let Some(job) = window.jobs.pop() {
+                self.run_apply_job(job).await;
+            }
+            return;
+        }
+
+        let job_ids = window.job_ids();
+        let records: Vec<CdcBatchLoadJobRecord> =
+            window.jobs.iter().map(|job| job.record.clone()).collect();
+        let table_key = window.table_key().to_string();
+        let started_at = Instant::now();
+        let payload = match window.merged_payload() {
+            Ok(payload) => payload,
+            Err(err) => {
+                let message = err.to_string();
+                let err = anyhow::anyhow!(message.clone());
+                if self
+                    .fail_reducer_window(records, &table_key, started_at, &err)
+                    .await
+                {
+                    let result = Err(etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "queued CDC batch-load reducer window failed",
+                        message
+                    ));
+                    self.resolve_window_waiters(&job_ids, result).await;
+                }
+                self.notify.notify_one();
+                return;
+            }
+        };
+        let span = info_span!(
+            "cdc_batch_load_reducer_window",
+            head_job_id = job_ids.first().map_or("", String::as_str),
+            table = %table_key,
+            first_sequence = window.first_sequence(),
+            job_count = job_ids.len(),
+            step_count = payload.steps.len()
+        );
+        let (heartbeat_stop_tx, mut heartbeat_stop_rx) = oneshot::channel();
+        let heartbeat_handle = {
+            let state_handle = self.state_handle.clone();
+            let heartbeat_job_ids = job_ids.clone();
+            let heartbeat_table = table_key.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL) => {
+                            if let Err(err) = state_handle.heartbeat_cdc_batch_load_jobs(&heartbeat_job_ids).await {
+                                warn!(
+                                    component = "consumer",
+                                    event = "cdc_consumer_window_heartbeat_failed",
+                                    connection_id = state_handle.connection_id(),
+                                    job_count = heartbeat_job_ids.len(),
+                                    table = %heartbeat_table,
+                                    error = %err,
+                                    "failed to heartbeat queued CDC batch-load reducer window"
+                                );
+                            }
+                        }
+                        _ = &mut heartbeat_stop_rx => break,
+                    }
+                }
+            })
+        };
+
+        let result: anyhow::Result<()> = Box::pin(cdc_batch_load_job_with_timeout(
+            CDC_BATCH_LOAD_JOB_HARD_TIMEOUT,
+            job_ids.first().map_or("cdc-window", String::as_str),
+            &table_key,
+            async {
+                if should_check_table_apply_readiness(self.mixed_mode_gate_enabled()) {
+                    match self.table_apply_readiness(&payload.source_table).await {
+                        Ok(CdcApplyReadiness::Ready) => {
+                            self.inner
+                                .apply_cdc_batch_load_job(
+                                    self.state_handle.connection_id(),
+                                    &payload,
+                                )
+                                .await
+                        }
+                        Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
+                            "CDC batch-load waiting for snapshot handoff for {}",
+                            payload.source_table
+                        )),
+                        Ok(CdcApplyReadiness::Blocked) => {
+                            info!(
+                                component = "consumer",
+                                event = "cdc_consumer_window_skipped_blocked_table",
+                                connection_id = self.state_handle.connection_id(),
+                                table = %table_key,
+                                job_count = job_ids.len(),
+                                "skipping queued CDC batch-load reducer window because table is blocked until manual resync"
+                            );
+                            Ok(())
+                        }
+                        Err(err) => Err(anyhow::anyhow!(
+                            "failed to inspect CDC apply readiness for {}: {}",
+                            payload.source_table,
+                            err
+                        )),
+                    }
+                } else {
+                    self.inner
+                        .apply_cdc_batch_load_job(self.state_handle.connection_id(), &payload)
+                        .await
+                }
+            }
+            .instrument(span),
+        ))
+        .await;
+        let _ = heartbeat_stop_tx.send(());
+        let _ = heartbeat_handle.await;
+
+        let terminal_state_committed = match &result {
+            Ok(()) => {
+                match self
+                    .state_handle
+                    .mark_cdc_batch_load_window_succeeded(&job_ids)
+                    .await
+                {
+                    Err(err) => {
+                        warn!(
+                            component = "consumer",
+                            event = "cdc_consumer_window_success_state_update_failed",
+                            connection_id = self.state_handle.connection_id(),
+                            table = %table_key,
+                            job_count = job_ids.len(),
+                            error = %err,
+                            "failed to durably mark CDC batch-load reducer window succeeded"
+                        );
+                        false
+                    }
+                    Ok(()) => {
+                        crate::telemetry::record_cdc_batch_load_job(
+                            self.state_handle.connection_id(),
+                            &table_key,
+                            "succeeded",
+                            started_at.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        info!(
+                            component = "consumer",
+                            event = "cdc_consumer_window_succeeded",
+                            connection_id = self.state_handle.connection_id(),
+                            table = %table_key,
+                            job_count = job_ids.len(),
+                            duration_ms = started_at.elapsed().as_millis() as u64,
+                            "queued CDC batch-load reducer window succeeded"
+                        );
+                        if let Some(stats) = &self.stats {
+                            let row_count = payload.steps.iter().map(|step| step.row_count).sum();
+                            let upserted =
+                                payload.steps.iter().map(|step| step.upserted_count).sum();
+                            let deleted = payload.steps.iter().map(|step| step.deleted_count).sum();
+                            stats
+                                .record_load(
+                                    &payload.source_table,
+                                    row_count,
+                                    upserted,
+                                    deleted,
+                                    started_at.elapsed().as_millis() as u64,
+                                )
+                                .await;
+                        }
+                        true
+                    }
+                }
+            }
+            Err(err) => {
+                self.fail_reducer_window(records, &table_key, started_at, err)
+                    .await
+            }
+        };
+
+        let resolve_waiters = match &result {
+            Ok(()) => terminal_state_committed,
+            Err(err) => {
+                should_resolve_cdc_batch_load_waiters(
+                    classify_sync_retry(err),
+                    self.local_retry_retryable_failures,
+                ) && terminal_state_committed
+            }
+        };
+
+        if resolve_waiters {
+            let waiter_result = match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "queued CDC batch-load job failed",
+                    err.to_string()
+                )),
+            };
+            self.resolve_window_waiters(&job_ids, waiter_result).await;
+        }
+        self.notify.notify_one();
+    }
+
+    async fn resolve_window_waiters(&self, job_ids: &[String], result: EtlResult<()>) {
+        let mut waiters_by_job = self.waiters.lock().await;
+        let mut result = Some(result);
+        for job_id in job_ids {
+            if let Some(waiters) = waiters_by_job.remove(job_id) {
+                for waiter in waiters {
+                    let waiter_result = match result.take() {
+                        Some(Ok(())) | None => Ok(()),
+                        Some(Err(err)) => {
+                            let message = err.to_string();
+                            result = Some(Err(err));
+                            Err(etl::etl_error!(
+                                ErrorKind::DestinationError,
+                                "queued CDC batch-load job failed",
+                                message
+                            ))
+                        }
+                    };
+                    let _ignored = waiter.send(waiter_result);
+                }
+            }
+        }
+    }
+
+    async fn run_apply_job(&self, job: CdcQueuedBatchLoadJob) {
+        let job_id = job.record.job_id.clone();
+        let table_key = job.record.table_key.clone();
+        let record = job.record.clone();
         let started_at = Instant::now();
         let span = info_span!(
             "cdc_batch_load_job",
@@ -511,7 +1021,6 @@ impl CdcBatchLoadManager {
             first_sequence = job.record.first_sequence,
             step_count = job.payload.steps.len()
         );
-        let _span = span.enter();
         let (heartbeat_stop_tx, mut heartbeat_stop_rx) = oneshot::channel();
         let heartbeat_handle = {
             let state_handle = self.state_handle.clone();
@@ -538,167 +1047,132 @@ impl CdcBatchLoadManager {
                 }
             })
         };
-        let result: anyhow::Result<()> = if should_check_table_apply_readiness(
-            self.mixed_mode_gate_enabled(),
-        ) {
-            match self.table_apply_readiness(&job.payload.source_table).await {
-                Ok(CdcApplyReadiness::Ready) => {
+        let result: anyhow::Result<()> = Box::pin(cdc_batch_load_job_with_timeout(
+            CDC_BATCH_LOAD_JOB_HARD_TIMEOUT,
+            &job_id,
+            &table_key,
+            async {
+                if should_check_table_apply_readiness(self.mixed_mode_gate_enabled()) {
+                    match self.table_apply_readiness(&job.payload.source_table).await {
+                        Ok(CdcApplyReadiness::Ready) => {
+                            self.inner
+                                .apply_cdc_batch_load_job(
+                                    self.state_handle.connection_id(),
+                                    &job.payload,
+                                )
+                                .await
+                        }
+                        Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
+                            "CDC batch-load waiting for snapshot handoff for {}",
+                            job.payload.source_table
+                        )),
+                        Ok(CdcApplyReadiness::Blocked) => {
+                            info!(
+                                component = "consumer",
+                                event = "cdc_consumer_job_skipped_blocked_table",
+                                connection_id = self.state_handle.connection_id(),
+                                job_id = %job_id,
+                                table = %table_key,
+                                "skipping queued CDC batch-load job because table is blocked until manual resync"
+                            );
+                            Ok(())
+                        }
+                        Err(err) => Err(anyhow::anyhow!(
+                            "failed to inspect CDC apply readiness for {}: {}",
+                            job.payload.source_table,
+                            err
+                        )),
+                    }
+                } else {
                     self.inner
-                        .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+                        .apply_cdc_batch_load_job(
+                            self.state_handle.connection_id(),
+                            &job.payload,
+                        )
                         .await
                 }
-                Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
-                    "CDC batch-load waiting for snapshot handoff for {}",
-                    job.payload.source_table
-                )),
-                Ok(CdcApplyReadiness::Blocked) => {
-                    info!(
-                        component = "consumer",
-                        event = "cdc_consumer_job_skipped_blocked_table",
-                        connection_id = self.state_handle.connection_id(),
-                        job_id = %job_id,
-                        table = %table_key,
-                        "skipping queued CDC batch-load job because table is blocked until manual resync"
-                    );
-                    Ok(())
-                }
-                Err(err) => Err(anyhow::anyhow!(
-                    "failed to inspect CDC apply readiness for {}: {}",
-                    job.payload.source_table,
-                    err
-                )),
             }
-        } else {
-            self.inner
-                .process_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
-                .await
-        };
+            .instrument(span),
+        ))
+        .await;
         let _ = heartbeat_stop_tx.send(());
         let _ = heartbeat_handle.await;
 
-        match &result {
+        let terminal_state_committed = match &result {
             Ok(()) => {
-                crate::telemetry::record_cdc_batch_load_job(
-                    self.state_handle.connection_id(),
-                    &table_key,
-                    "succeeded",
-                    started_at.elapsed().as_secs_f64() * 1000.0,
-                );
-                info!(
-                    component = "consumer",
-                    event = "cdc_consumer_job_succeeded",
-                    connection_id = self.state_handle.connection_id(),
-                    job_id = %job_id,
-                    table = %table_key,
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    "queued CDC batch-load job succeeded"
-                );
-                if let Some(stats) = &self.stats {
-                    let row_count = job.payload.steps.iter().map(|step| step.row_count).sum();
-                    let upserted = job
-                        .payload
-                        .steps
-                        .iter()
-                        .map(|step| step.upserted_count)
-                        .sum();
-                    let deleted = job
-                        .payload
-                        .steps
-                        .iter()
-                        .map(|step| step.deleted_count)
-                        .sum();
-                    stats
-                        .record_load(
-                            &job.payload.source_table,
-                            row_count,
-                            upserted,
-                            deleted,
-                            started_at.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                }
-                let _ = self
+                match self
                     .state_handle
-                    .mark_cdc_batch_load_job_succeeded(&job_id)
-                    .await;
-                let _ = self
-                    .state_handle
-                    .mark_cdc_commit_fragments_succeeded_for_job(&job_id)
-                    .await;
-            }
-            Err(err) => {
-                let retry_class = classify_sync_retry(err);
-                crate::telemetry::record_cdc_batch_load_job(
-                    self.state_handle.connection_id(),
-                    &table_key,
-                    "failed",
-                    started_at.elapsed().as_secs_f64() * 1000.0,
-                );
-                warn!(
-                    component = "consumer",
-                    event = "cdc_consumer_job_failed",
-                    connection_id = self.state_handle.connection_id(),
-                    job_id = %job_id,
-                    table = %table_key,
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    error = %err,
-                    "queued CDC batch-load job failed"
-                );
-                let _ = self
-                    .state_handle
-                    .mark_cdc_batch_load_job_failed(&job_id, &err.to_string(), retry_class)
-                    .await;
-                if should_mark_cdc_batch_load_fragments_failed(
-                    retry_class,
-                    self.local_retry_retryable_failures,
-                ) {
-                    let _ = self
-                        .state_handle
-                        .mark_cdc_commit_fragments_failed_for_job(&job_id, &err.to_string())
-                        .await;
-                } else {
-                    let state_handle = self.state_handle.clone();
-                    let notify = Arc::clone(&self.notify);
-                    let retry_job_id = job_id.clone();
-                    let retry_table = table_key.clone();
-                    let retry_delay =
-                        cdc_batch_load_retry_delay(job.record.attempt_count, &retry_table);
-                    info!(
-                        component = "consumer",
-                        event = "cdc_consumer_job_retry_scheduled",
-                        connection_id = self.state_handle.connection_id(),
-                        job_id = %retry_job_id,
-                        table = %retry_table,
-                        retry_class = retry_class.as_str(),
-                        retry_delay_ms = retry_delay.as_millis() as u64,
-                        "scheduled queued CDC batch-load job for local retry"
-                    );
-                    tokio::spawn(async move {
-                        tokio::time::sleep(retry_delay).await;
-                        match state_handle.requeue_cdc_batch_load_job(&retry_job_id).await {
-                            Ok(true) => notify.notify_one(),
-                            Ok(false) => {}
-                            Err(err) => warn!(
-                                component = "consumer",
-                                event = "cdc_consumer_job_retry_requeue_failed",
-                                connection_id = state_handle.connection_id(),
-                                job_id = %retry_job_id,
-                                table = %retry_table,
-                                error = %err,
-                                "failed to requeue queued CDC batch-load job for retry"
-                            ),
+                    .mark_cdc_batch_load_bundle_succeeded(&job_id)
+                    .await
+                {
+                    Err(err) => {
+                        warn!(
+                            component = "consumer",
+                            event = "cdc_consumer_job_success_state_update_failed",
+                            connection_id = self.state_handle.connection_id(),
+                            job_id = %job_id,
+                            table = %table_key,
+                            error = %err,
+                            "failed to durably mark CDC batch-load job succeeded"
+                        );
+                        false
+                    }
+                    Ok(()) => {
+                        crate::telemetry::record_cdc_batch_load_job(
+                            self.state_handle.connection_id(),
+                            &table_key,
+                            "succeeded",
+                            started_at.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        info!(
+                            component = "consumer",
+                            event = "cdc_consumer_job_succeeded",
+                            connection_id = self.state_handle.connection_id(),
+                            job_id = %job_id,
+                            table = %table_key,
+                            duration_ms = started_at.elapsed().as_millis() as u64,
+                            "queued CDC batch-load job succeeded"
+                        );
+                        if let Some(stats) = &self.stats {
+                            let row_count =
+                                job.payload.steps.iter().map(|step| step.row_count).sum();
+                            let upserted = job
+                                .payload
+                                .steps
+                                .iter()
+                                .map(|step| step.upserted_count)
+                                .sum();
+                            let deleted = job
+                                .payload
+                                .steps
+                                .iter()
+                                .map(|step| step.deleted_count)
+                                .sum();
+                            stats
+                                .record_load(
+                                    &job.payload.source_table,
+                                    row_count,
+                                    upserted,
+                                    deleted,
+                                    started_at.elapsed().as_millis() as u64,
+                                )
+                                .await;
                         }
-                    });
+                        true
+                    }
                 }
             }
-        }
+            Err(err) => self.fail_job(record, &table_key, started_at, err).await,
+        };
 
         let resolve_waiters = match &result {
-            Ok(()) => true,
-            Err(err) => should_resolve_cdc_batch_load_waiters(
-                classify_sync_retry(err),
-                self.local_retry_retryable_failures,
-            ),
+            Ok(()) => terminal_state_committed,
+            Err(err) => {
+                should_resolve_cdc_batch_load_waiters(
+                    classify_sync_retry(err),
+                    self.local_retry_retryable_failures,
+                ) && terminal_state_committed
+            }
         };
 
         if resolve_waiters && let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
@@ -716,6 +1190,184 @@ impl CdcBatchLoadManager {
         }
         self.notify.notify_one();
     }
+
+    async fn fail_reducer_window(
+        &self,
+        records: Vec<CdcBatchLoadJobRecord>,
+        table_key: &str,
+        started_at: Instant,
+        err: &anyhow::Error,
+    ) -> bool {
+        let job_ids: Vec<String> = records.iter().map(|record| record.job_id.clone()).collect();
+        let retry_class = classify_sync_retry(err);
+        crate::telemetry::record_cdc_batch_load_job(
+            self.state_handle.connection_id(),
+            table_key,
+            "failed",
+            started_at.elapsed().as_secs_f64() * 1000.0,
+        );
+        warn!(
+            component = "consumer",
+            event = "cdc_consumer_window_failed",
+            connection_id = self.state_handle.connection_id(),
+            job_count = job_ids.len(),
+            table = %table_key,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            error = %err,
+            "queued CDC batch-load reducer window failed"
+        );
+        let mark_fragments_failed = should_mark_cdc_batch_load_fragments_failed(
+            retry_class,
+            self.local_retry_retryable_failures,
+        );
+        if let Err(state_err) = self
+            .state_handle
+            .mark_cdc_batch_load_window_failed(
+                &job_ids,
+                &err.to_string(),
+                retry_class,
+                mark_fragments_failed,
+            )
+            .await
+        {
+            warn!(
+                component = "consumer",
+                event = "cdc_consumer_window_failure_state_update_failed",
+                connection_id = self.state_handle.connection_id(),
+                table = %table_key,
+                job_count = job_ids.len(),
+                error = %state_err,
+                "failed to durably mark CDC batch-load reducer window failed"
+            );
+            return false;
+        }
+        if !mark_fragments_failed {
+            for record in records {
+                let state_handle = self.state_handle.clone();
+                let notify = Arc::clone(&self.notify);
+                let retry_job_id = record.job_id.clone();
+                let retry_table = table_key.to_string();
+                let retry_delay = cdc_batch_load_retry_delay(record.attempt_count, &retry_table);
+                info!(
+                    component = "consumer",
+                    event = "cdc_consumer_job_retry_scheduled",
+                    connection_id = self.state_handle.connection_id(),
+                    job_id = %retry_job_id,
+                    table = %retry_table,
+                    retry_class = retry_class.as_str(),
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "scheduled queued CDC batch-load job for local retry"
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(retry_delay).await;
+                    match state_handle.requeue_cdc_batch_load_job(&retry_job_id).await {
+                        Ok(true) => notify.notify_one(),
+                        Ok(false) => {}
+                        Err(err) => warn!(
+                            component = "consumer",
+                            event = "cdc_consumer_job_retry_requeue_failed",
+                            connection_id = state_handle.connection_id(),
+                            job_id = %retry_job_id,
+                            table = %retry_table,
+                            error = %err,
+                            "failed to requeue queued CDC batch-load job for retry"
+                        ),
+                    }
+                });
+            }
+        }
+        true
+    }
+
+    async fn fail_job(
+        &self,
+        record: CdcBatchLoadJobRecord,
+        table_key: &str,
+        started_at: Instant,
+        err: &anyhow::Error,
+    ) -> bool {
+        let job_id = record.job_id.clone();
+        let retry_class = classify_sync_retry(err);
+        crate::telemetry::record_cdc_batch_load_job(
+            self.state_handle.connection_id(),
+            table_key,
+            "failed",
+            started_at.elapsed().as_secs_f64() * 1000.0,
+        );
+        warn!(
+            component = "consumer",
+            event = "cdc_consumer_job_failed",
+            connection_id = self.state_handle.connection_id(),
+            job_id = %job_id,
+            table = %table_key,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            error = %err,
+            "queued CDC batch-load job failed"
+        );
+        let mark_fragments_failed = should_mark_cdc_batch_load_fragments_failed(
+            retry_class,
+            self.local_retry_retryable_failures,
+        );
+        if let Err(state_err) = self
+            .state_handle
+            .mark_cdc_batch_load_bundle_failed(
+                &job_id,
+                &err.to_string(),
+                retry_class,
+                mark_fragments_failed,
+            )
+            .await
+        {
+            warn!(
+                component = "consumer",
+                event = "cdc_consumer_job_failure_state_update_failed",
+                connection_id = self.state_handle.connection_id(),
+                job_id = %job_id,
+                table = %table_key,
+                error = %state_err,
+                "failed to durably mark CDC batch-load job failed"
+            );
+            return false;
+        }
+        if !mark_fragments_failed {
+            let state_handle = self.state_handle.clone();
+            let notify = Arc::clone(&self.notify);
+            let retry_job_id = job_id.clone();
+            let retry_table = table_key.to_string();
+            let retry_delay = cdc_batch_load_retry_delay(record.attempt_count, &retry_table);
+            info!(
+                component = "consumer",
+                event = "cdc_consumer_job_retry_scheduled",
+                connection_id = self.state_handle.connection_id(),
+                job_id = %retry_job_id,
+                table = %retry_table,
+                retry_class = retry_class.as_str(),
+                retry_delay_ms = retry_delay.as_millis() as u64,
+                "scheduled queued CDC batch-load job for local retry"
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(retry_delay).await;
+                match state_handle.requeue_cdc_batch_load_job(&retry_job_id).await {
+                    Ok(true) => notify.notify_one(),
+                    Ok(false) => {}
+                    Err(err) => warn!(
+                        component = "consumer",
+                        event = "cdc_consumer_job_retry_requeue_failed",
+                        connection_id = state_handle.connection_id(),
+                        job_id = %retry_job_id,
+                        table = %retry_table,
+                        error = %err,
+                        "failed to requeue queued CDC batch-load job for retry"
+                    ),
+                }
+            });
+        }
+        true
+    }
+}
+
+fn work_barrier_kind(truncate: bool) -> Option<String> {
+    truncate.then(|| "truncate".to_string())
 }
 
 #[cfg(test)]
@@ -769,5 +1421,91 @@ mod tests {
     fn checkpoint_readiness_checks_only_run_in_mixed_mode() {
         assert!(!should_check_table_apply_readiness(false));
         assert!(should_check_table_apply_readiness(true));
+    }
+
+    #[test]
+    fn batch_load_ledger_metadata_preserves_all_steps() {
+        let metadata = cdc_batch_load_ledger_metadata_json(&CdcBatchLoadJobPayload {
+            job_id: "job-1".to_string(),
+            source_table: "public.accounts".to_string(),
+            target_table: "public__accounts".to_string(),
+            schema: TableSchema {
+                name: "public__accounts".to_string(),
+                columns: Vec::new(),
+                primary_key: Some("id".to_string()),
+            },
+            staging_schema: Some(cdc_staging_table_schema(&TableSchema {
+                name: "public__accounts".to_string(),
+                columns: Vec::new(),
+                primary_key: Some("id".to_string()),
+            })),
+            primary_key: "id".to_string(),
+            truncate: false,
+            steps: vec![
+                CdcBatchLoadJobStep {
+                    staging_table: "stage_upsert".to_string(),
+                    object_uri: "gs://bucket/upsert.parquet".to_string(),
+                    load_job_id: Some("load-upsert".to_string()),
+                    row_count: 3,
+                    upserted_count: 3,
+                    deleted_count: 0,
+                },
+                CdcBatchLoadJobStep {
+                    staging_table: "stage_delete".to_string(),
+                    object_uri: "gs://bucket/delete.parquet".to_string(),
+                    load_job_id: Some("load-delete".to_string()),
+                    row_count: 2,
+                    upserted_count: 2,
+                    deleted_count: 2,
+                },
+            ],
+        })
+        .expect("ledger metadata json");
+        let value = serde_json::from_str::<serde_json::Value>(&metadata)
+            .expect("valid ledger metadata json");
+
+        assert_eq!(value["staging_strategy"], "per_job");
+        assert_eq!(value["scalar_metadata"], "first_step_hints");
+        assert_eq!(value["steps"].as_array().expect("steps").len(), 2);
+        assert_eq!(value["steps"][0]["staging_table"], "stage_upsert");
+        assert_eq!(
+            value["steps"][1]["object_uri"],
+            "gs://bucket/delete.parquet"
+        );
+        assert_eq!(value["steps"][1]["load_job_id"], "load-delete");
+    }
+
+    #[test]
+    fn batch_load_payload_can_read_legacy_payload_without_staging_schema() {
+        let payload = serde_json::from_str::<CdcBatchLoadJobPayload>(
+            r#"{
+                "job_id":"job-1",
+                "source_table":"public.accounts",
+                "target_table":"public__accounts",
+                "schema":{"name":"public__accounts","columns":[],"primary_key":"id"},
+                "primary_key":"id",
+                "truncate":false,
+                "steps":[]
+            }"#,
+        )
+        .expect("legacy payload should deserialize");
+
+        assert!(payload.staging_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_load_job_timeout_surfaces_stuck_work() {
+        let result = cdc_batch_load_job_with_timeout(
+            Duration::from_millis(1),
+            "cdc_job_stuck",
+            "public__accounts",
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+
+        let err = result.expect_err("pending job should time out");
+        assert!(err.to_string().contains(
+            "CDC batch-load job cdc_job_stuck for public__accounts exceeded hard timeout"
+        ));
     }
 }

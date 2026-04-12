@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) const CDC_STAGING_SEQUENCE_COLUMN: &str = "_cdsync_sequence";
+pub(super) const CDC_STAGING_COMMIT_LSN_COLUMN: &str = "_cdsync_commit_lsn";
+pub(super) const CDC_STAGING_TX_ORDINAL_COLUMN: &str = "_cdsync_tx_ordinal";
+pub(super) const CDC_STAGING_OPERATION_COLUMN: &str = "_cdsync_operation";
+
 pub(super) async fn build_cdc_frame(
     info: CdcTableInfo,
     rows: Vec<TableRow>,
@@ -21,6 +26,42 @@ pub(super) async fn build_cdc_frame(
         })?
 }
 
+pub(super) async fn build_cdc_staging_frame(
+    info: CdcTableInfo,
+    rows: Vec<CdcTableWorkRow>,
+    sequence_by_commit_lsn: HashMap<String, u64>,
+    synced_at: DateTime<Utc>,
+    deleted_at_override: Option<DateTime<Utc>>,
+) -> EtlResult<DataFrame> {
+    if rows.len() < CDC_FRAME_BUILD_BLOCKING_ROWS {
+        return table_work_rows_to_staging_frame(
+            &info,
+            &rows,
+            &sequence_by_commit_lsn,
+            synced_at,
+            deleted_at_override,
+        );
+    }
+
+    task::spawn_blocking(move || {
+        table_work_rows_to_staging_frame(
+            &info,
+            &rows,
+            &sequence_by_commit_lsn,
+            synced_at,
+            deleted_at_override,
+        )
+    })
+    .await
+    .map_err(|err| {
+        etl::etl_error!(
+            ErrorKind::DestinationError,
+            "failed to join CDC staging frame build task",
+            err.to_string()
+        )
+    })?
+}
+
 pub(super) fn compact_table_events(
     info: &CdcTableInfo,
     table_id: TableId,
@@ -39,7 +80,15 @@ pub(super) fn compact_table_events(
                     ));
                 }
                 let key = primary_key_identity(info, &insert_event.table_row)?;
-                row_actions.insert(key, PendingTableRowAction::Upsert(insert_event.table_row));
+                row_actions.insert(
+                    key,
+                    PendingTableRowAction::Upsert(work_row(
+                        insert_event.table_row,
+                        insert_event.commit_lsn,
+                        insert_event.tx_ordinal,
+                        CdcTableWorkRowOperation::Upsert,
+                    )),
+                );
             }
             Event::Update(update_event) => {
                 if update_event.table_id != table_id {
@@ -49,7 +98,15 @@ pub(super) fn compact_table_events(
                     ));
                 }
                 let key = primary_key_identity(info, &update_event.table_row)?;
-                row_actions.insert(key, PendingTableRowAction::Upsert(update_event.table_row));
+                row_actions.insert(
+                    key,
+                    PendingTableRowAction::Upsert(work_row(
+                        update_event.table_row,
+                        update_event.commit_lsn,
+                        update_event.tx_ordinal,
+                        CdcTableWorkRowOperation::Upsert,
+                    )),
+                );
             }
             Event::Delete(delete_event) => {
                 if delete_event.table_id != table_id {
@@ -63,7 +120,15 @@ pub(super) fn compact_table_events(
                 }
                 if let Some((_, old_row)) = delete_event.old_table_row {
                     let key = primary_key_identity(info, &old_row)?;
-                    row_actions.insert(key, PendingTableRowAction::Delete(old_row));
+                    row_actions.insert(
+                        key,
+                        PendingTableRowAction::Delete(work_row(
+                            old_row,
+                            delete_event.commit_lsn,
+                            delete_event.tx_ordinal,
+                            CdcTableWorkRowOperation::Delete,
+                        )),
+                    );
                 } else {
                     warn!(
                         table = %info.source_name,
@@ -104,6 +169,20 @@ pub(super) fn compact_table_events(
         delete_rows,
         truncate,
     })
+}
+
+fn work_row(
+    row: TableRow,
+    commit_lsn: etl::types::PgLsn,
+    tx_ordinal: u64,
+    operation: CdcTableWorkRowOperation,
+) -> CdcTableWorkRow {
+    CdcTableWorkRow {
+        row,
+        commit_lsn: commit_lsn.to_string(),
+        tx_ordinal,
+        operation,
+    }
 }
 
 fn primary_key_identity(info: &CdcTableInfo, row: &TableRow) -> EtlResult<String> {
@@ -201,6 +280,123 @@ pub(super) fn table_rows_to_frame(
         etl::etl_error!(
             ErrorKind::ConversionError,
             "failed to build CDC dataframe",
+            err.to_string()
+        )
+    })
+}
+
+pub(super) fn cdc_staging_table_schema(schema: &TableSchema) -> TableSchema {
+    let mut staging_schema = schema.clone();
+    staging_schema.columns.extend([
+        ColumnSchema {
+            name: CDC_STAGING_SEQUENCE_COLUMN.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: CDC_STAGING_COMMIT_LSN_COLUMN.to_string(),
+            data_type: DataType::String,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: CDC_STAGING_TX_ORDINAL_COLUMN.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: CDC_STAGING_OPERATION_COLUMN.to_string(),
+            data_type: DataType::String,
+            nullable: false,
+        },
+    ]);
+    staging_schema
+}
+
+fn table_work_rows_to_staging_frame(
+    info: &CdcTableInfo,
+    rows: &[CdcTableWorkRow],
+    sequence_by_commit_lsn: &HashMap<String, u64>,
+    synced_at: DateTime<Utc>,
+    deleted_at_override: Option<DateTime<Utc>>,
+) -> Result<DataFrame, EtlError> {
+    let staging_schema = cdc_staging_table_schema(&info.schema);
+    let polars_schema = polars_schema_with_metadata(&staging_schema, &info.metadata)?;
+    let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
+    for work_row in rows {
+        let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
+        for (column, source_idx) in info
+            .schema
+            .columns
+            .iter()
+            .zip(info.dest_source_indices.iter())
+        {
+            let cell = work_row
+                .row
+                .values()
+                .get(*source_idx)
+                .unwrap_or(&Cell::Null);
+            values.push(cell_to_anyvalue(cell, &column.data_type));
+        }
+
+        let sequence = sequence_by_commit_lsn
+            .get(&work_row.commit_lsn)
+            .copied()
+            .ok_or_else(|| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "missing CDC sequence metadata for staging row",
+                    work_row.commit_lsn.clone()
+                )
+            })?;
+        values.push(AnyValue::Int64(i64::try_from(sequence).map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::ConversionError,
+                "CDC sequence does not fit in BigQuery Int64 staging metadata",
+                err.to_string()
+            )
+        })?));
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            work_row.commit_lsn.as_str(),
+        )));
+        values.push(AnyValue::Int64(
+            i64::try_from(work_row.tx_ordinal).map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::ConversionError,
+                    "CDC transaction ordinal does not fit in BigQuery Int64 staging metadata",
+                    err.to_string()
+                )
+            })?,
+        ));
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            work_row.operation.as_str(),
+        )));
+
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            synced_at.to_rfc3339(),
+        )));
+
+        let deleted_at = if info.soft_delete {
+            if let Some(ts) = deleted_at_override {
+                Some(ts.to_rfc3339())
+            } else {
+                derive_deleted_at_from_row(info, &work_row.row)
+            }
+        } else {
+            None
+        };
+
+        match deleted_at {
+            Some(ts) => values.push(AnyValue::StringOwned(PlSmallStr::from(ts))),
+            None => values.push(AnyValue::Null),
+        }
+
+        output.push(PolarsRow::new(values));
+    }
+
+    DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(|err| {
+        etl::etl_error!(
+            ErrorKind::ConversionError,
+            "failed to build CDC staging dataframe",
             err.to_string()
         )
     })

@@ -40,6 +40,9 @@ impl PostgresSource {
             apply_batch_size,
             apply_max_fill,
             apply_concurrency,
+            max_inflight_commits,
+            backlog_max_pending_fragments,
+            backlog_max_oldest_pending,
             follow,
             shutdown,
         } = config;
@@ -87,7 +90,7 @@ impl PostgresSource {
         let mut table_apply_locks: HashMap<TableId, Arc<Mutex<()>>> = HashMap::new();
         let mut active_table_applies: HashSet<TableId> = HashSet::new();
         let max_active_applies = apply_concurrency.max(1);
-        let max_commit_queue_depth = max_active_applies.saturating_mul(4).max(1);
+        let max_commit_queue_depth = max_inflight_commits.max(1);
 
         loop {
             if shutdown_requested && !in_tx {
@@ -125,7 +128,9 @@ impl PostgresSource {
                         )?;
                         submit_cdc_apply_acks(&coordinator_tx, acks)?;
                         drain_ready_cdc_coordinator_advances(
+                            &coordinator_tx,
                             &mut coordinator_advances_rx,
+                            &coordinator_state_rx,
                             &stats,
                             table_configs,
                             state,
@@ -164,7 +169,9 @@ impl PostgresSource {
                         )?;
                         submit_cdc_apply_acks(&coordinator_tx, acks)?;
                         drain_ready_cdc_coordinator_advances(
+                            &coordinator_tx,
                             &mut coordinator_advances_rx,
+                            &coordinator_state_rx,
                             &stats,
                             table_configs,
                             state,
@@ -296,7 +303,9 @@ impl PostgresSource {
                         )?;
                         submit_cdc_apply_acks(&coordinator_tx, acks)?;
                         drain_ready_cdc_coordinator_advances(
+                            &coordinator_tx,
                             &mut coordinator_advances_rx,
+                            &coordinator_state_rx,
                             &stats,
                             table_configs,
                             state,
@@ -335,7 +344,9 @@ impl PostgresSource {
                         )?;
                         submit_cdc_apply_acks(&coordinator_tx, acks)?;
                         drain_ready_cdc_coordinator_advances(
+                            &coordinator_tx,
                             &mut coordinator_advances_rx,
+                            &coordinator_state_rx,
                             &stats,
                             table_configs,
                             state,
@@ -589,7 +600,62 @@ impl PostgresSource {
                                 .await?;
                                 submit_cdc_apply_acks(&coordinator_tx, acks)?;
                                 drain_ready_cdc_coordinator_advances(
+                                    &coordinator_tx,
                                     &mut coordinator_advances_rx,
+                                    &coordinator_state_rx,
+                                    &stats,
+                                    table_configs,
+                                    state,
+                                    state_handle.as_ref(),
+                                    stream.as_mut(),
+                                    last_received_lsn,
+                                    &mut last_flushed_lsn,
+                                )
+                                .await?;
+                            }
+                            while cdc_durable_backlog_backpressure_exceeded(
+                                slot_name,
+                                state_handle.as_ref(),
+                                backlog_max_pending_fragments,
+                                backlog_max_oldest_pending,
+                            )
+                            .await?
+                            {
+                                dispatch_cdc_batches_and_record(
+                                    slot_name,
+                                    pending_events.len(),
+                                    &mut queued_batches,
+                                    &mut pending_table_batches,
+                                    &mut inflight_dispatch,
+                                    &coordinator_tx,
+                                    &coordinator_state_rx,
+                                    dest,
+                                    &mut CdcApplyCoordination {
+                                        table_apply_locks: &mut table_apply_locks,
+                                        active_table_applies: &mut active_table_applies,
+                                    },
+                                    CdcDispatchConfig {
+                                        max_active_applies,
+                                        apply_batch_size,
+                                        max_fill: apply_max_fill,
+                                        force_flush: true,
+                                    },
+                                )?;
+                                if inflight_dispatch.is_empty() && inflight_apply.is_empty() {
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                } else {
+                                    let acks = drain_one_cdc_work(
+                                        &mut inflight_dispatch,
+                                        &mut inflight_apply,
+                                        &mut active_table_applies,
+                                    )
+                                    .await?;
+                                    submit_cdc_apply_acks(&coordinator_tx, acks)?;
+                                }
+                                drain_ready_cdc_coordinator_advances(
+                                    &coordinator_tx,
+                                    &mut coordinator_advances_rx,
+                                    &coordinator_state_rx,
                                     &stats,
                                     table_configs,
                                     state,
@@ -667,7 +733,9 @@ impl PostgresSource {
                                     }],
                                 )?;
                                 drain_ready_cdc_coordinator_advances(
+                                    &coordinator_tx,
                                     &mut coordinator_advances_rx,
+                                    &coordinator_state_rx,
                                     &stats,
                                     table_configs,
                                     state,
@@ -875,7 +943,9 @@ impl PostgresSource {
                 submit_cdc_apply_acks(&coordinator_tx, acks)?;
             }
             drain_ready_cdc_coordinator_advances(
+                &coordinator_tx,
                 &mut coordinator_advances_rx,
+                &coordinator_state_rx,
                 &stats,
                 table_configs,
                 state,
@@ -891,7 +961,9 @@ impl PostgresSource {
                 submit_cdc_apply_acks(&coordinator_tx, acks)?;
             }
             drain_ready_cdc_coordinator_advances(
+                &coordinator_tx,
                 &mut coordinator_advances_rx,
+                &coordinator_state_rx,
                 &stats,
                 table_configs,
                 state,

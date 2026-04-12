@@ -60,6 +60,7 @@ pub(super) struct ProgressResponse {
     pub(super) current_run: Option<RunSummary>,
     pub(super) runtime: ConnectionRuntime,
     pub(super) cdc: ConnectionCdcSnapshot,
+    pub(super) cdc_progress: Option<CdcProgressInsight>,
     pub(super) batch_load_queue: Option<CdcBatchLoadQueueSummary>,
     pub(super) cdc_coordinator: Option<CdcCoordinatorSummary>,
     pub(super) tables: Vec<TableProgress>,
@@ -77,6 +78,21 @@ pub(super) struct TableProgress {
     pub(super) lag_seconds: Option<i64>,
     pub(super) snapshot_chunks_total: usize,
     pub(super) snapshot_chunks_complete: usize,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct CdcProgressInsight {
+    pub(super) status: &'static str,
+    pub(super) primary_blocker: &'static str,
+    pub(super) detail: String,
+    pub(super) sequence_lag: Option<i64>,
+    pub(super) wal_bytes_behind: Option<i64>,
+    pub(super) pending_fragments: Option<i64>,
+    pub(super) failed_fragments: Option<i64>,
+    pub(super) pending_jobs: Option<i64>,
+    pub(super) running_jobs: Option<i64>,
+    pub(super) jobs_per_minute: Option<i64>,
+    pub(super) rows_per_minute: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -179,6 +195,13 @@ pub(super) struct ScrubbedPostgresConfig {
     pub(super) cdc_batch_size: Option<usize>,
     pub(super) cdc_apply_concurrency: Option<usize>,
     pub(super) cdc_batch_load_worker_count: Option<usize>,
+    pub(super) cdc_batch_load_staging_worker_count: Option<usize>,
+    pub(super) cdc_batch_load_reducer_worker_count: Option<usize>,
+    pub(super) cdc_max_inflight_commits: Option<usize>,
+    pub(super) cdc_batch_load_reducer_max_jobs: Option<usize>,
+    pub(super) cdc_batch_load_reducer_enabled: Option<bool>,
+    pub(super) cdc_backlog_max_pending_fragments: Option<usize>,
+    pub(super) cdc_backlog_max_oldest_pending_seconds: Option<u64>,
     pub(super) cdc_max_fill_ms: Option<u64>,
     pub(super) cdc_max_pending_events: Option<usize>,
     pub(super) cdc_idle_timeout_seconds: Option<u64>,

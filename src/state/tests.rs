@@ -10,6 +10,58 @@ fn test_state_config() -> Option<StateConfig> {
     })
 }
 
+#[test]
+fn cdc_ledger_stage_defaults_from_legacy_statuses() {
+    assert_eq!(
+        CdcLedgerStage::from_job_status(CdcBatchLoadJobStatus::Pending),
+        CdcLedgerStage::Received
+    );
+    assert_eq!(
+        CdcLedgerStage::from_job_status(CdcBatchLoadJobStatus::Running),
+        CdcLedgerStage::Applying
+    );
+    assert_eq!(
+        CdcLedgerStage::from_job_status(CdcBatchLoadJobStatus::Succeeded),
+        CdcLedgerStage::Applied
+    );
+    assert_eq!(
+        CdcLedgerStage::from_fragment_status(CdcCommitFragmentStatus::Succeeded),
+        CdcLedgerStage::Applied
+    );
+}
+
+#[test]
+fn cdc_ledger_stage_normalization_preserves_explicit_pipeline_stages() {
+    assert_eq!(
+        CdcLedgerStage::normalize_for_job_status(
+            CdcLedgerStage::Staged,
+            CdcBatchLoadJobStatus::Pending,
+        ),
+        CdcLedgerStage::Staged
+    );
+    assert_eq!(
+        CdcLedgerStage::normalize_for_job_status(
+            CdcLedgerStage::Received,
+            CdcBatchLoadJobStatus::Running,
+        ),
+        CdcLedgerStage::Applying
+    );
+    assert_eq!(
+        CdcLedgerStage::normalize_for_fragment_status(
+            CdcLedgerStage::Loaded,
+            CdcCommitFragmentStatus::Pending,
+        ),
+        CdcLedgerStage::Loaded
+    );
+    assert_eq!(
+        CdcLedgerStage::normalize_for_fragment_status(
+            CdcLedgerStage::Received,
+            CdcCommitFragmentStatus::Failed,
+        ),
+        CdcLedgerStage::Failed
+    );
+}
+
 #[tokio::test]
 async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {

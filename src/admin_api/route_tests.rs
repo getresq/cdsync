@@ -305,6 +305,13 @@ fn test_config() -> Config {
                 cdc_batch_size: Some(1000),
                 cdc_apply_concurrency: Some(8),
                 cdc_batch_load_worker_count: Some(8),
+                cdc_batch_load_staging_worker_count: None,
+                cdc_batch_load_reducer_worker_count: None,
+                cdc_max_inflight_commits: None,
+                cdc_batch_load_reducer_max_jobs: None,
+                cdc_batch_load_reducer_enabled: None,
+                cdc_backlog_max_pending_fragments: None,
+                cdc_backlog_max_oldest_pending_seconds: None,
                 cdc_max_fill_ms: Some(2000),
                 cdc_max_pending_events: Some(100_000),
                 cdc_idle_timeout_seconds: Some(10),
@@ -1125,6 +1132,11 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(progress_json["cdc"]["slot_active"], true);
     assert_eq!(progress_json["cdc"]["confirmed_flush_lsn"], "0/16B6C50");
     assert!(progress_json["cdc"]["sampled_at"].is_string());
+    assert_eq!(progress_json["cdc_progress"]["status"], "watch");
+    assert_eq!(
+        progress_json["cdc_progress"]["primary_blocker"],
+        "unattributed_wal_gap"
+    );
     assert_eq!(progress_json["tables"][0]["table_name"], "public.accounts");
     assert_eq!(
         progress_json["tables"][0]["checkpoint"]["last_primary_key"],

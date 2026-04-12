@@ -4,10 +4,10 @@ use crate::destinations::bigquery::{
 use crate::destinations::{Destination as CdsDestination, WriteMode};
 use crate::state::{
     CdcBatchLoadJobRecord, CdcBatchLoadJobStatus, CdcCommitFragmentRecord, CdcCommitFragmentStatus,
-    StateHandle,
+    CdcLedgerStage, StateHandle,
 };
 use crate::stats::StatsHandle;
-use crate::types::{DataType, MetadataColumns, TableSchema};
+use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -23,12 +23,13 @@ use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, oneshot};
 use tokio::task;
-use tracing::{info, info_span, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 mod frame;
 mod queue;
@@ -73,14 +74,41 @@ pub struct CdcTableSpec {
 
 struct CdcCommitTableWork {
     table_id: TableId,
-    rows: Vec<TableRow>,
-    delete_rows: Vec<TableRow>,
+    rows: Vec<CdcTableWorkRow>,
+    delete_rows: Vec<CdcTableWorkRow>,
     truncate: bool,
+}
+
+#[derive(Debug)]
+struct CdcTableWorkRow {
+    row: TableRow,
+    commit_lsn: String,
+    tx_ordinal: u64,
+    operation: CdcTableWorkRowOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CdcTableWorkRowOperation {
+    Upsert,
+    Delete,
+}
+
+impl CdcTableWorkRowOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 struct CdcQueuedBatchLoadJob {
     record: CdcBatchLoadJobRecord,
     payload: CdcBatchLoadJobPayload,
+}
+
+struct CdcQueuedBatchLoadWindow {
+    jobs: Vec<CdcQueuedBatchLoadJob>,
 }
 
 #[derive(Clone)]
@@ -99,18 +127,21 @@ struct CdcBatchLoadManager {
     mixed_mode_gate_enabled: Arc<AtomicBool>,
     waiters: Arc<Mutex<CdcBatchLoadJobWaiters>>,
     notify: Arc<Notify>,
+    reducer_max_jobs: usize,
     local_retry_retryable_failures: bool,
 }
 
 enum PendingTableRowAction {
-    Upsert(TableRow),
-    Delete(TableRow),
+    Upsert(CdcTableWorkRow),
+    Delete(CdcTableWorkRow),
 }
 
 const CDC_FRAME_BUILD_BLOCKING_ROWS: usize = 512;
 const CDC_BATCH_LOAD_CLAIM_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CDC_BATCH_LOAD_JOB_STALE_TIMEOUT: Duration = Duration::from_secs(90);
+const CDC_BATCH_LOAD_JOB_HARD_TIMEOUT: Duration =
+    crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 
 #[derive(Clone, Copy)]
 enum CdcBatchLoadStepKind {
@@ -193,7 +224,9 @@ impl EtlBigQueryDestination {
         tables: HashMap<TableId, CdcTableInfo>,
         stats: Option<StatsHandle>,
         apply_concurrency: usize,
-        cdc_batch_load_worker_count: usize,
+        cdc_batch_load_staging_worker_count: usize,
+        cdc_batch_load_reducer_worker_count: usize,
+        cdc_batch_load_reducer_max_jobs: usize,
         state_handle: Option<StateHandle>,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
@@ -204,7 +237,9 @@ impl EtlBigQueryDestination {
                         inner.clone(),
                         stats.clone(),
                         state_handle,
-                        cdc_batch_load_worker_count.max(1),
+                        cdc_batch_load_staging_worker_count.max(1),
+                        cdc_batch_load_reducer_worker_count.max(1),
+                        cdc_batch_load_reducer_max_jobs.max(1),
                         local_retry_retryable_failures,
                     )
                     .await?,
@@ -255,7 +290,7 @@ impl EtlBigQueryDestination {
     async fn write_rows(
         &self,
         info: &CdcTableInfo,
-        rows: Vec<TableRow>,
+        rows: Vec<CdcTableWorkRow>,
         mode: WriteMode,
         synced_at: DateTime<Utc>,
         deleted_at_override: Option<DateTime<Utc>>,
@@ -280,7 +315,13 @@ impl EtlBigQueryDestination {
             ensure_ms = ensure_started_at.elapsed().as_millis() as u64,
             "destination table ensured before CDC write"
         );
-        let frame = build_cdc_frame(info.clone(), rows, synced_at, deleted_at_override).await?;
+        let frame = build_cdc_frame(
+            info.clone(),
+            rows.into_iter().map(|row| row.row).collect(),
+            synced_at,
+            deleted_at_override,
+        )
+        .await?;
         let load_start = Instant::now();
         self.inner
             .write_batch(
@@ -400,7 +441,7 @@ impl EtlBigQueryDestination {
                     delete_rows: Vec::new(),
                     truncate: false,
                 })
-                .rows = rows;
+                .rows = legacy_work_rows(rows, CdcTableWorkRowOperation::Upsert);
         }
 
         for (table_id, rows) in pending_deletes.drain() {
@@ -412,7 +453,7 @@ impl EtlBigQueryDestination {
                     delete_rows: Vec::new(),
                     truncate: false,
                 })
-                .delete_rows = rows;
+                .delete_rows = legacy_work_rows(rows, CdcTableWorkRowOperation::Delete);
         }
 
         let semaphore = Arc::new(Semaphore::new(self.apply_concurrency));
@@ -499,6 +540,20 @@ impl EtlBigQueryDestination {
     }
 }
 
+fn legacy_work_rows(
+    rows: Vec<TableRow>,
+    operation: CdcTableWorkRowOperation,
+) -> Vec<CdcTableWorkRow> {
+    rows.into_iter()
+        .map(|row| CdcTableWorkRow {
+            row,
+            commit_lsn: "0/0".to_string(),
+            tx_ordinal: 0,
+            operation,
+        })
+        .collect()
+}
+
 impl EtlDestination for EtlBigQueryDestination {
     fn name() -> &'static str {
         "cdsync_bigquery"
@@ -537,8 +592,14 @@ impl EtlDestination for EtlBigQueryDestination {
         let result = async {
             let info = self.get_table(table_id).await?;
             let synced_at = Utc::now();
-            self.write_rows(&info, table_rows, WriteMode::Append, synced_at, None)
-                .await
+            self.write_rows(
+                &info,
+                legacy_work_rows(table_rows, CdcTableWorkRowOperation::Upsert),
+                WriteMode::Append,
+                synced_at,
+                None,
+            )
+            .await
         }
         .await;
 
@@ -783,9 +844,12 @@ mod tests {
         assert_eq!(work.rows.len(), 1);
         assert!(work.delete_rows.is_empty());
         assert_eq!(
-            work.rows[0],
+            work.rows[0].row,
             TableRow::new(vec![Cell::I64(1), Cell::Bool(true)])
         );
+        assert_eq!(work.rows[0].commit_lsn, "0/3");
+        assert_eq!(work.rows[0].tx_ordinal, 1);
+        assert_eq!(work.rows[0].operation, CdcTableWorkRowOperation::Upsert);
     }
 
     #[test]
@@ -845,10 +909,58 @@ mod tests {
 
         let work = compact_table_events(&info, table_id, events).expect("work");
         assert!(work.truncate);
+        assert_eq!(work.rows.len(), 1);
         assert_eq!(
-            work.rows,
-            vec![TableRow::new(vec![Cell::I64(2), Cell::Null])]
+            work.rows[0].row,
+            TableRow::new(vec![Cell::I64(2), Cell::Null])
         );
         assert!(work.delete_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cdc_staging_frame_includes_reducer_metadata_columns() {
+        let info = build_info();
+        let table_id = info.table_id;
+        let events = vec![Event::Update(UpdateEvent {
+            start_lsn: etl::types::PgLsn::from(2),
+            commit_lsn: etl::types::PgLsn::from(3),
+            tx_ordinal: 7,
+            table_id,
+            table_row: TableRow::new(vec![Cell::I64(1), Cell::Bool(true)]),
+            old_table_row: None,
+        })];
+        let work = compact_table_events(&info, table_id, events).expect("work");
+        let frame = build_cdc_staging_frame(
+            info,
+            work.rows,
+            HashMap::from([("0/3".to_string(), 44_u64)]),
+            Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            None,
+        )
+        .await
+        .expect("staging frame");
+
+        assert!(frame.column(CDC_STAGING_SEQUENCE_COLUMN).is_ok());
+        assert!(frame.column(CDC_STAGING_COMMIT_LSN_COLUMN).is_ok());
+        assert!(frame.column(CDC_STAGING_TX_ORDINAL_COLUMN).is_ok());
+        assert!(frame.column(CDC_STAGING_OPERATION_COLUMN).is_ok());
+        assert_eq!(
+            frame
+                .column(CDC_STAGING_SEQUENCE_COLUMN)
+                .expect("sequence")
+                .i64()
+                .expect("sequence i64")
+                .get(0),
+            Some(44)
+        );
+        assert_eq!(
+            frame
+                .column(CDC_STAGING_OPERATION_COLUMN)
+                .expect("operation")
+                .str()
+                .expect("operation string")
+                .get(0),
+            Some("upsert")
+        );
     }
 }

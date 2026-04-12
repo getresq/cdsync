@@ -22,12 +22,19 @@ pub(super) fn cdc_batch_load_job_record_from_row(
     row: &PgRow,
 ) -> anyhow::Result<CdcBatchLoadJobRecord> {
     let first_sequence = row.try_get::<i64, _>("first_sequence")?;
+    let status = CdcBatchLoadJobStatus::from_str(&row.try_get::<String, _>("status")?)?;
+    let stage = row
+        .try_get::<Option<String>, _>("stage")?
+        .map(|value| CdcLedgerStage::from_str(&value))
+        .transpose()?
+        .unwrap_or_else(|| CdcLedgerStage::from_job_status(status));
     Ok(CdcBatchLoadJobRecord {
         job_id: row.try_get("job_id")?,
         table_key: row.try_get("table_key")?,
         first_sequence: u64::try_from(first_sequence)
             .context("cdc batch-load job first_sequence must be non-negative")?,
-        status: CdcBatchLoadJobStatus::from_str(&row.try_get::<String, _>("status")?)?,
+        status,
+        stage,
         payload_json: row.try_get("payload_json")?,
         attempt_count: row.try_get("attempt_count")?,
         retry_class: row
@@ -35,6 +42,13 @@ pub(super) fn cdc_batch_load_job_record_from_row(
             .map(|value| value.parse::<SyncRetryClass>())
             .transpose()?,
         last_error: row.try_get("last_error")?,
+        staging_table: row.try_get("staging_table")?,
+        artifact_uri: row.try_get("artifact_uri")?,
+        load_job_id: row.try_get("load_job_id")?,
+        merge_job_id: row.try_get("merge_job_id")?,
+        primary_key_lane: row.try_get("primary_key_lane")?,
+        barrier_kind: row.try_get("barrier_kind")?,
+        ledger_metadata_json: row.try_get("ledger_metadata_json")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

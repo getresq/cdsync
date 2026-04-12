@@ -49,18 +49,44 @@ impl StateHandle {
             .await
     }
 
-    pub async fn claim_next_cdc_batch_load_job(
+    pub async fn claim_next_cdc_batch_load_staging_job(
         &self,
-        stale_running_before_ms: i64,
+        stale_staged_before_ms: i64,
     ) -> anyhow::Result<Option<CdcBatchLoadJobRecord>> {
         self.store
-            .claim_next_cdc_batch_load_job(&self.connection_id, stale_running_before_ms)
+            .claim_next_cdc_batch_load_staging_job(&self.connection_id, stale_staged_before_ms)
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_job_loaded(&self, job_id: &str) -> anyhow::Result<bool> {
+        self.store
+            .mark_cdc_batch_load_job_loaded(&self.connection_id, job_id)
+            .await
+    }
+
+    pub async fn claim_next_loaded_cdc_batch_load_job_window_for_apply(
+        &self,
+        stale_running_before_ms: i64,
+        max_jobs: usize,
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        self.store
+            .claim_next_loaded_cdc_batch_load_job_window_for_apply(
+                &self.connection_id,
+                stale_running_before_ms,
+                max_jobs,
+            )
             .await
     }
 
     pub async fn heartbeat_cdc_batch_load_job(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
             .heartbeat_cdc_batch_load_job(&self.connection_id, job_id)
+            .await
+    }
+
+    pub async fn heartbeat_cdc_batch_load_jobs(&self, job_ids: &[String]) -> anyhow::Result<()> {
+        self.store
+            .heartbeat_cdc_batch_load_jobs(&self.connection_id, job_ids)
             .await
     }
 
@@ -78,45 +104,70 @@ impl StateHandle {
             .await
     }
 
-    pub async fn mark_cdc_batch_load_job_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
+    pub async fn mark_cdc_batch_load_bundle_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
-            .mark_cdc_batch_load_job_succeeded(&self.connection_id, job_id)
+            .mark_cdc_batch_load_bundle_succeeded(&self.connection_id, job_id)
             .await
     }
 
-    pub async fn mark_cdc_batch_load_job_failed(
+    pub async fn mark_cdc_batch_load_window_succeeded(
+        &self,
+        job_ids: &[String],
+    ) -> anyhow::Result<()> {
+        self.store
+            .mark_cdc_batch_load_window_succeeded(&self.connection_id, job_ids)
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_bundle_failed(
         &self,
         job_id: &str,
         error: &str,
         retry_class: SyncRetryClass,
+        mark_fragments_failed: bool,
     ) -> anyhow::Result<()> {
         self.store
-            .mark_cdc_batch_load_job_failed(&self.connection_id, job_id, error, retry_class)
+            .mark_cdc_batch_load_bundle_failed(
+                &self.connection_id,
+                job_id,
+                error,
+                retry_class,
+                mark_fragments_failed,
+            )
             .await
     }
 
-    pub async fn mark_cdc_commit_fragments_succeeded_for_job(
+    pub async fn mark_cdc_batch_load_window_failed(
         &self,
-        job_id: &str,
-    ) -> anyhow::Result<()> {
-        self.store
-            .mark_cdc_commit_fragments_succeeded_for_job(&self.connection_id, job_id)
-            .await
-    }
-
-    pub async fn mark_cdc_commit_fragments_failed_for_job(
-        &self,
-        job_id: &str,
+        job_ids: &[String],
         error: &str,
+        retry_class: SyncRetryClass,
+        mark_fragments_failed: bool,
     ) -> anyhow::Result<()> {
         self.store
-            .mark_cdc_commit_fragments_failed_for_job(&self.connection_id, job_id, error)
+            .mark_cdc_batch_load_window_failed(
+                &self.connection_id,
+                job_ids,
+                error,
+                retry_class,
+                mark_fragments_failed,
+            )
             .await
     }
 
     pub async fn save_cdc_feedback_state(&self, state: &CdcWatermarkState) -> anyhow::Result<()> {
         self.store
             .save_cdc_feedback_state(&self.connection_id, state)
+            .await
+    }
+
+    pub async fn load_cdc_durable_apply_frontier(
+        &self,
+        from_sequence: u64,
+        max_sequences: usize,
+    ) -> anyhow::Result<Option<CdcDurableApplyFrontier>> {
+        self.store
+            .load_cdc_durable_apply_frontier(&self.connection_id, from_sequence, max_sequences)
             .await
     }
 
@@ -146,6 +197,15 @@ impl StateHandle {
     pub async fn load_cdc_watermark_state(&self) -> anyhow::Result<Option<CdcWatermarkState>> {
         self.store
             .load_cdc_watermark_state(&self.connection_id)
+            .await
+    }
+
+    pub async fn load_cdc_coordinator_summary(
+        &self,
+        wal_bytes_behind_confirmed: Option<i64>,
+    ) -> anyhow::Result<CdcCoordinatorSummary> {
+        self.store
+            .load_cdc_coordinator_summary(&self.connection_id, wal_bytes_behind_confirmed)
             .await
     }
 

@@ -58,6 +58,9 @@ pub(super) enum CdcCoordinatorCommand {
     CompleteFragments {
         sequences: Vec<u64>,
     },
+    CompleteCommits {
+        sequences: Vec<u64>,
+    },
 }
 
 pub(super) struct CdcWatermarkRuntime<'a> {
@@ -114,14 +117,28 @@ impl CdcWatermarkTracker {
         &mut self,
         sequence: u64,
     ) -> Result<Option<CdcWatermarkAdvance>> {
+        if sequence < self.next_sequence {
+            return Ok(None);
+        }
         let entry = self
             .commits
             .get_mut(&sequence)
             .context("missing CDC commit tracker entry")?;
         if entry.remaining_fragments == 0 {
-            anyhow::bail!("duplicate CDC apply ack for sequence {}", sequence);
+            return Ok(None);
         }
         entry.remaining_fragments -= 1;
+        Ok(self.advance_ready())
+    }
+
+    pub(super) fn complete_commit(&mut self, sequence: u64) -> Result<Option<CdcWatermarkAdvance>> {
+        if sequence < self.next_sequence {
+            return Ok(None);
+        }
+        let Some(entry) = self.commits.get_mut(&sequence) else {
+            return Ok(None);
+        };
+        entry.remaining_fragments = 0;
         Ok(self.advance_ready())
     }
 
@@ -191,6 +208,15 @@ pub(super) fn spawn_cdc_coordinator(
                 CdcCoordinatorCommand::CompleteFragments { sequences } => {
                     for sequence in sequences {
                         if let Some(advance) = tracker.complete_fragment(sequence)?
+                            && advance_tx.send(advance).is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                CdcCoordinatorCommand::CompleteCommits { sequences } => {
+                    for sequence in sequences {
+                        if let Some(advance) = tracker.complete_commit(sequence)?
                             && advance_tx.send(advance).is_err()
                         {
                             return Ok(());
@@ -645,6 +671,65 @@ mod tests {
 
         drop(tx);
         task.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn durable_commit_completion_advances_and_ignores_late_fragment_ack() -> anyhow::Result<()> {
+        let mut tracker = CdcWatermarkTracker {
+            next_sequence: 10,
+            commits: BTreeMap::new(),
+        };
+        tracker.register_commit(10, etl::types::PgLsn::from(0x0A_u64), HashMap::new(), 0, 2);
+        tracker.register_commit(11, etl::types::PgLsn::from(0x0B_u64), HashMap::new(), 0, 1);
+
+        let advance = tracker
+            .complete_commit(10)?
+            .context("durable frontier should advance sequence 10")?;
+        assert_eq!(advance.next_sequence_to_ack, 11);
+        assert!(tracker.complete_fragment(10)?.is_none());
+
+        let advance = tracker
+            .complete_fragment(11)?
+            .context("fragment ack should advance sequence 11")?;
+        assert_eq!(advance.next_sequence_to_ack, 12);
+
+        Ok(())
+    }
+
+    #[test]
+    fn durable_commit_completion_ignores_unregistered_sequence() -> anyhow::Result<()> {
+        let mut tracker = CdcWatermarkTracker {
+            next_sequence: 10,
+            commits: BTreeMap::new(),
+        };
+
+        assert!(tracker.complete_commit(10)?.is_none());
+        tracker.register_commit(10, etl::types::PgLsn::from(0x0A_u64), HashMap::new(), 0, 1);
+        let advance = tracker
+            .complete_commit(10)?
+            .context("durable frontier should advance after registration")?;
+        assert_eq!(advance.next_sequence_to_ack, 11);
+
+        Ok(())
+    }
+
+    #[test]
+    fn watermark_tracker_holds_later_completion_until_prefix_is_complete() -> anyhow::Result<()> {
+        let mut tracker = CdcWatermarkTracker {
+            next_sequence: 20,
+            commits: BTreeMap::new(),
+        };
+        tracker.register_commit(20, etl::types::PgLsn::from(0x20_u64), HashMap::new(), 0, 1);
+        tracker.register_commit(21, etl::types::PgLsn::from(0x21_u64), HashMap::new(), 0, 1);
+
+        assert!(tracker.complete_commit(21)?.is_none());
+        let advance = tracker
+            .complete_commit(20)?
+            .context("completing the prefix should release both commits")?;
+        assert_eq!(advance.next_sequence_to_ack, 22);
+        assert_eq!(advance.commit_lsn, etl::types::PgLsn::from(0x21_u64));
+
         Ok(())
     }
 }

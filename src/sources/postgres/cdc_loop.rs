@@ -1,5 +1,7 @@
 use super::*;
 
+const CDC_DURABLE_FRONTIER_SCAN_LIMIT: usize = 4096;
+
 pub(super) struct CdcIdleState {
     pub(super) follow: bool,
     pub(super) in_tx: bool,
@@ -81,8 +83,83 @@ pub(super) fn submit_cdc_apply_acks(
     Ok(())
 }
 
+pub(super) async fn submit_cdc_durable_frontier_acks(
+    coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
+    coordinator_state_rx: &watch::Receiver<CdcCoordinatorRuntimeState>,
+    state_handle: Option<&StateHandle>,
+) -> Result<()> {
+    let Some(state_handle) = state_handle else {
+        return Ok(());
+    };
+    let from_sequence = coordinator_state_rx.borrow().next_sequence_to_ack;
+    let Some(frontier) = state_handle
+        .load_cdc_durable_apply_frontier(from_sequence, CDC_DURABLE_FRONTIER_SCAN_LIMIT)
+        .await?
+    else {
+        return Ok(());
+    };
+    if frontier.next_sequence_to_ack <= from_sequence {
+        return Ok(());
+    }
+    let sequences = (from_sequence..frontier.next_sequence_to_ack).collect::<Vec<_>>();
+    info!(
+        component = "coordinator",
+        event = "cdc_coordinator_durable_frontier_seen",
+        connection_id = state_handle.connection_id(),
+        from_sequence,
+        next_sequence_to_ack = frontier.next_sequence_to_ack,
+        commit_lsn = %frontier.commit_lsn,
+        sequence_count = sequences.len(),
+        "submitting durable CDC frontier completions"
+    );
+    coordinator_tx
+        .send(CdcCoordinatorCommand::CompleteCommits { sequences })
+        .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
+    Ok(())
+}
+
+pub(super) async fn cdc_durable_backlog_backpressure_exceeded(
+    slot_name: &str,
+    state_handle: Option<&StateHandle>,
+    max_pending_fragments: Option<usize>,
+    max_oldest_pending: Option<Duration>,
+) -> Result<bool> {
+    if max_pending_fragments.is_none() && max_oldest_pending.is_none() {
+        return Ok(false);
+    }
+    let Some(state_handle) = state_handle else {
+        return Ok(false);
+    };
+    let summary = state_handle.load_cdc_coordinator_summary(None).await?;
+    if let Some(max_pending_fragments) = max_pending_fragments
+        && summary.pending_fragments >= i64::try_from(max_pending_fragments).unwrap_or(i64::MAX)
+    {
+        crate::telemetry::record_cdc_backpressure_wait(
+            slot_name,
+            u64::try_from(summary.pending_fragments).unwrap_or_default(),
+            max_pending_fragments as u64,
+        );
+        return Ok(true);
+    }
+    if let (Some(oldest_pending_age_seconds), Some(max_oldest_pending)) =
+        (summary.oldest_pending_age_seconds, max_oldest_pending)
+        && oldest_pending_age_seconds
+            >= i64::try_from(max_oldest_pending.as_secs()).unwrap_or(i64::MAX)
+    {
+        crate::telemetry::record_cdc_backpressure_wait(
+            slot_name,
+            u64::try_from(oldest_pending_age_seconds).unwrap_or_default(),
+            max_oldest_pending.as_secs(),
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub(super) async fn drain_ready_cdc_coordinator_advances(
+    coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
     coordinator_advances_rx: &mut mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
+    coordinator_state_rx: &watch::Receiver<CdcCoordinatorRuntimeState>,
     stats: &Option<StatsHandle>,
     table_configs: &HashMap<TableId, ResolvedPostgresTable>,
     state: &mut ConnectionState,
@@ -91,6 +168,7 @@ pub(super) async fn drain_ready_cdc_coordinator_advances(
     last_received_lsn: etl::types::PgLsn,
     last_flushed_lsn: &mut etl::types::PgLsn,
 ) -> Result<()> {
+    submit_cdc_durable_frontier_acks(coordinator_tx, coordinator_state_rx, state_handle).await?;
     while let Ok(advance) = coordinator_advances_rx.try_recv() {
         apply_cdc_watermark_advance(
             advance,
@@ -369,7 +447,9 @@ pub(super) async fn finalize_cdc_runtime(
             submit_cdc_apply_acks(&coordinator_tx, acks)?;
         }
         drain_ready_cdc_coordinator_advances(
+            &coordinator_tx,
             coordinator_advances_rx,
+            coordinator_state_rx,
             stats,
             table_configs,
             state,
@@ -387,7 +467,9 @@ pub(super) async fn finalize_cdc_runtime(
         .await?;
         submit_cdc_apply_acks(&coordinator_tx, acks)?;
         drain_ready_cdc_coordinator_advances(
+            &coordinator_tx,
             coordinator_advances_rx,
+            coordinator_state_rx,
             stats,
             table_configs,
             state,
@@ -433,4 +515,126 @@ pub(super) async fn finalize_cdc_runtime(
     coordinator_task.await.map_err(anyhow::Error::new)??;
 
     Ok(*last_flushed_lsn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state_config() -> Option<crate::config::StateConfig> {
+        let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+        Some(crate::config::StateConfig {
+            url,
+            schema: Some(format!("cdsync_state_it_{}", Uuid::new_v4().simple())),
+        })
+    }
+
+    #[tokio::test]
+    async fn durable_frontier_scan_advances_replayed_registered_commit() -> anyhow::Result<()> {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        crate::state::SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&config, 16).await?;
+        let state_handle = store.handle("app");
+        let now = chrono::Utc::now().timestamp_millis();
+        let job = crate::state::CdcBatchLoadJobRecord {
+            job_id: "job-replayed-after-feedback-gap".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: crate::state::CdcBatchLoadJobStatus::Succeeded,
+            stage: crate::state::CdcLedgerStage::Applied,
+            payload_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        let fragment = crate::state::CdcCommitFragmentRecord {
+            fragment_id: "job-replayed-after-feedback-gap:10".to_string(),
+            job_id: job.job_id.clone(),
+            sequence: 10,
+            commit_lsn: "0/A".to_string(),
+            table_key: job.table_key.clone(),
+            status: crate::state::CdcCommitFragmentStatus::Succeeded,
+            stage: crate::state::CdcLedgerStage::Applied,
+            row_count: 1,
+            upserted_count: 1,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        state_handle
+            .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+            .await?;
+
+        let (coordinator_tx, mut advances_rx, state_rx, task) = spawn_cdc_coordinator(10);
+        coordinator_tx.send(CdcCoordinatorCommand::RegisterCommit {
+            sequence: 10,
+            commit_lsn: etl::types::PgLsn::from(0x0A_u64),
+            stats: HashMap::new(),
+            extract_ms: 0,
+            fragment_count: 1,
+        })?;
+
+        submit_cdc_durable_frontier_acks(&coordinator_tx, &state_rx, Some(&state_handle)).await?;
+        let advance = timeout(Duration::from_secs(1), advances_rx.recv())
+            .await?
+            .context("durable frontier should advance replayed commit")?;
+        assert_eq!(advance.next_sequence_to_ack, 11);
+        assert_eq!(advance.commit_lsn, etl::types::PgLsn::from(0x0A_u64));
+
+        drop(coordinator_tx);
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_backlog_backpressure_uses_pending_fragment_count() -> anyhow::Result<()> {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        crate::state::SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&config, 16).await?;
+        let state_handle = store.handle("app");
+        let now = chrono::Utc::now().timestamp_millis();
+        let job = crate::state::CdcBatchLoadJobRecord {
+            job_id: "job-pending-backpressure".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: crate::state::CdcBatchLoadJobStatus::Pending,
+            stage: crate::state::CdcLedgerStage::Loaded,
+            payload_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        let fragment = crate::state::CdcCommitFragmentRecord {
+            fragment_id: "job-pending-backpressure:10".to_string(),
+            job_id: job.job_id.clone(),
+            sequence: 10,
+            commit_lsn: "0/A".to_string(),
+            table_key: job.table_key.clone(),
+            status: crate::state::CdcCommitFragmentStatus::Pending,
+            stage: crate::state::CdcLedgerStage::Loaded,
+            row_count: 1,
+            upserted_count: 1,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        state_handle
+            .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+            .await?;
+
+        assert!(
+            cdc_durable_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(1), None)
+                .await?
+        );
+        assert!(
+            !cdc_durable_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(2), None)
+                .await?
+        );
+
+        Ok(())
+    }
 }

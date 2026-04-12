@@ -19,14 +19,94 @@ pub struct PostgresCdcState {
 pub struct CdcReplayCleanupSummary {
     pub discarded_jobs: u64,
     pub discarded_fragments: u64,
+    pub repaired_terminal_fragments: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CdcBatchLoadJobStatus {
+    #[default]
     Pending,
     Running,
     Succeeded,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CdcLedgerStage {
+    #[default]
+    Received,
+    Staged,
+    Loaded,
+    ApplyPending,
+    Applying,
+    Applied,
+    Failed,
+    Blocked,
+}
+
+impl CdcLedgerStage {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Staged => "staged",
+            Self::Loaded => "loaded",
+            Self::ApplyPending => "apply_pending",
+            Self::Applying => "applying",
+            Self::Applied => "applied",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub(super) fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "received" => Ok(Self::Received),
+            "staged" => Ok(Self::Staged),
+            "loaded" => Ok(Self::Loaded),
+            "apply_pending" => Ok(Self::ApplyPending),
+            "applying" => Ok(Self::Applying),
+            "applied" => Ok(Self::Applied),
+            "failed" => Ok(Self::Failed),
+            "blocked" => Ok(Self::Blocked),
+            other => anyhow::bail!("unknown CDC ledger stage {}", other),
+        }
+    }
+
+    pub(super) fn from_job_status(status: CdcBatchLoadJobStatus) -> Self {
+        match status {
+            CdcBatchLoadJobStatus::Pending => Self::Received,
+            CdcBatchLoadJobStatus::Running => Self::Applying,
+            CdcBatchLoadJobStatus::Succeeded => Self::Applied,
+            CdcBatchLoadJobStatus::Failed => Self::Failed,
+        }
+    }
+
+    pub(super) fn from_fragment_status(status: CdcCommitFragmentStatus) -> Self {
+        match status {
+            CdcCommitFragmentStatus::Pending => Self::Received,
+            CdcCommitFragmentStatus::Succeeded => Self::Applied,
+            CdcCommitFragmentStatus::Failed => Self::Failed,
+        }
+    }
+
+    pub(super) fn normalize_for_job_status(stage: Self, status: CdcBatchLoadJobStatus) -> Self {
+        if stage == Self::Received && !matches!(status, CdcBatchLoadJobStatus::Pending) {
+            Self::from_job_status(status)
+        } else {
+            stage
+        }
+    }
+
+    pub(super) fn normalize_for_fragment_status(
+        stage: Self,
+        status: CdcCommitFragmentStatus,
+    ) -> Self {
+        if stage == Self::Received && !matches!(status, CdcCommitFragmentStatus::Pending) {
+            Self::from_fragment_status(status)
+        } else {
+            stage
+        }
+    }
 }
 
 impl CdcBatchLoadJobStatus {
@@ -50,22 +130,31 @@ impl CdcBatchLoadJobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CdcBatchLoadJobRecord {
     pub job_id: String,
     pub table_key: String,
     pub first_sequence: u64,
     pub status: CdcBatchLoadJobStatus,
+    pub stage: CdcLedgerStage,
     pub payload_json: String,
     pub attempt_count: i32,
     pub retry_class: Option<SyncRetryClass>,
     pub last_error: Option<String>,
+    pub staging_table: Option<String>,
+    pub artifact_uri: Option<String>,
+    pub load_job_id: Option<String>,
+    pub merge_job_id: Option<String>,
+    pub primary_key_lane: Option<String>,
+    pub barrier_kind: Option<String>,
+    pub ledger_metadata_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CdcCommitFragmentStatus {
+    #[default]
     Pending,
     Succeeded,
     Failed,
@@ -90,7 +179,7 @@ impl CdcCommitFragmentStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CdcCommitFragmentRecord {
     pub fragment_id: String,
     pub job_id: String,
@@ -98,10 +187,18 @@ pub struct CdcCommitFragmentRecord {
     pub commit_lsn: String,
     pub table_key: String,
     pub status: CdcCommitFragmentStatus,
+    pub stage: CdcLedgerStage,
     pub row_count: i64,
     pub upserted_count: i64,
     pub deleted_count: i64,
     pub last_error: Option<String>,
+    pub artifact_uri: Option<String>,
+    pub staging_table: Option<String>,
+    pub load_job_id: Option<String>,
+    pub merge_job_id: Option<String>,
+    pub primary_key_lane: Option<String>,
+    pub barrier_kind: Option<String>,
+    pub ledger_metadata_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -121,9 +218,16 @@ pub struct CdcWatermarkState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CdcDurableApplyFrontier {
+    pub next_sequence_to_ack: u64,
+    pub commit_lsn: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CdcCoordinatorSummary {
     pub next_sequence_to_ack: u64,
     pub last_enqueued_sequence: Option<u64>,
+    pub sequence_lag: Option<i64>,
     pub pending_fragments: i64,
     pub failed_fragments: i64,
     pub oldest_pending_sequence: Option<u64>,
@@ -148,8 +252,17 @@ pub struct CdcBatchLoadQueueSummary {
     pub running_jobs: i64,
     pub succeeded_jobs: i64,
     pub failed_jobs: i64,
+    pub received_jobs: i64,
+    pub staged_jobs: i64,
+    pub loaded_jobs: i64,
+    pub applying_jobs: i64,
+    pub applied_jobs: i64,
+    pub failed_stage_jobs: i64,
     pub oldest_pending_age_seconds: Option<i64>,
     pub oldest_running_age_seconds: Option<i64>,
+    pub oldest_received_age_seconds: Option<i64>,
+    pub oldest_loaded_age_seconds: Option<i64>,
+    pub oldest_applying_age_seconds: Option<i64>,
     pub jobs_per_minute: i64,
     pub rows_per_minute: i64,
     pub avg_job_duration_seconds: Option<f64>,

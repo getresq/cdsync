@@ -242,6 +242,14 @@ source:
   cdc_pipeline_id: 1
   cdc_batch_size: 10000
   cdc_apply_concurrency: 8
+  cdc_batch_load_worker_count: 8
+  cdc_batch_load_staging_worker_count: 8
+  cdc_batch_load_reducer_worker_count: 8
+  cdc_max_inflight_commits: 32
+  cdc_batch_load_reducer_max_jobs: 16
+  cdc_batch_load_reducer_enabled: true
+  cdc_backlog_max_pending_fragments: 10000
+  cdc_backlog_max_oldest_pending_seconds: 300
   cdc_max_fill_ms: 2000
   cdc_max_pending_events: 100000
   cdc_idle_timeout_seconds: 10
@@ -276,6 +284,14 @@ CDC fields:
 - `cdc_pipeline_id`: required when `cdc: true`
 - `cdc_batch_size`: optional, defaults to `batch_size` then `sync.default_batch_size`
 - `cdc_apply_concurrency`: optional, defaults to `sync.max_concurrency`
+- `cdc_batch_load_worker_count`: optional legacy batch-load worker count, defaults to `cdc_apply_concurrency`; used as the fallback for staging and reducer worker counts. If both split worker counts are omitted, each pool uses this value, so total queued CDC worker tasks can be about 2x this number.
+- `cdc_batch_load_staging_worker_count`: optional queued CDC staging/load worker count, defaults to `cdc_batch_load_worker_count`
+- `cdc_batch_load_reducer_worker_count`: optional queued CDC apply/reducer worker count, defaults to `cdc_batch_load_worker_count`
+- `cdc_max_inflight_commits`: optional current in-memory CDC read-ahead cap, defaults to `cdc_apply_concurrency * 4`. This is not the future durable backlog budget.
+- `cdc_batch_load_reducer_max_jobs`: optional max loaded CDC jobs a table-local reducer claims at once, defaults to `16`
+- `cdc_batch_load_reducer_enabled`: optional reducer coalescing rollout gate, defaults to `true`; set `false` to force single-job apply windows
+- `cdc_backlog_max_pending_fragments`: optional durable pending-fragment cap for WAL backpressure; omitted means disabled
+- `cdc_backlog_max_oldest_pending_seconds`: optional durable oldest-pending-fragment age cap for WAL backpressure; omitted means disabled
 - `cdc_max_fill_ms`: optional, defaults to `2000`
 - `cdc_max_pending_events`: optional, defaults to `100000`
 - `cdc_idle_timeout_seconds`: optional, defaults to `10`

@@ -4,6 +4,8 @@ mod route_tests;
 mod runtime_helpers;
 mod scrub;
 mod streaming;
+#[cfg(test)]
+mod tests;
 
 use crate::config::{
     AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig,
@@ -840,6 +842,8 @@ async fn progress(
     } else {
         None
     };
+    let cdc_progress =
+        build_cdc_progress_insight(&cdc, batch_load_queue.as_ref(), cdc_coordinator.as_ref());
 
     Ok(Json(ProgressResponse {
         connection_id,
@@ -847,6 +851,7 @@ async fn progress(
         current_run,
         runtime,
         cdc,
+        cdc_progress,
         batch_load_queue,
         cdc_coordinator,
         tables,

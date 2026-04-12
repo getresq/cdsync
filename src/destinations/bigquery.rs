@@ -13,7 +13,12 @@ use gcloud_bigquery::client::google_cloud_auth::project::Config as GoogleAuthCon
 use gcloud_bigquery::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use gcloud_bigquery::client::{Client, ClientConfig};
 use gcloud_bigquery::http::error::Error as BqError;
+use gcloud_bigquery::http::job::get::GetJobRequest;
+use gcloud_bigquery::http::job::get_query_results::{
+    GetQueryResultsRequest, GetQueryResultsResponse,
+};
 use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
+use gcloud_bigquery::http::job::{Job, JobReference, JobState};
 use gcloud_bigquery::http::table::{
     Table, TableReference, TableSchema as BqTableSchema, TimePartitionType, TimePartitioning,
 };
@@ -21,6 +26,7 @@ use polars::prelude::DataFrame;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
@@ -29,7 +35,7 @@ use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::timeout;
-use tracing::{error, info, info_span, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -61,6 +67,8 @@ pub struct DestinationTableSummary {
 pub(crate) struct CdcBatchLoadJobStep {
     pub(crate) staging_table: String,
     pub(crate) object_uri: String,
+    #[serde(default)]
+    pub(crate) load_job_id: Option<String>,
     pub(crate) row_count: usize,
     pub(crate) upserted_count: usize,
     pub(crate) deleted_count: usize,
@@ -72,6 +80,8 @@ pub(crate) struct CdcBatchLoadJobPayload {
     pub(crate) source_table: String,
     pub(crate) target_table: String,
     pub(crate) schema: TableSchema,
+    #[serde(default)]
+    pub(crate) staging_schema: Option<TableSchema>,
     pub(crate) primary_key: String,
     pub(crate) truncate: bool,
     pub(crate) steps: Vec<CdcBatchLoadJobStep>,
@@ -79,6 +89,10 @@ pub(crate) struct CdcBatchLoadJobPayload {
 
 const EMULATOR_INSERT_BLOCKING_ROWS: usize = 512;
 pub(super) const BIGQUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const BIGQUERY_QUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(110);
+const BIGQUERY_JOB_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const CDC_STAGING_SEQUENCE_COLUMN: &str = "_cdsync_sequence";
+const CDC_STAGING_TX_ORDINAL_COLUMN: &str = "_cdsync_tx_ordinal";
 
 impl BigQueryDestination {
     pub(crate) fn cdc_batch_load_queue_enabled(&self) -> bool {
@@ -354,10 +368,20 @@ impl BigQueryDestination {
     }
 
     async fn run_query(&self, sql: &str) -> Result<QueryResponse> {
+        self.run_query_with_request_id(sql, None).await
+    }
+
+    async fn run_query_with_request_id(
+        &self,
+        sql: &str,
+        request_id: Option<String>,
+    ) -> Result<QueryResponse> {
         let request = QueryRequest {
             query: sql.to_string(),
             use_legacy_sql: false,
             location: self.config.location.clone().unwrap_or_default(),
+            timeout_ms: Some(BIGQUERY_QUERY_REQUEST_TIMEOUT.as_millis() as i64),
+            request_id,
             ..Default::default()
         };
 
@@ -387,6 +411,21 @@ impl BigQueryDestination {
             .await?
         };
 
+        let response = if response.job_complete {
+            response
+        } else {
+            if self.config.emulator_http.is_some() {
+                anyhow::bail!(
+                    "BigQuery emulator query returned incomplete job {}",
+                    response.job_reference.job_id
+                );
+            }
+            self.wait_for_query_job_completion("BigQuery query", &response.job_reference)
+                .await?;
+            self.fetch_query_results_response(&response.job_reference)
+                .await?
+        };
+
         if let Some(errors) = &response.errors
             && !errors.is_empty()
         {
@@ -395,6 +434,94 @@ impl BigQueryDestination {
         }
 
         Ok(response)
+    }
+
+    async fn wait_for_query_job_completion(
+        &self,
+        label: &str,
+        job_reference: &JobReference,
+    ) -> Result<()> {
+        if job_reference.job_id.is_empty() {
+            anyhow::bail!("{label} returned incomplete response without a BigQuery job id");
+        }
+        let location = job_reference
+            .location
+            .clone()
+            .or_else(|| self.config.location.clone());
+        let project_id = query_job_project_id(&self.config.project_id, job_reference);
+        let started_at = std::time::Instant::now();
+        let mut last_log_at = started_at;
+        loop {
+            let current = BigQueryDestination::await_with_timeout(
+                format!("fetching BigQuery query job {}", job_reference.job_id),
+                BIGQUERY_REQUEST_TIMEOUT,
+                self.client.job().get(
+                    project_id,
+                    &job_reference.job_id,
+                    &GetJobRequest {
+                        location: location.clone(),
+                    },
+                ),
+            )
+            .await?;
+
+            if query_job_completed(label, &current)? {
+                return Ok(());
+            }
+
+            if last_log_at.elapsed() >= BIGQUERY_JOB_PROGRESS_LOG_INTERVAL {
+                info!(
+                    job_id = %job_reference.job_id,
+                    state = ?current.status.state,
+                    elapsed_secs = started_at.elapsed().as_secs(),
+                    "waiting for BigQuery query job completion"
+                );
+                last_log_at = std::time::Instant::now();
+            }
+
+            if started_at.elapsed() >= BATCH_LOAD_JOB_HARD_TIMEOUT {
+                anyhow::bail!(
+                    "{} job {} exceeded hard timeout of {}s",
+                    label,
+                    job_reference.job_id,
+                    BATCH_LOAD_JOB_HARD_TIMEOUT.as_secs()
+                );
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn fetch_query_results_response(
+        &self,
+        job_reference: &JobReference,
+    ) -> Result<QueryResponse> {
+        let location = job_reference
+            .location
+            .clone()
+            .or_else(|| self.config.location.clone());
+        let project_id = query_job_project_id(&self.config.project_id, job_reference);
+        let result = BigQueryDestination::await_with_timeout(
+            format!(
+                "fetching BigQuery query results for {}",
+                job_reference.job_id
+            ),
+            BIGQUERY_REQUEST_TIMEOUT,
+            self.client.job().get_query_results(
+                project_id,
+                &job_reference.job_id,
+                &GetQueryResultsRequest {
+                    start_index: 0,
+                    page_token: None,
+                    max_results: None,
+                    timeout_ms: Some(BIGQUERY_QUERY_REQUEST_TIMEOUT.as_millis() as i64),
+                    location,
+                    format_options: None,
+                },
+            ),
+        )
+        .await?;
+        get_query_results_to_query_response(result)
     }
 
     async fn ensure_table_internal(
@@ -682,45 +809,12 @@ impl BigQueryDestination {
         Ok(object_uri)
     }
 
-    pub(crate) async fn process_cdc_batch_load_job(
+    pub(crate) async fn stage_cdc_batch_load_job(
         &self,
         connection_id: &str,
         payload: &CdcBatchLoadJobPayload,
     ) -> Result<()> {
-        let target_started_at = std::time::Instant::now();
-        let target_span = info_span!(
-            "cdc_batch_load_job.ensure_target",
-            connection_id = connection_id,
-            table = %payload.target_table
-        );
-        {
-            let _target_span = target_span.enter();
-            self.ensure_table(&payload.schema).await?;
-        }
-        crate::telemetry::record_cdc_batch_load_stage_duration(
-            connection_id,
-            &payload.target_table,
-            "ensure_target",
-            target_started_at.elapsed().as_secs_f64() * 1000.0,
-            payload.steps.iter().map(|step| step.row_count as u64).sum(),
-        );
-        info!(
-            component = "consumer",
-            event = "cdc_consumer_ensure_target_completed",
-            connection_id = connection_id,
-            table = %payload.target_table,
-            duration_ms = target_started_at.elapsed().as_millis() as u64,
-            "queued ensure target completed"
-        );
-        if payload.truncate {
-            let truncate_started_at = std::time::Instant::now();
-            self.truncate_table(&payload.target_table).await?;
-            info!(
-                table = %payload.target_table,
-                duration_ms = truncate_started_at.elapsed().as_millis() as u64,
-                "queued truncate target completed"
-            );
-        }
+        let staging_schema = payload.staging_schema.as_ref().unwrap_or(&payload.schema);
         for step in &payload.steps {
             info!(
                 component = "consumer",
@@ -740,8 +834,8 @@ impl BigQueryDestination {
                 rows = step.row_count
             );
             {
-                let _ensure_staging_span = ensure_staging_span.enter();
-                self.ensure_table_internal(&payload.schema, &step.staging_table, false)
+                self.ensure_table_internal(staging_schema, &step.staging_table, false)
+                    .instrument(ensure_staging_span)
                     .await?;
             }
             crate::telemetry::record_cdc_batch_load_stage_duration(
@@ -770,13 +864,14 @@ impl BigQueryDestination {
                 rows = step.row_count
             );
             {
-                let _load_span = load_span.enter();
                 self.run_load_job(
                     &step.staging_table,
-                    &with_metadata_schema(&payload.schema, &self.metadata),
+                    &with_metadata_schema(staging_schema, &self.metadata),
                     &step.object_uri,
                     gcloud_bigquery::http::job::WriteDisposition::WriteTruncate,
+                    step.load_job_id.as_deref(),
                 )
+                .instrument(load_span)
                 .await?;
             }
             crate::telemetry::record_cdc_batch_load_stage_duration(
@@ -796,6 +891,98 @@ impl BigQueryDestination {
                 duration_ms = load_started_at.elapsed().as_millis() as u64,
                 "queued BigQuery load job completed"
             );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_cdc_batch_load_job(
+        &self,
+        connection_id: &str,
+        payload: &CdcBatchLoadJobPayload,
+    ) -> Result<()> {
+        let target_started_at = std::time::Instant::now();
+        let target_span = info_span!(
+            "cdc_batch_load_job.ensure_target",
+            connection_id = connection_id,
+            table = %payload.target_table
+        );
+        {
+            self.ensure_table(&payload.schema)
+                .instrument(target_span)
+                .await?;
+        }
+        crate::telemetry::record_cdc_batch_load_stage_duration(
+            connection_id,
+            &payload.target_table,
+            "ensure_target",
+            target_started_at.elapsed().as_secs_f64() * 1000.0,
+            payload.steps.iter().map(|step| step.row_count as u64).sum(),
+        );
+        info!(
+            component = "consumer",
+            event = "cdc_consumer_ensure_target_completed",
+            connection_id = connection_id,
+            table = %payload.target_table,
+            duration_ms = target_started_at.elapsed().as_millis() as u64,
+            "queued ensure target completed"
+        );
+        if payload.truncate {
+            let truncate_started_at = std::time::Instant::now();
+            self.truncate_table(&payload.target_table).await?;
+            info!(
+                table = %payload.target_table,
+                duration_ms = truncate_started_at.elapsed().as_millis() as u64,
+                "queued truncate target completed"
+            );
+        }
+        if payload.staging_schema.is_some() && !payload.steps.is_empty() {
+            let merge_started_at = std::time::Instant::now();
+            info!(
+                component = "consumer",
+                event = "cdc_consumer_reducer_merge_started",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                step_count = payload.steps.len(),
+                rows = payload.steps.iter().map(|step| step.row_count).sum::<usize>(),
+                "starting reduced queued BigQuery merge from staging tables"
+            );
+            let merge_span = info_span!(
+                "cdc_batch_load_job.reducer_merge",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                step_count = payload.steps.len()
+            );
+            self.merge_cdc_staging_steps(
+                &payload.target_table,
+                &payload.steps,
+                &payload.schema,
+                &payload.primary_key,
+            )
+            .instrument(merge_span)
+            .await?;
+            crate::telemetry::record_cdc_batch_load_stage_duration(
+                connection_id,
+                &payload.target_table,
+                "merge",
+                merge_started_at.elapsed().as_secs_f64() * 1000.0,
+                payload.steps.iter().map(|step| step.row_count as u64).sum(),
+            );
+            info!(
+                component = "consumer",
+                event = "cdc_consumer_reducer_merge_completed",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                step_count = payload.steps.len(),
+                duration_ms = merge_started_at.elapsed().as_millis() as u64,
+                "completed reduced queued BigQuery merge from staging tables"
+            );
+            for step in &payload.steps {
+                self.spawn_drop_table_if_exists(step.staging_table.clone())
+                    .await;
+            }
+            return Ok(());
+        }
+        for step in &payload.steps {
             info!(
                 component = "consumer",
                 event = "cdc_consumer_merge_started",
@@ -814,13 +1001,13 @@ impl BigQueryDestination {
                 rows = step.row_count
             );
             {
-                let _merge_span = merge_span.enter();
                 self.merge_staging(
                     &payload.target_table,
                     &step.staging_table,
                     &payload.schema,
                     &payload.primary_key,
                 )
+                .instrument(merge_span)
                 .await?;
             }
             crate::telemetry::record_cdc_batch_load_stage_duration(
@@ -890,8 +1077,71 @@ impl BigQueryDestination {
             insert_vals = insert_vals.join(", ")
         );
 
-        self.run_query(&sql).await.with_context(|| {
-            format!("merging staging BigQuery table {} into {}", staging, target)
+        self.run_query_with_request_id(
+            &sql,
+            Some(stable_query_request_id(
+                "merge",
+                &format!("{}:{}:{}", self.config.dataset, target, staging),
+            )),
+        )
+        .await
+        .with_context(|| format!("merging staging BigQuery table {} into {}", staging, target))?;
+        Ok(())
+    }
+
+    async fn merge_cdc_staging_steps(
+        &self,
+        target: &str,
+        steps: &[CdcBatchLoadJobStep],
+        schema: &TableSchema,
+        primary_key: &str,
+    ) -> Result<()> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+        if self.dry_run {
+            info!(
+                "dry-run: reduced merge {} staging tables into {}",
+                steps.len(),
+                target
+            );
+            return Ok(());
+        }
+
+        let merge_lock = self.table_merge_lock(target).await;
+        let _merge_permit = merge_lock
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to acquire BigQuery merge lock for {}", target))?;
+
+        let sql = cdc_reducer_merge_sql(
+            &self.config.project_id,
+            &self.config.dataset,
+            target,
+            steps,
+            schema,
+            &self.metadata,
+            primary_key,
+        );
+        let staging_key = steps
+            .iter()
+            .map(|step| step.staging_table.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.run_query_with_request_id(
+            &sql,
+            Some(stable_query_request_id(
+                "merge",
+                &format!("{}:{}:{}", self.config.dataset, target, staging_key),
+            )),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "merging {} CDC staging BigQuery tables into {}",
+                steps.len(),
+                target
+            )
         })?;
         Ok(())
     }
@@ -1148,13 +1398,147 @@ pub(crate) fn stable_cdc_batch_load_object_name(
     )
 }
 
+fn cdc_reducer_merge_sql(
+    project: &str,
+    dataset: &str,
+    target: &str,
+    steps: &[CdcBatchLoadJobStep],
+    schema: &TableSchema,
+    metadata: &MetadataColumns,
+    primary_key: &str,
+) -> String {
+    let schema = with_metadata_schema(schema, metadata);
+    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let projection = columns
+        .iter()
+        .map(|col| bq_ident(col))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut reducer_columns = columns.iter().map(|col| bq_ident(col)).collect::<Vec<_>>();
+    reducer_columns.push(bq_ident(CDC_STAGING_SEQUENCE_COLUMN));
+    reducer_columns.push(bq_ident(CDC_STAGING_TX_ORDINAL_COLUMN));
+    let reducer_projection = reducer_columns.join(", ");
+    let union_sources = steps
+        .iter()
+        .map(|step| {
+            format!(
+                "SELECT {reducer_projection} FROM `{project}.{dataset}.{staging}`",
+                staging = step.staging_table
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let updates = columns
+        .iter()
+        .map(|col| format!("{} = S.{}", bq_ident(col), bq_ident(col)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_cols = columns
+        .iter()
+        .map(|col| bq_ident(col))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = columns
+        .iter()
+        .map(|col| format!("S.{}", bq_ident(col)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pk = bq_ident(primary_key);
+    let sequence = bq_ident(CDC_STAGING_SEQUENCE_COLUMN);
+    let tx_ordinal = bq_ident(CDC_STAGING_TX_ORDINAL_COLUMN);
+
+    format!(
+        "MERGE `{project}.{dataset}.{target}` T USING (\
+         SELECT {projection} FROM (\
+         SELECT {projection}, ROW_NUMBER() OVER (PARTITION BY {pk} \
+         ORDER BY {sequence} DESC, {tx_ordinal} DESC) AS _cdsync_reducer_rank \
+         FROM ({union_sources}) _cdsync_reducer_source) \
+         WHERE _cdsync_reducer_rank = 1) S ON T.{pk} = S.{pk} \
+         WHEN MATCHED THEN UPDATE SET {updates} \
+         WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+    )
+}
+
+fn stable_query_request_id(prefix: &str, key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{prefix}_{}", &digest[..24])
+}
+
+fn query_job_completed(label: &str, job: &Job) -> Result<bool> {
+    if job.status.state != JobState::Done {
+        return Ok(false);
+    }
+    if let Some(error_result) = &job.status.error_result {
+        anyhow::bail!(
+            "{} job {} failed: {:?}",
+            label,
+            job.job_reference.job_id,
+            error_result
+        );
+    }
+    if let Some(errors) = &job.status.errors
+        && !errors.is_empty()
+    {
+        anyhow::bail!(
+            "{} job {} reported errors: {:?}",
+            label,
+            job.job_reference.job_id,
+            errors
+        );
+    }
+    Ok(true)
+}
+
+fn query_job_project_id<'a>(fallback: &'a str, job_reference: &'a JobReference) -> &'a str {
+    if job_reference.project_id.is_empty() {
+        fallback
+    } else {
+        &job_reference.project_id
+    }
+}
+
+fn get_query_results_to_query_response(result: GetQueryResultsResponse) -> Result<QueryResponse> {
+    if !result.job_complete {
+        anyhow::bail!(
+            "BigQuery query results for job {} were still incomplete after job reached DONE",
+            result.job_reference.job_id
+        );
+    }
+    Ok(QueryResponse {
+        kind: result.kind,
+        schema: result.schema,
+        job_reference: result.job_reference,
+        total_rows: Some(result.total_rows),
+        page_token: result.page_token,
+        rows: result.rows,
+        total_bytes_processed: result.total_bytes_processed,
+        job_complete: result.job_complete,
+        errors: result.errors,
+        cache_hit: result.cache_hit,
+        num_dml_affected_rows: result.num_dml_affected_rows,
+        session_info: None,
+        dml_stats: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, drain_cleanup_task_handles,
-        reap_finished_cleanup_task_handles, upsert_staging_table_id,
+        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, cdc_reducer_merge_sql,
+        drain_cleanup_task_handles, get_query_results_to_query_response, query_job_completed,
+        reap_finished_cleanup_task_handles, stable_query_request_id, upsert_staging_table_id,
     };
+    use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
     use gcloud_bigquery::http::error::Error as BqError;
+    use gcloud_bigquery::http::job::get_query_results::GetQueryResultsResponse;
+    use gcloud_bigquery::http::job::query::QueryResponse;
+    use gcloud_bigquery::http::job::{
+        Job, JobConfiguration, JobReference, JobState, JobStatus, JobType,
+    };
     use std::future::pending;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1210,6 +1594,139 @@ mod tests {
         assert!(BIGQUERY_REQUEST_TIMEOUT > Duration::ZERO);
     }
 
+    #[test]
+    fn stable_query_request_id_fits_bigquery_request_id_limit() {
+        let request_id = stable_query_request_id(
+            "merge",
+            "cdsync_app_public_production:public__accounts:public__accounts_staging_upsert_abc",
+        );
+
+        assert_eq!(request_id.len(), 30);
+        assert_eq!(
+            request_id,
+            stable_query_request_id(
+                "merge",
+                "cdsync_app_public_production:public__accounts:public__accounts_staging_upsert_abc"
+            )
+        );
+    }
+
+    #[test]
+    fn cdc_reducer_merge_sql_deduplicates_union_by_latest_sequence() {
+        let sql = cdc_reducer_merge_sql(
+            "project",
+            "dataset",
+            "public__accounts",
+            &[
+                CdcBatchLoadJobStep {
+                    staging_table: "stage_1".to_string(),
+                    object_uri: "gs://bucket/stage_1.parquet".to_string(),
+                    load_job_id: None,
+                    row_count: 2,
+                    upserted_count: 2,
+                    deleted_count: 0,
+                },
+                CdcBatchLoadJobStep {
+                    staging_table: "stage_2".to_string(),
+                    object_uri: "gs://bucket/stage_2.parquet".to_string(),
+                    load_job_id: None,
+                    row_count: 3,
+                    upserted_count: 3,
+                    deleted_count: 0,
+                },
+            ],
+            &TableSchema {
+                name: "public__accounts".to_string(),
+                columns: vec![
+                    ColumnSchema {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        name: "name".to_string(),
+                        data_type: DataType::String,
+                        nullable: true,
+                    },
+                ],
+                primary_key: Some("id".to_string()),
+            },
+            &MetadataColumns::default(),
+            "id",
+        );
+
+        assert!(sql.contains("`project.dataset.stage_1`"));
+        assert!(sql.contains("UNION ALL"));
+        assert!(sql.contains("`project.dataset.stage_2`"));
+        assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY `id`"));
+        assert!(sql.contains("ORDER BY `_cdsync_sequence` DESC, `_cdsync_tx_ordinal` DESC"));
+        assert!(sql.contains("WHERE _cdsync_reducer_rank = 1"));
+    }
+
+    #[test]
+    fn incomplete_query_response_requires_polling() {
+        let response = QueryResponse {
+            job_complete: false,
+            job_reference: JobReference {
+                project_id: "project".to_string(),
+                job_id: "query_job_1".to_string(),
+                location: Some("US".to_string()),
+            },
+            ..Default::default()
+        };
+
+        assert!(!response.job_complete);
+        assert_eq!(response.job_reference.job_id, "query_job_1");
+    }
+
+    #[test]
+    fn query_job_completion_tracks_running_then_done() {
+        let mut job = query_test_job(JobState::Running);
+        assert!(!query_job_completed("test query", &job).expect("running query job"));
+
+        job.status.state = JobState::Done;
+        assert!(query_job_completed("test query", &job).expect("done query job"));
+    }
+
+    #[test]
+    fn get_query_results_response_preserves_final_rows() {
+        let response = get_query_results_to_query_response(GetQueryResultsResponse {
+            kind: "bigquery#queryResponse".to_string(),
+            job_reference: JobReference {
+                project_id: "result-project".to_string(),
+                job_id: "query_job_1".to_string(),
+                location: Some("US".to_string()),
+            },
+            total_rows: 2,
+            job_complete: true,
+            ..Default::default()
+        })
+        .expect("query results response");
+
+        assert!(response.job_complete);
+        assert_eq!(response.total_rows, Some(2));
+        assert_eq!(response.job_reference.project_id, "result-project");
+    }
+
+    #[test]
+    fn get_query_results_response_rejects_incomplete_results() {
+        let err = get_query_results_to_query_response(GetQueryResultsResponse {
+            job_reference: JobReference {
+                project_id: "project".to_string(),
+                job_id: "query_job_1".to_string(),
+                location: Some("US".to_string()),
+            },
+            job_complete: false,
+            ..Default::default()
+        })
+        .expect_err("incomplete query results should fail");
+
+        assert!(
+            err.to_string()
+                .contains("were still incomplete after job reached DONE")
+        );
+    }
+
     #[tokio::test]
     async fn drain_cleanup_task_handles_waits_for_spawned_work() {
         let cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1226,6 +1743,28 @@ mod tests {
             .expect("cleanup tasks drained");
 
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    fn query_test_job(state: JobState) -> Job {
+        Job {
+            job_reference: JobReference {
+                project_id: "project".to_string(),
+                job_id: "query_job_1".to_string(),
+                location: Some("US".to_string()),
+            },
+            configuration: JobConfiguration {
+                job_type: "QUERY".to_string(),
+                job: JobType::Query(Default::default()),
+                dry_run: None,
+                job_timeout_ms: None,
+                labels: None,
+            },
+            status: JobStatus {
+                state,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

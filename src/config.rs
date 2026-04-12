@@ -91,7 +91,9 @@ impl Config {
             }
             cdc_connection_count = cdc_connection_count.saturating_add(1);
             let apply_concurrency = pg.cdc_apply_concurrency(fallback_snapshot_concurrency);
-            let worker_count = pg.cdc_batch_load_worker_count(apply_concurrency);
+            let worker_count = pg
+                .cdc_batch_load_staging_worker_count(apply_concurrency)
+                .saturating_add(pg.cdc_batch_load_reducer_worker_count(apply_concurrency));
             batch_load_workers =
                 batch_load_workers.saturating_add(u32::try_from(worker_count).unwrap_or(u32::MAX));
         }
@@ -334,6 +336,13 @@ pub struct PostgresConfig {
     pub cdc_batch_size: Option<usize>,
     pub cdc_apply_concurrency: Option<usize>,
     pub cdc_batch_load_worker_count: Option<usize>,
+    pub cdc_batch_load_staging_worker_count: Option<usize>,
+    pub cdc_batch_load_reducer_worker_count: Option<usize>,
+    pub cdc_max_inflight_commits: Option<usize>,
+    pub cdc_batch_load_reducer_max_jobs: Option<usize>,
+    pub cdc_batch_load_reducer_enabled: Option<bool>,
+    pub cdc_backlog_max_pending_fragments: Option<usize>,
+    pub cdc_backlog_max_oldest_pending_seconds: Option<u64>,
     pub cdc_max_fill_ms: Option<u64>,
     pub cdc_max_pending_events: Option<usize>,
     pub cdc_idle_timeout_seconds: Option<u64>,
@@ -361,6 +370,32 @@ impl PostgresConfig {
 
     pub fn cdc_batch_load_worker_count(&self, fallback: usize) -> usize {
         self.cdc_batch_load_worker_count.unwrap_or(fallback).max(1)
+    }
+
+    pub fn cdc_batch_load_staging_worker_count(&self, fallback: usize) -> usize {
+        self.cdc_batch_load_staging_worker_count
+            .unwrap_or_else(|| self.cdc_batch_load_worker_count(fallback))
+            .max(1)
+    }
+
+    pub fn cdc_batch_load_reducer_worker_count(&self, fallback: usize) -> usize {
+        self.cdc_batch_load_reducer_worker_count
+            .unwrap_or_else(|| self.cdc_batch_load_worker_count(fallback))
+            .max(1)
+    }
+
+    pub fn cdc_max_inflight_commits(&self, apply_concurrency: usize) -> usize {
+        self.cdc_max_inflight_commits
+            .unwrap_or_else(|| apply_concurrency.max(1).saturating_mul(4))
+            .max(1)
+    }
+
+    pub fn cdc_batch_load_reducer_max_jobs(&self) -> usize {
+        if self.cdc_batch_load_reducer_enabled.unwrap_or(true) {
+            self.cdc_batch_load_reducer_max_jobs.unwrap_or(16).max(1)
+        } else {
+            1
+        }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -550,6 +585,18 @@ connections:
       cdc_batch_size: 10000
       cdc_apply_concurrency: 8
       cdc_batch_load_worker_count: 8
+      # If omitted, both default to cdc_batch_load_worker_count. That can run
+      # roughly 2x that many batch-load tasks after the staging/reducer split.
+      # cdc_batch_load_staging_worker_count: 8
+      # cdc_batch_load_reducer_worker_count: 8
+      # Defaults to cdc_apply_concurrency * 4.
+      # This is the current in-memory read-ahead cap, not the future durable backlog budget.
+      # cdc_max_inflight_commits: 32
+      # cdc_batch_load_reducer_max_jobs: 16
+      # cdc_batch_load_reducer_enabled: true
+      # Optional durable backlog backpressure caps.
+      # cdc_backlog_max_pending_fragments: 10000
+      # cdc_backlog_max_oldest_pending_seconds: 300
       cdc_max_fill_ms: 2000
       cdc_max_pending_events: 100000
       cdc_idle_timeout_seconds: 10
@@ -736,6 +783,13 @@ connections:
             cdc_batch_size: None,
             cdc_apply_concurrency: None,
             cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -762,6 +816,13 @@ connections:
             cdc_batch_size: None,
             cdc_apply_concurrency: Some(9),
             cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -788,6 +849,13 @@ connections:
             cdc_batch_size: None,
             cdc_apply_concurrency: Some(8),
             cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -814,6 +882,13 @@ connections:
             cdc_batch_size: None,
             cdc_apply_concurrency: Some(8),
             cdc_batch_load_worker_count: Some(12),
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -823,6 +898,214 @@ connections:
         };
 
         assert_eq!(config.cdc_batch_load_worker_count(8), 12);
+    }
+
+    #[test]
+    fn cdc_batch_load_split_worker_counts_default_to_legacy_worker_count() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: Some(12),
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_batch_load_staging_worker_count(8), 12);
+        assert_eq!(config.cdc_batch_load_reducer_worker_count(8), 12);
+    }
+
+    #[test]
+    fn cdc_batch_load_split_worker_counts_honor_explicit_overrides() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: Some(12),
+            cdc_batch_load_staging_worker_count: Some(20),
+            cdc_batch_load_reducer_worker_count: Some(4),
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_batch_load_staging_worker_count(8), 20);
+        assert_eq!(config.cdc_batch_load_reducer_worker_count(8), 4);
+    }
+
+    #[test]
+    fn cdc_max_inflight_commits_defaults_to_apply_concurrency_multiplier() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_max_inflight_commits(8), 32);
+    }
+
+    #[test]
+    fn cdc_max_inflight_commits_honors_explicit_override() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: Some(128),
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_max_inflight_commits(8), 128);
+    }
+
+    #[test]
+    fn cdc_batch_load_reducer_max_jobs_defaults_and_honors_override() {
+        let default_config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+        let override_config = PostgresConfig {
+            cdc_batch_load_reducer_max_jobs: Some(64),
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            ..default_config.clone()
+        };
+
+        assert_eq!(default_config.cdc_batch_load_reducer_max_jobs(), 16);
+        assert_eq!(override_config.cdc_batch_load_reducer_max_jobs(), 64);
+    }
+
+    #[test]
+    fn cdc_batch_load_reducer_max_jobs_respects_rollout_gate() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: Some(64),
+            cdc_batch_load_reducer_enabled: Some(false),
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_batch_load_reducer_max_jobs(), 1);
     }
 
     #[test]
@@ -848,6 +1131,13 @@ connections:
                     cdc_batch_size: None,
                     cdc_apply_concurrency: Some(8),
                     cdc_batch_load_worker_count: Some(8),
+                    cdc_batch_load_staging_worker_count: None,
+                    cdc_batch_load_reducer_worker_count: None,
+                    cdc_max_inflight_commits: None,
+                    cdc_batch_load_reducer_max_jobs: None,
+                    cdc_batch_load_reducer_enabled: None,
+                    cdc_backlog_max_pending_fragments: None,
+                    cdc_backlog_max_oldest_pending_seconds: None,
                     cdc_max_fill_ms: None,
                     cdc_max_pending_events: None,
                     cdc_idle_timeout_seconds: None,
@@ -886,7 +1176,7 @@ connections:
             stats: None,
         };
 
-        assert_eq!(cfg.state_pool_max_connections(), 16);
+        assert_eq!(cfg.state_pool_max_connections(), 24);
     }
 
     #[test]
@@ -912,6 +1202,13 @@ connections:
                     cdc_batch_size: None,
                     cdc_apply_concurrency: Some(32),
                     cdc_batch_load_worker_count: Some(32),
+                    cdc_batch_load_staging_worker_count: None,
+                    cdc_batch_load_reducer_worker_count: None,
+                    cdc_max_inflight_commits: None,
+                    cdc_batch_load_reducer_max_jobs: None,
+                    cdc_batch_load_reducer_enabled: None,
+                    cdc_backlog_max_pending_fragments: None,
+                    cdc_backlog_max_oldest_pending_seconds: None,
                     cdc_max_fill_ms: None,
                     cdc_max_pending_events: None,
                     cdc_idle_timeout_seconds: None,
@@ -950,7 +1247,7 @@ connections:
             stats: None,
         };
 
-        assert_eq!(cfg.state_pool_max_connections(), 40);
+        assert_eq!(cfg.state_pool_max_connections(), 72);
     }
 
     #[test]

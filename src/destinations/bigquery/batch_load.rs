@@ -10,6 +10,7 @@ use tokio::task;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+use gcloud_bigquery::http::error::Error as BqError;
 use gcloud_bigquery::http::job::get::GetJobRequest;
 use gcloud_bigquery::http::job::{
     CreateDisposition, Job, JobConfiguration, JobConfigurationLoad, JobReference, JobState,
@@ -73,6 +74,7 @@ impl BigQueryDestination {
             &schema,
             &object_uri,
             WriteDisposition::WriteAppend,
+            None,
         )
         .await?;
         tracing::info!(
@@ -142,8 +144,12 @@ impl BigQueryDestination {
         schema: &TableSchema,
         source_uri: &str,
         write_disposition: WriteDisposition,
+        stable_job_id: Option<&str>,
     ) -> Result<()> {
-        let job_id = format!("cdsync_load_{}", Uuid::new_v4().simple());
+        let job_id = stable_job_id.map_or_else(
+            || format!("cdsync_load_{}", Uuid::new_v4().simple()),
+            ToOwned::to_owned,
+        );
         let location = self.config.location.clone();
         let job = build_load_job(
             &self.config.project_id,
@@ -156,12 +162,35 @@ impl BigQueryDestination {
             write_disposition,
         );
 
-        let created = BigQueryDestination::await_with_timeout(
+        let created = match BigQueryDestination::await_with_timeout(
             format!("creating BigQuery load job for {}", source_uri),
             BIGQUERY_REQUEST_TIMEOUT,
             self.client.job().create(&job),
         )
-        .await?;
+        .await
+        {
+            Ok(job) => job,
+            Err(err)
+                if stable_job_id.is_some()
+                    && err.downcast_ref::<BqError>().is_some_and(
+                        |err| matches!(err, BqError::Response(response) if response.code == 409),
+                    ) =>
+            {
+                BigQueryDestination::await_with_timeout(
+                    format!("fetching existing BigQuery load job {}", job_id),
+                    BIGQUERY_REQUEST_TIMEOUT,
+                    self.client.job().get(
+                        &self.config.project_id,
+                        &job_id,
+                        &GetJobRequest {
+                            location: location.clone(),
+                        },
+                    ),
+                )
+                .await?
+            }
+            Err(err) => return Err(err),
+        };
 
         tracing::info!(
             table = table_id,

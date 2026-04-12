@@ -179,6 +179,85 @@ pub(super) fn cached_postgres_cdc_runtime_state(
     }
 }
 
+pub(super) fn build_cdc_progress_insight(
+    cdc: &ConnectionCdcSnapshot,
+    batch_load_queue: Option<&CdcBatchLoadQueueSummary>,
+    cdc_coordinator: Option<&CdcCoordinatorSummary>,
+) -> Option<CdcProgressInsight> {
+    if cdc.sampler_status == "disabled" && batch_load_queue.is_none() && cdc_coordinator.is_none() {
+        return None;
+    }
+
+    let sequence_lag = cdc_coordinator.and_then(|summary| summary.sequence_lag);
+    let pending_fragments = cdc_coordinator.map(|summary| summary.pending_fragments);
+    let failed_fragments = cdc_coordinator.map(|summary| summary.failed_fragments);
+    let pending_jobs = batch_load_queue.map(|summary| summary.pending_jobs);
+    let running_jobs = batch_load_queue.map(|summary| summary.running_jobs);
+    let jobs_per_minute = batch_load_queue.map(|summary| summary.jobs_per_minute);
+    let rows_per_minute = batch_load_queue.map(|summary| summary.rows_per_minute);
+
+    let (status, primary_blocker, detail) = if cdc.sampler_status != "ok" {
+        (
+            "unknown",
+            "cdc_sampler",
+            format!("CDC sampler status is {}", cdc.sampler_status),
+        )
+    } else if failed_fragments.unwrap_or_default() > 0
+        || batch_load_queue.is_some_and(|summary| summary.failed_jobs > 0)
+    {
+        (
+            "blocked",
+            "failed_work",
+            "Failed CDC fragments or batch-load jobs require retry or intervention".to_string(),
+        )
+    } else if rows_per_minute.unwrap_or_default() > 0 || jobs_per_minute.unwrap_or_default() > 0 {
+        (
+            "moving",
+            "none",
+            "Queued CDC work is completing recently".to_string(),
+        )
+    } else if cdc.wal_bytes_behind_confirmed.unwrap_or_default() > 0
+        && pending_fragments.unwrap_or_default() == 0
+        && pending_jobs.unwrap_or_default() == 0
+        && running_jobs.unwrap_or_default() == 0
+    {
+        (
+            "watch",
+            "unattributed_wal_gap",
+            "WAL is behind confirmed flush, but no queued CDC work is attributed yet".to_string(),
+        )
+    } else if pending_fragments.unwrap_or_default() > 0
+        || pending_jobs.unwrap_or_default() > 0
+        || running_jobs.unwrap_or_default() > 0
+    {
+        (
+            "backlogged",
+            "staging_or_reducer_backlog",
+            "CDC work is queued or running but has no recent completion rate".to_string(),
+        )
+    } else {
+        (
+            "idle",
+            "none",
+            "No CDC backlog is visible in the admin summaries".to_string(),
+        )
+    };
+
+    Some(CdcProgressInsight {
+        status,
+        primary_blocker,
+        detail,
+        sequence_lag,
+        wal_bytes_behind: cdc.wal_bytes_behind_confirmed,
+        pending_fragments,
+        failed_fragments,
+        pending_jobs,
+        running_jobs,
+        jobs_per_minute,
+        rows_per_minute,
+    })
+}
+
 pub(super) fn active_checkpoint_map<'a>(
     state: &'a ConnectionState,
     source: &SourceConfig,

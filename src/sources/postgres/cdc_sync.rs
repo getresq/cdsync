@@ -875,9 +875,19 @@ impl PostgresSource {
             .unwrap_or(default_batch_size);
         let snapshot_concurrency = snapshot_concurrency.max(1);
         let cdc_apply_concurrency = self.config.cdc_apply_concurrency(snapshot_concurrency);
-        let cdc_batch_load_worker_count = self
+        let cdc_batch_load_staging_worker_count = self
             .config
-            .cdc_batch_load_worker_count(cdc_apply_concurrency);
+            .cdc_batch_load_staging_worker_count(cdc_apply_concurrency);
+        let cdc_batch_load_reducer_worker_count = self
+            .config
+            .cdc_batch_load_reducer_worker_count(cdc_apply_concurrency);
+        let cdc_batch_load_reducer_max_jobs = self.config.cdc_batch_load_reducer_max_jobs();
+        let cdc_max_inflight_commits = self.config.cdc_max_inflight_commits(cdc_apply_concurrency);
+        let cdc_backlog_max_pending_fragments = self.config.cdc_backlog_max_pending_fragments;
+        let cdc_backlog_max_oldest_pending = self
+            .config
+            .cdc_backlog_max_oldest_pending_seconds
+            .map(Duration::from_secs);
         let cdc_apply_batch_size = batch_size.max(1);
         let cdc_apply_max_fill =
             Duration::from_millis(self.config.cdc_max_fill_ms.unwrap_or(2_000).max(1));
@@ -1044,7 +1054,9 @@ impl PostgresSource {
             table_info_map.clone(),
             stats.clone(),
             cdc_apply_concurrency,
-            cdc_batch_load_worker_count,
+            cdc_batch_load_staging_worker_count,
+            cdc_batch_load_reducer_worker_count,
+            cdc_batch_load_reducer_max_jobs,
             state_handle.clone(),
             follow,
         )
@@ -1433,6 +1445,9 @@ impl PostgresSource {
                             apply_batch_size: cdc_apply_batch_size,
                             apply_max_fill: cdc_apply_max_fill,
                             apply_concurrency: cdc_apply_concurrency,
+                            max_inflight_commits: cdc_max_inflight_commits,
+                            backlog_max_pending_fragments: cdc_backlog_max_pending_fragments,
+                            backlog_max_oldest_pending: cdc_backlog_max_oldest_pending,
                             follow,
                             shutdown: shutdown.clone(),
                         },
@@ -1613,6 +1628,9 @@ impl PostgresSource {
                         apply_batch_size: cdc_apply_batch_size,
                         apply_max_fill: cdc_apply_max_fill,
                         apply_concurrency: cdc_apply_concurrency,
+                        max_inflight_commits: cdc_max_inflight_commits,
+                        backlog_max_pending_fragments: cdc_backlog_max_pending_fragments,
+                        backlog_max_oldest_pending: cdc_backlog_max_oldest_pending,
                         follow,
                         shutdown: shutdown.clone(),
                     },

@@ -5,7 +5,9 @@ use crate::config::{
     PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
 use crate::retry::ErrorReasonCode;
-use crate::types::{SnapshotChunkCheckpoint, TableCheckpoint, TableRuntimeState, TableRuntimeStatus};
+use crate::types::{
+    SnapshotChunkCheckpoint, TableCheckpoint, TableRuntimeState, TableRuntimeStatus,
+};
 use chrono::TimeZone;
 use std::collections::HashMap;
 
@@ -38,6 +40,13 @@ fn test_hash_config(
                 cdc_batch_size: Some(1000),
                 cdc_apply_concurrency: Some(8),
                 cdc_batch_load_worker_count: Some(8),
+                cdc_batch_load_staging_worker_count: None,
+                cdc_batch_load_reducer_worker_count: None,
+                cdc_max_inflight_commits: None,
+                cdc_batch_load_reducer_max_jobs: None,
+                cdc_batch_load_reducer_enabled: None,
+                cdc_backlog_max_pending_fragments: None,
+                cdc_backlog_max_oldest_pending_seconds: None,
                 cdc_max_fill_ms: Some(2000),
                 cdc_max_pending_events: Some(100_000),
                 cdc_idle_timeout_seconds: Some(10),
@@ -182,6 +191,13 @@ fn max_checkpoint_age_seconds_ignores_removed_config_entities() {
             cdc_batch_size: None,
             cdc_apply_concurrency: None,
             cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
             cdc_max_pending_events: None,
             cdc_idle_timeout_seconds: None,
@@ -251,6 +267,13 @@ fn test_postgres_cdc_connection() -> ConnectionConfig {
             cdc_batch_size: Some(1000),
             cdc_apply_concurrency: Some(8),
             cdc_batch_load_worker_count: Some(8),
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: Some(2000),
             cdc_max_pending_events: Some(100_000),
             cdc_idle_timeout_seconds: Some(10),
@@ -325,6 +348,61 @@ fn build_table_progress_requires_real_cdc_follow_state() {
 }
 
 #[test]
+fn cdc_progress_insight_marks_recent_completion_as_moving() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: Some("0/B".to_string()),
+        restart_lsn: Some("0/A".to_string()),
+        confirmed_flush_lsn: Some("0/A".to_string()),
+        wal_bytes_retained_by_slot: Some(16),
+        wal_bytes_behind_confirmed: Some(8),
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        jobs_per_minute: 3,
+        rows_per_minute: 1_200,
+        ..Default::default()
+    };
+    let coordinator = CdcCoordinatorSummary {
+        sequence_lag: Some(2),
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), Some(&coordinator))
+        .expect("progress insight");
+
+    assert_eq!(insight.status, "moving");
+    assert_eq!(insight.primary_blocker, "none");
+    assert_eq!(insight.sequence_lag, Some(2));
+}
+
+#[test]
+fn cdc_progress_insight_surfaces_failed_work_as_blocker() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: None,
+        restart_lsn: None,
+        confirmed_flush_lsn: None,
+        wal_bytes_retained_by_slot: None,
+        wal_bytes_behind_confirmed: None,
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        failed_jobs: 1,
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), None).expect("progress insight");
+
+    assert_eq!(insight.status, "blocked");
+    assert_eq!(insight.primary_blocker, "failed_work");
+}
+
+#[test]
 fn build_table_progress_prefers_table_runtime_retry_state() {
     let connection = test_postgres_cdc_connection();
     let mut state = ConnectionState {
@@ -362,7 +440,10 @@ fn build_table_progress_prefers_table_runtime_retry_state() {
     assert_eq!(table.phase, "retrying");
     assert_eq!(table.reason_code, "bigquery_dml_quota");
     assert!(matches!(
-        table.runtime.as_ref().map(|runtime| (&runtime.status, runtime.attempts)),
+        table
+            .runtime
+            .as_ref()
+            .map(|runtime| (&runtime.status, runtime.attempts)),
         Some((TableRuntimeStatus::Retrying, 4))
     ));
 }
@@ -441,14 +522,12 @@ fn derive_connection_runtime_uses_mixed_mode_when_snapshot_and_cdc_overlap() {
     state.postgres.insert(
         "public.accounts".to_string(),
         TableCheckpoint {
-            snapshot_chunks: vec![
-                SnapshotChunkCheckpoint {
-                    start_primary_key: Some("1".to_string()),
-                    end_primary_key: Some("100".to_string()),
-                    last_primary_key: Some("50".to_string()),
-                    complete: false,
-                },
-            ],
+            snapshot_chunks: vec![SnapshotChunkCheckpoint {
+                start_primary_key: Some("1".to_string()),
+                end_primary_key: Some("100".to_string()),
+                last_primary_key: Some("50".to_string()),
+                complete: false,
+            }],
             ..Default::default()
         },
     );

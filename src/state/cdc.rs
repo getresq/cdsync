@@ -18,13 +18,21 @@ impl SyncStateStore {
                 table_key,
                 first_sequence,
                 status,
+                stage,
                 payload_json,
                 attempt_count,
                 retry_class,
                 last_error,
+                staging_table,
+                artifact_uri,
+                load_job_id,
+                merge_job_id,
+                primary_key_lane,
+                barrier_kind,
+                ledger_metadata_json,
                 created_at,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             on conflict(job_id) do update set
                 table_key = case
                     when {table}.status = 'failed' then excluded.table_key
@@ -37,6 +45,10 @@ impl SyncStateStore {
                 status = case
                     when {table}.status = 'failed' then excluded.status
                     else {table}.status
+                end,
+                stage = case
+                    when {table}.status = 'failed' then excluded.stage
+                    else {table}.stage
                 end,
                 payload_json = case
                     when {table}.status = 'failed' then excluded.payload_json
@@ -51,12 +63,42 @@ impl SyncStateStore {
                     when {table}.status = 'failed' then null
                     else {table}.last_error
                 end,
+                staging_table = case
+                    when {table}.status = 'failed' then excluded.staging_table
+                    else {table}.staging_table
+                end,
+                artifact_uri = case
+                    when {table}.status = 'failed' then excluded.artifact_uri
+                    else {table}.artifact_uri
+                end,
+                load_job_id = case
+                    when {table}.status = 'failed' then excluded.load_job_id
+                    else {table}.load_job_id
+                end,
+                merge_job_id = case
+                    when {table}.status = 'failed' then excluded.merge_job_id
+                    else {table}.merge_job_id
+                end,
+                primary_key_lane = case
+                    when {table}.status = 'failed' then excluded.primary_key_lane
+                    else {table}.primary_key_lane
+                end,
+                barrier_kind = case
+                    when {table}.status = 'failed' then excluded.barrier_kind
+                    else {table}.barrier_kind
+                end,
+                ledger_metadata_json = case
+                    when {table}.status = 'failed' then excluded.ledger_metadata_json
+                    else {table}.ledger_metadata_json
+                end,
                 updated_at = case
                     when {table}.status = 'failed' then excluded.updated_at
                     else {table}.updated_at
                 end
             returning job_id, table_key, first_sequence, status, payload_json, attempt_count,
-                      retry_class, last_error, created_at, updated_at
+                      retry_class, last_error, stage, staging_table, artifact_uri, load_job_id,
+                      merge_job_id, primary_key_lane, barrier_kind, ledger_metadata_json,
+                      created_at, updated_at
             "#,
             table = table,
         ))
@@ -65,10 +107,21 @@ impl SyncStateStore {
         .bind(&job.table_key)
         .bind(saturating_u64_to_i64(job.first_sequence))
         .bind(job.status.as_str())
+        .bind(
+            CdcLedgerStage::normalize_for_job_status(job.stage, job.status)
+                .as_str(),
+        )
         .bind(&job.payload_json)
         .bind(job.attempt_count)
         .bind(job.retry_class.map(SyncRetryClass::as_str))
         .bind(job.last_error.clone())
+        .bind(job.staging_table.clone())
+        .bind(job.artifact_uri.clone())
+        .bind(job.load_job_id.clone())
+        .bind(job.merge_job_id.clone())
+        .bind(job.primary_key_lane.clone())
+        .bind(job.barrier_kind.clone())
+        .bind(job.ledger_metadata_json.clone())
         .bind(job.created_at)
         .bind(job.updated_at)
         .fetch_one(&mut *tx)
@@ -86,13 +139,21 @@ impl SyncStateStore {
                     commit_lsn,
                     table_key,
                     status,
+                    stage,
                     row_count,
                     upserted_count,
                     deleted_count,
                     last_error,
+                    artifact_uri,
+                    staging_table,
+                    load_job_id,
+                    merge_job_id,
+                    primary_key_lane,
+                    barrier_kind,
+                    ledger_metadata_json,
                     created_at,
                     updated_at
-                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                 on conflict(fragment_id) do update set
                     job_id = excluded.job_id,
                     sequence = excluded.sequence,
@@ -102,6 +163,10 @@ impl SyncStateStore {
                         when {fragment_table}.status = 'failed' then excluded.status
                         else {fragment_table}.status
                     end,
+                    stage = case
+                        when {fragment_table}.status = 'failed' then excluded.stage
+                        else {fragment_table}.stage
+                    end,
                     row_count = excluded.row_count,
                     upserted_count = excluded.upserted_count,
                     deleted_count = excluded.deleted_count,
@@ -109,6 +174,13 @@ impl SyncStateStore {
                         when {fragment_table}.status = 'failed' then excluded.last_error
                         else {fragment_table}.last_error
                     end,
+                    artifact_uri = excluded.artifact_uri,
+                    staging_table = excluded.staging_table,
+                    load_job_id = excluded.load_job_id,
+                    merge_job_id = excluded.merge_job_id,
+                    primary_key_lane = excluded.primary_key_lane,
+                    barrier_kind = excluded.barrier_kind,
+                    ledger_metadata_json = excluded.ledger_metadata_json,
                     updated_at = case
                         when {fragment_table}.status = 'failed' then excluded.updated_at
                         else {fragment_table}.updated_at
@@ -123,10 +195,21 @@ impl SyncStateStore {
             .bind(&fragment.commit_lsn)
             .bind(&fragment.table_key)
             .bind(fragment.status.as_str())
+            .bind(
+                CdcLedgerStage::normalize_for_fragment_status(fragment.stage, fragment.status)
+                    .as_str(),
+            )
             .bind(fragment.row_count)
             .bind(fragment.upserted_count)
             .bind(fragment.deleted_count)
             .bind(fragment.last_error.clone())
+            .bind(fragment.artifact_uri.clone())
+            .bind(fragment.staging_table.clone())
+            .bind(fragment.load_job_id.clone())
+            .bind(fragment.merge_job_id.clone())
+            .bind(fragment.primary_key_lane.clone())
+            .bind(fragment.barrier_kind.clone())
+            .bind(fragment.ledger_metadata_json.clone())
             .bind(fragment.created_at)
             .bind(fragment.updated_at)
             .execute(&mut *tx)
@@ -145,7 +228,10 @@ impl SyncStateStore {
         let status_values: Vec<&str> = statuses.iter().map(|status| status.as_str()).collect();
         let rows = sqlx::query(&format!(
             r#"
-            select job_id, table_key, first_sequence, status, payload_json, attempt_count, retry_class, last_error, created_at, updated_at
+            select job_id, table_key, first_sequence, status, payload_json, attempt_count,
+                   retry_class, last_error, stage, staging_table, artifact_uri, load_job_id,
+                   merge_job_id, primary_key_lane, barrier_kind, ledger_metadata_json,
+                   created_at, updated_at
             from {}
             where connection_id = $1
               and status = any($2)
@@ -163,10 +249,10 @@ impl SyncStateStore {
             .collect()
     }
 
-    pub async fn claim_next_cdc_batch_load_job(
+    pub async fn claim_next_cdc_batch_load_staging_job(
         &self,
         connection_id: &str,
-        stale_running_before_ms: i64,
+        stale_staged_before_ms: i64,
     ) -> anyhow::Result<Option<CdcBatchLoadJobRecord>> {
         let now = now_millis();
         let row = sqlx::query(&format!(
@@ -175,9 +261,89 @@ impl SyncStateStore {
                 select j.job_id
                 from {} j
                 where j.connection_id = $1
+                  and j.status = $2
                   and (
-                    j.status = $2
-                    or (j.status = $3 and j.updated_at < $4)
+                    j.stage = $3
+                    or (j.stage = $4 and j.updated_at < $5)
+                  )
+                order by j.first_sequence asc, j.created_at asc
+                for update skip locked
+                limit 1
+            )
+            update {} jobs
+            set stage = $4,
+                attempt_count = jobs.attempt_count + 1,
+                last_error = null,
+                updated_at = $6
+            from candidate
+            where jobs.connection_id = $1
+              and jobs.job_id = candidate.job_id
+            returning jobs.job_id, jobs.table_key, jobs.first_sequence, jobs.status,
+                      jobs.payload_json, jobs.attempt_count, jobs.retry_class, jobs.last_error,
+                      jobs.stage, jobs.staging_table, jobs.artifact_uri, jobs.load_job_id,
+                      jobs.merge_job_id, jobs.primary_key_lane, jobs.barrier_kind,
+                      jobs.ledger_metadata_json,
+                      jobs.created_at, jobs.updated_at
+            "#,
+            self.table("cdc_batch_load_jobs"),
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcLedgerStage::Received.as_str())
+        .bind(CdcLedgerStage::Staged.as_str())
+        .bind(stale_staged_before_ms)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.as_ref()
+            .map(cdc_batch_load_job_record_from_row)
+            .transpose()
+    }
+
+    pub async fn mark_cdc_batch_load_job_loaded(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(&format!(
+            r#"
+            update {}
+            set stage = $3,
+                updated_at = $4
+            where connection_id = $1
+              and job_id = $2
+              and status = $5
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcLedgerStage::Loaded.as_str())
+        .bind(now_millis())
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn claim_next_loaded_cdc_batch_load_job_window_for_apply(
+        &self,
+        connection_id: &str,
+        stale_running_before_ms: i64,
+        max_jobs: usize,
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        let now = now_millis();
+        let rows = sqlx::query(&format!(
+            r#"
+            with candidate as (
+                select j.job_id, j.table_key, j.first_sequence, j.barrier_kind, j.payload_json
+                from {} j
+                where j.connection_id = $1
+                  and (
+                    (j.status = $2 and j.stage = $3)
+                    or (j.status = $4 and j.updated_at < $5)
                   )
                   and not exists (
                     select 1
@@ -188,43 +354,93 @@ impl SyncStateStore {
                       and blockers.first_sequence < j.first_sequence
                       and (
                         blockers.status = $2
-                        or blockers.status = $5
-                        or (blockers.status = $3 and blockers.updated_at >= $4)
+                        or blockers.status = $6
+                        or blockers.status = $4
                       )
                   )
                 order by j.first_sequence asc, j.created_at asc
                 for update skip locked
                 limit 1
+            ),
+            window_candidates as (
+                select j.job_id
+                from {} j
+                join candidate first
+                  on first.table_key = j.table_key
+                where j.connection_id = $1
+                  and (
+                    j.job_id = first.job_id
+                    or (
+                      first.barrier_kind is null
+                      and first.payload_json::jsonb ? 'staging_schema'
+                      and first.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                      and j.status = $2
+                      and j.stage = $3
+                      and j.barrier_kind is null
+                      and j.first_sequence > first.first_sequence
+                      and j.payload_json::jsonb ? 'staging_schema'
+                      and j.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                      and not exists (
+                        select 1
+                        from {} blockers
+                        where blockers.connection_id = j.connection_id
+                          and blockers.table_key = j.table_key
+                          and blockers.job_id <> first.job_id
+                          and blockers.first_sequence >= first.first_sequence
+                          and blockers.first_sequence < j.first_sequence
+                          and not (
+                            blockers.status = $2
+                            and blockers.stage = $3
+                            and blockers.barrier_kind is null
+                            and blockers.payload_json::jsonb ? 'staging_schema'
+                            and blockers.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                          )
+                      )
+                    )
+                  )
+                order by j.first_sequence asc, j.created_at asc
+                for update of j skip locked
+                limit $9
             )
             update {} jobs
-            set status = $3,
-                attempt_count = jobs.attempt_count + 1,
-                retry_class = jobs.retry_class,
+            set status = $4,
+                stage = $7,
                 last_error = null,
-                updated_at = $6
+                updated_at = $8
             from candidate
             where jobs.connection_id = $1
-              and jobs.job_id = candidate.job_id
+              and jobs.job_id in (select job_id from window_candidates)
             returning jobs.job_id, jobs.table_key, jobs.first_sequence, jobs.status,
                       jobs.payload_json, jobs.attempt_count, jobs.retry_class, jobs.last_error,
+                      jobs.stage, jobs.staging_table, jobs.artifact_uri, jobs.load_job_id,
+                      jobs.merge_job_id, jobs.primary_key_lane, jobs.barrier_kind,
+                      jobs.ledger_metadata_json,
                       jobs.created_at, jobs.updated_at
             "#,
+            self.table("cdc_batch_load_jobs"),
+            self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
         .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcLedgerStage::Loaded.as_str())
         .bind(CdcBatchLoadJobStatus::Running.as_str())
         .bind(stale_running_before_ms)
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind(CdcLedgerStage::Applying.as_str())
         .bind(now)
-        .fetch_optional(&self.pool)
+        .bind(saturating_usize_to_i64(max_jobs.max(1)))
+        .fetch_all(&self.pool)
         .await?;
 
-        row.as_ref()
+        let mut records = rows
+            .iter()
             .map(cdc_batch_load_job_record_from_row)
-            .transpose()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        records.sort_by_key(|record| (record.first_sequence, record.created_at));
+        Ok(records)
     }
 
     pub async fn heartbeat_cdc_batch_load_job(
@@ -232,18 +448,30 @@ impl SyncStateStore {
         connection_id: &str,
         job_id: &str,
     ) -> anyhow::Result<()> {
+        self.heartbeat_cdc_batch_load_jobs(connection_id, &[job_id.to_string()])
+            .await
+    }
+
+    pub async fn heartbeat_cdc_batch_load_jobs(
+        &self,
+        connection_id: &str,
+        job_ids: &[String],
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
         sqlx::query(&format!(
             r#"
             update {}
             set updated_at = $3
             where connection_id = $1
-              and job_id = $2
+              and job_id = any($2)
               and status = $4
             "#,
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
-        .bind(job_id)
+        .bind(job_ids)
         .bind(now_millis())
         .bind(CdcBatchLoadJobStatus::Running.as_str())
         .execute(&self.pool)
@@ -255,6 +483,36 @@ impl SyncStateStore {
         &self,
         connection_id: &str,
     ) -> anyhow::Result<CdcReplayCleanupSummary> {
+        let mut tx = self.pool.begin().await?;
+        let jobs_table = self.table("cdc_batch_load_jobs");
+        let fragment_table = self.table("cdc_commit_fragments");
+        let now = now_millis();
+
+        let repair_result = sqlx::query(&format!(
+            r#"
+            update {fragment_table} fragments
+            set status = $3,
+                stage = $4,
+                last_error = null,
+                updated_at = $5
+            from {jobs_table} jobs
+            where fragments.connection_id = $1
+              and jobs.connection_id = fragments.connection_id
+              and jobs.job_id = fragments.job_id
+              and jobs.status = $2
+              and fragments.status <> $3
+            "#,
+            fragment_table = fragment_table,
+            jobs_table = jobs_table,
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Succeeded.as_str())
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .bind(CdcLedgerStage::Applied.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
         let doomed_jobs = self
             .load_cdc_batch_load_jobs(
                 connection_id,
@@ -267,12 +525,12 @@ impl SyncStateStore {
         let doomed_job_ids: Vec<String> = doomed_jobs.into_iter().map(|job| job.job_id).collect();
 
         if doomed_job_ids.is_empty() {
-            return Ok(CdcReplayCleanupSummary::default());
+            tx.commit().await?;
+            return Ok(CdcReplayCleanupSummary {
+                repaired_terminal_fragments: repair_result.rows_affected(),
+                ..Default::default()
+            });
         }
-
-        let mut tx = self.pool.begin().await?;
-        let jobs_table = self.table("cdc_batch_load_jobs");
-        let fragment_table = self.table("cdc_commit_fragments");
 
         let fragment_result = sqlx::query(&format!(
             r#"
@@ -304,6 +562,7 @@ impl SyncStateStore {
         Ok(CdcReplayCleanupSummary {
             discarded_jobs: job_result.rows_affected(),
             discarded_fragments: fragment_result.rows_affected(),
+            repaired_terminal_fragments: repair_result.rows_affected(),
         })
     }
 
@@ -316,6 +575,7 @@ impl SyncStateStore {
             r#"
             update {}
             set status = $3,
+                stage = $7,
                 retry_class = retry_class,
                 last_error = null,
                 updated_at = $4
@@ -335,62 +595,148 @@ impl SyncStateStore {
             SyncRetryClass::Backpressure.as_str(),
             SyncRetryClass::Transient.as_str(),
         ])
+        .bind(CdcLedgerStage::Received.as_str())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn mark_cdc_batch_load_job_succeeded(
+    pub async fn mark_cdc_batch_load_bundle_succeeded(
         &self,
         connection_id: &str,
         job_id: &str,
     ) -> anyhow::Result<()> {
+        self.mark_cdc_batch_load_window_succeeded(connection_id, &[job_id.to_string()])
+            .await
+    }
+
+    pub async fn mark_cdc_batch_load_window_succeeded(
+        &self,
+        connection_id: &str,
+        job_ids: &[String],
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
+                stage = $5,
                 retry_class = null,
                 last_error = null,
                 updated_at = $4
-            where connection_id = $1 and job_id = $2
+            where connection_id = $1 and job_id = any($2)
             "#,
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
-        .bind(job_id)
+        .bind(job_ids)
         .bind(CdcBatchLoadJobStatus::Succeeded.as_str())
-        .bind(now_millis())
-        .execute(&self.pool)
+        .bind(now)
+        .bind(CdcLedgerStage::Applied.as_str())
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                stage = $5,
+                last_error = null,
+                updated_at = $4
+            where connection_id = $1 and job_id = any($2)
+            "#,
+            self.table("cdc_commit_fragments")
+        ))
+        .bind(connection_id)
+        .bind(job_ids)
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .bind(now)
+        .bind(CdcLedgerStage::Applied.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn mark_cdc_batch_load_job_failed(
+    pub async fn mark_cdc_batch_load_bundle_failed(
         &self,
         connection_id: &str,
         job_id: &str,
         error: &str,
         retry_class: SyncRetryClass,
+        mark_fragments_failed: bool,
     ) -> anyhow::Result<()> {
+        self.mark_cdc_batch_load_window_failed(
+            connection_id,
+            &[job_id.to_string()],
+            error,
+            retry_class,
+            mark_fragments_failed,
+        )
+        .await
+    }
+
+    pub async fn mark_cdc_batch_load_window_failed(
+        &self,
+        connection_id: &str,
+        job_ids: &[String],
+        error: &str,
+        retry_class: SyncRetryClass,
+        mark_fragments_failed: bool,
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
+                stage = $7,
                 retry_class = $4,
                 last_error = $5,
                 updated_at = $6
-            where connection_id = $1 and job_id = $2
+            where connection_id = $1 and job_id = any($2)
             "#,
             self.table("cdc_batch_load_jobs")
         ))
         .bind(connection_id)
-        .bind(job_id)
+        .bind(job_ids)
         .bind(CdcBatchLoadJobStatus::Failed.as_str())
         .bind(retry_class.as_str())
         .bind(error)
-        .bind(now_millis())
-        .execute(&self.pool)
+        .bind(now)
+        .bind(CdcLedgerStage::Failed.as_str())
+        .execute(&mut *tx)
         .await?;
+
+        if mark_fragments_failed {
+            sqlx::query(&format!(
+                r#"
+                update {}
+                set status = $3,
+                    stage = $6,
+                    last_error = $4,
+                    updated_at = $5
+                where connection_id = $1 and job_id = any($2)
+                "#,
+                self.table("cdc_commit_fragments")
+            ))
+            .bind(connection_id)
+            .bind(job_ids)
+            .bind(CdcCommitFragmentStatus::Failed.as_str())
+            .bind(error)
+            .bind(now)
+            .bind(CdcLedgerStage::Failed.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -409,8 +755,17 @@ impl SyncStateStore {
                 count(*) filter (where status = 'running')::bigint as running_jobs,
                 count(*) filter (where status = 'succeeded')::bigint as succeeded_jobs,
                 count(*) filter (where status = 'failed')::bigint as failed_jobs,
+                count(*) filter (where stage = 'received')::bigint as received_jobs,
+                count(*) filter (where stage = 'staged')::bigint as staged_jobs,
+                count(*) filter (where stage = 'loaded')::bigint as loaded_jobs,
+                count(*) filter (where stage = 'applying')::bigint as applying_jobs,
+                count(*) filter (where stage = 'applied')::bigint as applied_jobs,
+                count(*) filter (where stage = 'failed')::bigint as failed_stage_jobs,
                 min(created_at) filter (where status = 'pending') as oldest_pending_ms,
                 min(updated_at) filter (where status = 'running') as oldest_running_ms,
+                min(updated_at) filter (where stage = 'received') as oldest_received_ms,
+                min(updated_at) filter (where stage = 'loaded') as oldest_loaded_ms,
+                min(updated_at) filter (where stage = 'applying') as oldest_applying_ms,
                 count(*) filter (where status = 'succeeded' and updated_at >= $2)::bigint as jobs_per_minute,
                 avg((updated_at - created_at)::double precision) filter (where status = 'succeeded' and updated_at >= $3) as avg_job_duration_ms
             from {}
@@ -533,6 +888,9 @@ impl SyncStateStore {
 
         let oldest_pending_ms: Option<i64> = aggregate.try_get("oldest_pending_ms")?;
         let oldest_running_ms: Option<i64> = aggregate.try_get("oldest_running_ms")?;
+        let oldest_received_ms: Option<i64> = aggregate.try_get("oldest_received_ms")?;
+        let oldest_loaded_ms: Option<i64> = aggregate.try_get("oldest_loaded_ms")?;
+        let oldest_applying_ms: Option<i64> = aggregate.try_get("oldest_applying_ms")?;
         let avg_job_duration_ms: Option<f64> = aggregate.try_get("avg_job_duration_ms")?;
 
         Ok(CdcBatchLoadQueueSummary {
@@ -541,8 +899,17 @@ impl SyncStateStore {
             running_jobs: aggregate.try_get::<i64, _>("running_jobs")?,
             succeeded_jobs: aggregate.try_get::<i64, _>("succeeded_jobs")?,
             failed_jobs: aggregate.try_get::<i64, _>("failed_jobs")?,
+            received_jobs: aggregate.try_get::<i64, _>("received_jobs")?,
+            staged_jobs: aggregate.try_get::<i64, _>("staged_jobs")?,
+            loaded_jobs: aggregate.try_get::<i64, _>("loaded_jobs")?,
+            applying_jobs: aggregate.try_get::<i64, _>("applying_jobs")?,
+            applied_jobs: aggregate.try_get::<i64, _>("applied_jobs")?,
+            failed_stage_jobs: aggregate.try_get::<i64, _>("failed_stage_jobs")?,
             oldest_pending_age_seconds: oldest_pending_ms.map(|ts| ((now - ts).max(0)) / 1000),
             oldest_running_age_seconds: oldest_running_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            oldest_received_age_seconds: oldest_received_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            oldest_loaded_age_seconds: oldest_loaded_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            oldest_applying_age_seconds: oldest_applying_ms.map(|ts| ((now - ts).max(0)) / 1000),
             jobs_per_minute: aggregate.try_get::<i64, _>("jobs_per_minute")?,
             rows_per_minute,
             avg_job_duration_seconds: avg_job_duration_ms.map(|value| value / 1000.0),
@@ -586,7 +953,9 @@ impl SyncStateStore {
         let rows = sqlx::query(&format!(
             r#"
             select fragment_id, job_id, sequence, commit_lsn, table_key, status, row_count,
-                   upserted_count, deleted_count, last_error, created_at, updated_at
+                   upserted_count, deleted_count, last_error, stage, artifact_uri, staging_table,
+                   load_job_id, merge_job_id, primary_key_lane, barrier_kind, ledger_metadata_json,
+                   created_at, updated_at
             from {}
             where connection_id = $1
               and status = any($2)
@@ -602,6 +971,12 @@ impl SyncStateStore {
         rows.into_iter()
             .map(|row| {
                 let sequence = row.try_get::<i64, _>("sequence")?;
+                let status = CdcCommitFragmentStatus::from_str(row.try_get("status")?)?;
+                let stage = row
+                    .try_get::<Option<String>, _>("stage")?
+                    .map(|value| CdcLedgerStage::from_str(&value))
+                    .transpose()?
+                    .unwrap_or_else(|| CdcLedgerStage::from_fragment_status(status));
                 Ok(CdcCommitFragmentRecord {
                     fragment_id: row.try_get("fragment_id")?,
                     job_id: row.try_get("job_id")?,
@@ -609,11 +984,19 @@ impl SyncStateStore {
                         .context("cdc commit fragment sequence must be non-negative")?,
                     commit_lsn: row.try_get("commit_lsn")?,
                     table_key: row.try_get("table_key")?,
-                    status: CdcCommitFragmentStatus::from_str(row.try_get("status")?)?,
+                    status,
+                    stage,
                     row_count: row.try_get("row_count")?,
                     upserted_count: row.try_get("upserted_count")?,
                     deleted_count: row.try_get("deleted_count")?,
                     last_error: row.try_get("last_error")?,
+                    artifact_uri: row.try_get("artifact_uri")?,
+                    staging_table: row.try_get("staging_table")?,
+                    load_job_id: row.try_get("load_job_id")?,
+                    merge_job_id: row.try_get("merge_job_id")?,
+                    primary_key_lane: row.try_get("primary_key_lane")?,
+                    barrier_kind: row.try_get("barrier_kind")?,
+                    ledger_metadata_json: row.try_get("ledger_metadata_json")?,
                     created_at: row.try_get("created_at")?,
                     updated_at: row.try_get("updated_at")?,
                 })
@@ -621,54 +1004,54 @@ impl SyncStateStore {
             .collect()
     }
 
-    pub async fn mark_cdc_commit_fragments_succeeded_for_job(
+    pub async fn load_cdc_durable_apply_frontier(
         &self,
         connection_id: &str,
-        job_id: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(&format!(
+        from_sequence: u64,
+        max_sequences: usize,
+    ) -> anyhow::Result<Option<CdcDurableApplyFrontier>> {
+        let rows = sqlx::query(&format!(
             r#"
-            update {}
-            set status = $3,
-                last_error = null,
-                updated_at = $4
-            where connection_id = $1 and job_id = $2
+            select sequence,
+                   max(commit_lsn) as commit_lsn,
+                   bool_and(status = $3) as all_succeeded
+            from {}
+            where connection_id = $1
+              and sequence >= $2
+            group by sequence
+            order by sequence asc
+            limit $4
             "#,
             self.table("cdc_commit_fragments")
         ))
         .bind(connection_id)
-        .bind(job_id)
+        .bind(saturating_u64_to_i64(from_sequence))
         .bind(CdcCommitFragmentStatus::Succeeded.as_str())
-        .bind(now_millis())
-        .execute(&self.pool)
+        .bind(saturating_usize_to_i64(max_sequences.max(1)))
+        .fetch_all(&self.pool)
         .await?;
-        Ok(())
-    }
 
-    pub async fn mark_cdc_commit_fragments_failed_for_job(
-        &self,
-        connection_id: &str,
-        job_id: &str,
-        error: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(&format!(
-            r#"
-            update {}
-            set status = $3,
-                last_error = $4,
-                updated_at = $5
-            where connection_id = $1 and job_id = $2
-            "#,
-            self.table("cdc_commit_fragments")
-        ))
-        .bind(connection_id)
-        .bind(job_id)
-        .bind(CdcCommitFragmentStatus::Failed.as_str())
-        .bind(error)
-        .bind(now_millis())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut next_sequence = from_sequence;
+        let mut commit_lsn = None;
+        for row in rows {
+            let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
+                .context("cdc commit fragment sequence must be non-negative")?;
+            let all_succeeded = row.try_get::<bool, _>("all_succeeded")?;
+            if sequence != next_sequence || !all_succeeded {
+                break;
+            }
+            commit_lsn = row.try_get::<Option<String>, _>("commit_lsn")?;
+            next_sequence = next_sequence.saturating_add(1);
+        }
+
+        if next_sequence == from_sequence {
+            return Ok(None);
+        }
+        let commit_lsn = commit_lsn.context("durable CDC frontier missing commit LSN")?;
+        Ok(Some(CdcDurableApplyFrontier {
+            next_sequence_to_ack: next_sequence,
+            commit_lsn,
+        }))
     }
 
     pub async fn save_cdc_feedback_state(
@@ -911,6 +1294,14 @@ impl SyncStateStore {
             last_enqueued_sequence: watermark
                 .as_ref()
                 .and_then(|state| state.last_enqueued_sequence),
+            sequence_lag: watermark
+                .as_ref()
+                .and_then(|state| {
+                    state
+                        .last_enqueued_sequence
+                        .map(|last| (state.next_sequence_to_ack, last))
+                })
+                .map(|(next, last)| saturating_u64_to_i64(last.saturating_sub(next))),
             pending_fragments: saturating_usize_to_i64(pending.len()),
             failed_fragments: saturating_usize_to_i64(failed.len()),
             oldest_pending_sequence: oldest_pending.map(|fragment| fragment.sequence),
