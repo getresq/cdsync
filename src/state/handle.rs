@@ -104,6 +104,20 @@ impl StateHandle {
             .await
     }
 
+    pub async fn mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
+        &self,
+        job_ids: &[String],
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.store
+            .mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
+                &self.connection_id,
+                job_ids,
+                error,
+            )
+            .await
+    }
+
     pub async fn mark_cdc_batch_load_bundle_succeeded(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
             .mark_cdc_batch_load_bundle_succeeded(&self.connection_id, job_id)

@@ -252,9 +252,21 @@ pub struct CdcBatchLoadQueueSummary {
     pub running_jobs: i64,
     pub succeeded_jobs: i64,
     pub failed_jobs: i64,
+    #[serde(default)]
+    pub failed_retryable_jobs: i64,
+    #[serde(default)]
+    pub failed_permanent_jobs: i64,
+    #[serde(default)]
+    pub failed_snapshot_handoff_jobs: i64,
+    #[serde(default)]
+    pub failed_unclassified_jobs: i64,
     pub received_jobs: i64,
     pub staged_jobs: i64,
     pub loaded_jobs: i64,
+    #[serde(default)]
+    pub blocked_jobs: i64,
+    #[serde(default)]
+    pub snapshot_handoff_waiting_jobs: i64,
     pub applying_jobs: i64,
     pub applied_jobs: i64,
     pub failed_stage_jobs: i64,
@@ -262,6 +274,7 @@ pub struct CdcBatchLoadQueueSummary {
     pub oldest_running_age_seconds: Option<i64>,
     pub oldest_received_age_seconds: Option<i64>,
     pub oldest_loaded_age_seconds: Option<i64>,
+    pub oldest_blocked_age_seconds: Option<i64>,
     pub oldest_applying_age_seconds: Option<i64>,
     pub jobs_per_minute: i64,
     pub rows_per_minute: i64,
@@ -269,6 +282,7 @@ pub struct CdcBatchLoadQueueSummary {
     pub top_queued_tables: Vec<CdcBatchLoadQueueTableSummary>,
     pub top_loaded_tables: Vec<CdcBatchLoadLoadedTableSummary>,
     pub latest_failed_error: Option<String>,
+    pub latest_failed_retry_class: Option<String>,
     pub latest_failed_at: Option<DateTime<Utc>>,
 }
 

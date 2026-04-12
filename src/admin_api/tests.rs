@@ -403,6 +403,126 @@ fn cdc_progress_insight_surfaces_failed_work_as_blocker() {
 }
 
 #[test]
+fn cdc_progress_insight_treats_snapshot_handoff_failures_as_retrying_work() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: None,
+        restart_lsn: None,
+        confirmed_flush_lsn: None,
+        wal_bytes_retained_by_slot: None,
+        wal_bytes_behind_confirmed: None,
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        failed_jobs: 12,
+        failed_retryable_jobs: 12,
+        failed_snapshot_handoff_jobs: 12,
+        jobs_per_minute: 3,
+        rows_per_minute: 20,
+        latest_failed_error: Some(
+            "CDC batch-load waiting for snapshot handoff for public.workorders_workorder"
+                .to_string(),
+        ),
+        latest_failed_retry_class: Some("transient".to_string()),
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), None).expect("progress insight");
+
+    assert_eq!(insight.status, "moving");
+    assert_eq!(insight.primary_blocker, "snapshot_handoff_retry");
+    assert_eq!(
+        insight.detail,
+        "CDC jobs are retrying while table snapshots finish handoff"
+    );
+}
+
+#[test]
+fn cdc_progress_insight_treats_snapshot_handoff_wait_as_moving_work() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: None,
+        restart_lsn: None,
+        confirmed_flush_lsn: None,
+        wal_bytes_retained_by_slot: None,
+        wal_bytes_behind_confirmed: None,
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        pending_jobs: 12,
+        snapshot_handoff_waiting_jobs: 12,
+        jobs_per_minute: 3,
+        rows_per_minute: 20,
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), None).expect("progress insight");
+
+    assert_eq!(insight.status, "moving");
+    assert_eq!(insight.primary_blocker, "snapshot_handoff_wait");
+    assert_eq!(
+        insight.detail,
+        "CDC jobs are parked while table snapshots finish handoff"
+    );
+}
+
+#[test]
+fn cdc_progress_insight_treats_retryable_failures_as_backoff_not_failed_work() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: None,
+        restart_lsn: None,
+        confirmed_flush_lsn: None,
+        wal_bytes_retained_by_slot: None,
+        wal_bytes_behind_confirmed: None,
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        failed_jobs: 2,
+        failed_retryable_jobs: 2,
+        latest_failed_retry_class: Some("backpressure".to_string()),
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), None).expect("progress insight");
+
+    assert_eq!(insight.status, "backlogged");
+    assert_eq!(insight.primary_blocker, "retryable_job_backoff");
+}
+
+#[test]
+fn cdc_progress_insight_treats_legacy_unclassified_failures_as_watch() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: None,
+        restart_lsn: None,
+        confirmed_flush_lsn: None,
+        wal_bytes_retained_by_slot: None,
+        wal_bytes_behind_confirmed: None,
+    };
+    let queue = CdcBatchLoadQueueSummary {
+        failed_jobs: 1,
+        failed_unclassified_jobs: 1,
+        jobs_per_minute: 1,
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(&cdc, Some(&queue), None).expect("progress insight");
+
+    assert_eq!(insight.status, "watch");
+    assert_eq!(insight.primary_blocker, "unclassified_failed_jobs");
+}
+
+#[test]
 fn build_table_progress_prefers_table_runtime_retry_state() {
     let connection = test_postgres_cdc_connection();
     let mut state = ConnectionState {

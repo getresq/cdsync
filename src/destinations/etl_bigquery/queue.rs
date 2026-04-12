@@ -130,6 +130,17 @@ fn should_mark_cdc_batch_load_fragments_failed(
     !local_retry_retryable_failures || !retry_class.is_retryable()
 }
 
+const CDC_SNAPSHOT_HANDOFF_WAIT_PREFIX: &str = "CDC batch-load waiting for snapshot handoff";
+
+fn cdc_snapshot_handoff_wait_reason(source_table: &str) -> String {
+    format!("{CDC_SNAPSHOT_HANDOFF_WAIT_PREFIX} for {source_table}")
+}
+
+fn is_cdc_snapshot_handoff_wait_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .starts_with(CDC_SNAPSHOT_HANDOFF_WAIT_PREFIX)
+}
+
 fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
     compute_sync_retry_backoff(
         &format!("cdc_batch_load:{table_key}"),
@@ -869,8 +880,8 @@ impl CdcBatchLoadManager {
                                 .await
                         }
                         Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
-                            "CDC batch-load waiting for snapshot handoff for {}",
-                            payload.source_table
+                            "{}",
+                            cdc_snapshot_handoff_wait_reason(&payload.source_table)
                         )),
                         Ok(CdcApplyReadiness::Blocked) => {
                             info!(
@@ -956,8 +967,19 @@ impl CdcBatchLoadManager {
                 }
             }
             Err(err) => {
-                self.fail_reducer_window(records, &table_key, started_at, err)
-                    .await
+                if is_cdc_snapshot_handoff_wait_error(err) {
+                    self.block_window_for_snapshot_handoff(
+                        &job_ids,
+                        &table_key,
+                        &payload.source_table,
+                        started_at,
+                    )
+                    .await;
+                    false
+                } else {
+                    self.fail_reducer_window(records, &table_key, started_at, err)
+                        .await
+                }
             }
         };
 
@@ -981,6 +1003,47 @@ impl CdcBatchLoadManager {
                 )),
             };
             self.resolve_window_waiters(&job_ids, waiter_result).await;
+        }
+        self.notify.notify_one();
+    }
+
+    async fn block_window_for_snapshot_handoff(
+        &self,
+        job_ids: &[String],
+        table_key: &str,
+        source_table: &str,
+        started_at: Instant,
+    ) {
+        let reason = cdc_snapshot_handoff_wait_reason(source_table);
+        match self
+            .state_handle
+            .mark_cdc_batch_load_window_blocked_for_snapshot_handoff(job_ids, &reason)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    component = "consumer",
+                    event = "cdc_consumer_window_waiting_snapshot_handoff",
+                    connection_id = self.state_handle.connection_id(),
+                    table = %table_key,
+                    source_table,
+                    job_count = job_ids.len(),
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "queued CDC batch-load reducer window is waiting for snapshot handoff"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    component = "consumer",
+                    event = "cdc_consumer_window_snapshot_handoff_state_update_failed",
+                    connection_id = self.state_handle.connection_id(),
+                    table = %table_key,
+                    source_table,
+                    job_count = job_ids.len(),
+                    error = %err,
+                    "failed to mark queued CDC batch-load reducer window waiting for snapshot handoff"
+                );
+            }
         }
         self.notify.notify_one();
     }
@@ -1063,8 +1126,8 @@ impl CdcBatchLoadManager {
                                 .await
                         }
                         Ok(CdcApplyReadiness::Snapshotting) => Err(anyhow::anyhow!(
-                            "CDC batch-load waiting for snapshot handoff for {}",
-                            job.payload.source_table
+                            "{}",
+                            cdc_snapshot_handoff_wait_reason(&job.payload.source_table)
                         )),
                         Ok(CdcApplyReadiness::Blocked) => {
                             info!(
@@ -1162,7 +1225,20 @@ impl CdcBatchLoadManager {
                     }
                 }
             }
-            Err(err) => self.fail_job(record, &table_key, started_at, err).await,
+            Err(err) => {
+                if is_cdc_snapshot_handoff_wait_error(err) {
+                    self.block_window_for_snapshot_handoff(
+                        std::slice::from_ref(&job_id),
+                        &table_key,
+                        &job.payload.source_table,
+                        started_at,
+                    )
+                    .await;
+                    false
+                } else {
+                    self.fail_job(record, &table_key, started_at, err).await
+                }
+            }
         };
 
         let resolve_waiters = match &result {
@@ -1421,6 +1497,146 @@ mod tests {
     fn checkpoint_readiness_checks_only_run_in_mixed_mode() {
         assert!(!should_check_table_apply_readiness(false));
         assert!(should_check_table_apply_readiness(true));
+    }
+
+    #[test]
+    fn snapshot_handoff_errors_are_detected_for_wait_state() {
+        let err = anyhow::anyhow!("{}", cdc_snapshot_handoff_wait_reason("public.accounts"));
+        assert!(is_cdc_snapshot_handoff_wait_error(&err));
+
+        let other = anyhow::anyhow!("failed to inspect CDC apply readiness for public.accounts");
+        assert!(!is_cdc_snapshot_handoff_wait_error(&other));
+    }
+
+    #[tokio::test]
+    async fn apply_job_snapshot_handoff_path_parks_job_without_failure() -> anyhow::Result<()> {
+        let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok() else {
+            return Ok(());
+        };
+        let state_config = crate::config::StateConfig {
+            url: pg_url,
+            schema: Some(format!(
+                "cdsync_state_queue_{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        crate::state::SyncStateStore::migrate_with_config(&state_config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&state_config, 16).await?;
+        let handle = store.handle("app");
+        handle
+            .save_postgres_checkpoint(
+                "public.accounts",
+                &TableCheckpoint {
+                    snapshot_chunks: vec![crate::types::SnapshotChunkCheckpoint {
+                        start_primary_key: Some("1".to_string()),
+                        end_primary_key: Some("10".to_string()),
+                        last_primary_key: Some("5".to_string()),
+                        complete: false,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let inner = BigQueryDestination::new(
+            crate::config::BigQueryConfig {
+                project_id: "project".to_string(),
+                dataset: "dataset".to_string(),
+                location: None,
+                service_account_key_path: None,
+                service_account_key: None,
+                partition_by_synced_at: Some(false),
+                batch_load_bucket: None,
+                batch_load_prefix: None,
+                emulator_http: Some("http://localhost:9050".to_string()),
+                emulator_grpc: Some("localhost:9051".to_string()),
+            },
+            true,
+            MetadataColumns::default(),
+        )
+        .await?;
+        let manager = CdcBatchLoadManager {
+            inner,
+            stats: None,
+            state_handle: handle.clone(),
+            mixed_mode_gate_enabled: Arc::new(AtomicBool::new(true)),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
+            reducer_max_jobs: 1,
+            local_retry_retryable_failures: true,
+        };
+        let payload = CdcBatchLoadJobPayload {
+            job_id: "job-snapshot-handoff".to_string(),
+            source_table: "public.accounts".to_string(),
+            target_table: "public__accounts".to_string(),
+            schema: TableSchema {
+                name: "public__accounts".to_string(),
+                columns: Vec::new(),
+                primary_key: Some("id".to_string()),
+            },
+            staging_schema: Some(TableSchema {
+                name: "public__accounts".to_string(),
+                columns: Vec::new(),
+                primary_key: Some("id".to_string()),
+            }),
+            primary_key: "id".to_string(),
+            truncate: false,
+            steps: Vec::new(),
+        };
+        let now = Utc::now().timestamp_millis();
+        let record = CdcBatchLoadJobRecord {
+            job_id: payload.job_id.clone(),
+            table_key: payload.target_table.clone(),
+            first_sequence: 10,
+            status: CdcBatchLoadJobStatus::Running,
+            stage: CdcLedgerStage::Applying,
+            payload_json: serde_json::to_string(&payload)?,
+            attempt_count: 1,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &record,
+                &[CdcCommitFragmentRecord {
+                    fragment_id: "job-snapshot-handoff:10".to_string(),
+                    job_id: record.job_id.clone(),
+                    sequence: 10,
+                    commit_lsn: "0/AAA".to_string(),
+                    table_key: record.table_key.clone(),
+                    status: CdcCommitFragmentStatus::Pending,
+                    row_count: 1,
+                    upserted_count: 1,
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                }],
+            )
+            .await?;
+
+        manager
+            .run_apply_job(super::super::CdcQueuedBatchLoadJob { record, payload })
+            .await;
+
+        let summary = store.load_cdc_batch_load_queue_summary("app").await?;
+        assert_eq!(summary.failed_jobs, 0);
+        assert_eq!(summary.snapshot_handoff_waiting_jobs, 1);
+        let jobs = store
+            .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+            .await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].stage, CdcLedgerStage::Blocked);
+        assert_eq!(jobs[0].retry_class, None);
+
+        let fragments = store
+            .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Pending])
+            .await?;
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].stage, CdcLedgerStage::Blocked);
+        assert!(fragments[0].last_error.is_some());
+
+        Ok(())
     }
 
     #[test]

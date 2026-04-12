@@ -328,6 +328,145 @@ impl SyncStateStore {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
+        &self,
+        connection_id: &str,
+        job_ids: &[String],
+        error: &str,
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                stage = $5,
+                retry_class = null,
+                last_error = $4,
+                updated_at = $6
+            where connection_id = $1
+              and job_id = any($2)
+              and status = $7
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_ids)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(error)
+        .bind(CdcLedgerStage::Blocked.as_str())
+        .bind(now)
+        .bind(CdcBatchLoadJobStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set stage = $3,
+                last_error = $4,
+                updated_at = $5
+            where connection_id = $1
+              and job_id = any($2)
+              and status = $6
+            "#,
+            self.table("cdc_commit_fragments")
+        ))
+        .bind(connection_id)
+        .bind(job_ids)
+        .bind(CdcLedgerStage::Blocked.as_str())
+        .bind(error)
+        .bind(now)
+        .bind(CdcCommitFragmentStatus::Pending.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn release_snapshot_handoff_blocked_cdc_batch_load_jobs(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<u64> {
+        let now = now_millis();
+        let jobs_table = self.table("cdc_batch_load_jobs");
+        let fragment_table = self.table("cdc_commit_fragments");
+        let checkpoints_table = self.table("table_checkpoints");
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(&format!(
+            r#"
+            with ready_jobs as (
+                select j.job_id
+                from {jobs_table} j
+                left join {checkpoints_table} checkpoint
+                  on checkpoint.connection_id = j.connection_id
+                 and checkpoint.source_kind = 'postgres'
+                 and checkpoint.entity_name = j.payload_json::jsonb ->> 'source_table'
+                where j.connection_id = $1
+                  and j.status = $2
+                  and j.stage = $3
+                  and j.last_error like $4
+                  and not exists (
+                    select 1
+                    from jsonb_array_elements(
+                        coalesce(checkpoint.checkpoint_json::jsonb -> 'snapshot_chunks', '[]'::jsonb)
+                    ) chunk
+                    where not coalesce((chunk ->> 'complete')::boolean, false)
+                  )
+                order by j.first_sequence asc, j.created_at asc
+                for update of j skip locked
+            )
+            update {jobs_table} jobs
+            set stage = $5,
+                last_error = null,
+                updated_at = $6
+            from ready_jobs
+            where jobs.connection_id = $1
+              and jobs.job_id = ready_jobs.job_id
+            returning jobs.job_id
+            "#,
+            jobs_table = jobs_table,
+            checkpoints_table = checkpoints_table,
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcLedgerStage::Blocked.as_str())
+        .bind("CDC batch-load waiting for snapshot handoff%")
+        .bind(CdcLedgerStage::Loaded.as_str())
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        let job_ids = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("job_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !job_ids.is_empty() {
+            sqlx::query(&format!(
+                r#"
+                update {fragment_table}
+                set stage = $3,
+                    last_error = null,
+                    updated_at = $4
+                where connection_id = $1
+                  and job_id = any($2)
+                  and status = $5
+                "#,
+                fragment_table = fragment_table
+            ))
+            .bind(connection_id)
+            .bind(&job_ids)
+            .bind(CdcLedgerStage::Received.as_str())
+            .bind(now)
+            .bind(CdcCommitFragmentStatus::Pending.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(job_ids.len() as u64)
+    }
+
     pub async fn claim_next_loaded_cdc_batch_load_job_window_for_apply(
         &self,
         connection_id: &str,
@@ -335,6 +474,8 @@ impl SyncStateStore {
         max_jobs: usize,
     ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
         let now = now_millis();
+        self.release_snapshot_handoff_blocked_cdc_batch_load_jobs(connection_id)
+            .await?;
         let rows = sqlx::query(&format!(
             r#"
             with candidate as (
@@ -755,9 +896,34 @@ impl SyncStateStore {
                 count(*) filter (where status = 'running')::bigint as running_jobs,
                 count(*) filter (where status = 'succeeded')::bigint as succeeded_jobs,
                 count(*) filter (where status = 'failed')::bigint as failed_jobs,
+                count(*) filter (
+                    where status = 'failed'
+                      and retry_class in ('backpressure', 'transient')
+                )::bigint as failed_retryable_jobs,
+                count(*) filter (
+                    where status = 'failed'
+                      and retry_class = 'permanent'
+                )::bigint as failed_permanent_jobs,
+                count(*) filter (
+                    where status = 'failed'
+                      and retry_class in ('backpressure', 'transient')
+                      and last_error like 'CDC batch-load waiting for snapshot handoff%'
+                )::bigint as failed_snapshot_handoff_jobs,
+                count(*) filter (
+                    where status = 'failed'
+                      and (
+                          retry_class is null
+                          or retry_class not in ('backpressure', 'transient', 'permanent')
+                      )
+                )::bigint as failed_unclassified_jobs,
                 count(*) filter (where stage = 'received')::bigint as received_jobs,
                 count(*) filter (where stage = 'staged')::bigint as staged_jobs,
                 count(*) filter (where stage = 'loaded')::bigint as loaded_jobs,
+                count(*) filter (where stage = 'blocked')::bigint as blocked_jobs,
+                count(*) filter (
+                    where stage = 'blocked'
+                      and last_error like 'CDC batch-load waiting for snapshot handoff%'
+                )::bigint as snapshot_handoff_waiting_jobs,
                 count(*) filter (where stage = 'applying')::bigint as applying_jobs,
                 count(*) filter (where stage = 'applied')::bigint as applied_jobs,
                 count(*) filter (where stage = 'failed')::bigint as failed_stage_jobs,
@@ -765,6 +931,7 @@ impl SyncStateStore {
                 min(updated_at) filter (where status = 'running') as oldest_running_ms,
                 min(updated_at) filter (where stage = 'received') as oldest_received_ms,
                 min(updated_at) filter (where stage = 'loaded') as oldest_loaded_ms,
+                min(updated_at) filter (where stage = 'blocked') as oldest_blocked_ms,
                 min(updated_at) filter (where stage = 'applying') as oldest_applying_ms,
                 count(*) filter (where status = 'succeeded' and updated_at >= $2)::bigint as jobs_per_minute,
                 avg((updated_at - created_at)::double precision) filter (where status = 'succeeded' and updated_at >= $3) as avg_job_duration_ms
@@ -873,7 +1040,7 @@ impl SyncStateStore {
 
         let failed = sqlx::query(&format!(
             r#"
-            select last_error, updated_at
+            select last_error, retry_class, updated_at
             from {}
             where connection_id = $1
               and status = 'failed'
@@ -890,6 +1057,7 @@ impl SyncStateStore {
         let oldest_running_ms: Option<i64> = aggregate.try_get("oldest_running_ms")?;
         let oldest_received_ms: Option<i64> = aggregate.try_get("oldest_received_ms")?;
         let oldest_loaded_ms: Option<i64> = aggregate.try_get("oldest_loaded_ms")?;
+        let oldest_blocked_ms: Option<i64> = aggregate.try_get("oldest_blocked_ms")?;
         let oldest_applying_ms: Option<i64> = aggregate.try_get("oldest_applying_ms")?;
         let avg_job_duration_ms: Option<f64> = aggregate.try_get("avg_job_duration_ms")?;
 
@@ -899,9 +1067,17 @@ impl SyncStateStore {
             running_jobs: aggregate.try_get::<i64, _>("running_jobs")?,
             succeeded_jobs: aggregate.try_get::<i64, _>("succeeded_jobs")?,
             failed_jobs: aggregate.try_get::<i64, _>("failed_jobs")?,
+            failed_retryable_jobs: aggregate.try_get::<i64, _>("failed_retryable_jobs")?,
+            failed_permanent_jobs: aggregate.try_get::<i64, _>("failed_permanent_jobs")?,
+            failed_snapshot_handoff_jobs: aggregate
+                .try_get::<i64, _>("failed_snapshot_handoff_jobs")?,
+            failed_unclassified_jobs: aggregate.try_get::<i64, _>("failed_unclassified_jobs")?,
             received_jobs: aggregate.try_get::<i64, _>("received_jobs")?,
             staged_jobs: aggregate.try_get::<i64, _>("staged_jobs")?,
             loaded_jobs: aggregate.try_get::<i64, _>("loaded_jobs")?,
+            blocked_jobs: aggregate.try_get::<i64, _>("blocked_jobs")?,
+            snapshot_handoff_waiting_jobs: aggregate
+                .try_get::<i64, _>("snapshot_handoff_waiting_jobs")?,
             applying_jobs: aggregate.try_get::<i64, _>("applying_jobs")?,
             applied_jobs: aggregate.try_get::<i64, _>("applied_jobs")?,
             failed_stage_jobs: aggregate.try_get::<i64, _>("failed_stage_jobs")?,
@@ -909,6 +1085,7 @@ impl SyncStateStore {
             oldest_running_age_seconds: oldest_running_ms.map(|ts| ((now - ts).max(0)) / 1000),
             oldest_received_age_seconds: oldest_received_ms.map(|ts| ((now - ts).max(0)) / 1000),
             oldest_loaded_age_seconds: oldest_loaded_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            oldest_blocked_age_seconds: oldest_blocked_ms.map(|ts| ((now - ts).max(0)) / 1000),
             oldest_applying_age_seconds: oldest_applying_ms.map(|ts| ((now - ts).max(0)) / 1000),
             jobs_per_minute: aggregate.try_get::<i64, _>("jobs_per_minute")?,
             rows_per_minute,
@@ -936,6 +1113,10 @@ impl SyncStateStore {
             latest_failed_error: failed
                 .as_ref()
                 .and_then(|row| row.try_get::<Option<String>, _>("last_error").ok())
+                .flatten(),
+            latest_failed_retry_class: failed
+                .as_ref()
+                .and_then(|row| row.try_get::<Option<String>, _>("retry_class").ok())
                 .flatten(),
             latest_failed_at: failed
                 .as_ref()

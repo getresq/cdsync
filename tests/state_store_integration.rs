@@ -1195,6 +1195,190 @@ async fn postgres_state_store_requeues_retryable_batch_load_job_by_id() -> anyho
 }
 
 #[tokio::test]
+async fn postgres_state_store_batch_load_queue_summary_classifies_failed_jobs() -> anyhow::Result<()>
+{
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let cases = [
+        (
+            "job-snapshot-handoff",
+            Some(SyncRetryClass::Transient),
+            "CDC batch-load waiting for snapshot handoff for public.workorders_workorder",
+        ),
+        (
+            "job-generic-retryable",
+            Some(SyncRetryClass::Backpressure),
+            "quota exceeded",
+        ),
+        (
+            "job-permanent",
+            Some(SyncRetryClass::Permanent),
+            "invalid field mapping",
+        ),
+        (
+            "job-legacy-null",
+            None,
+            "legacy failed row without retry class",
+        ),
+    ];
+
+    for (index, (job_id, retry_class, error)) in cases.into_iter().enumerate() {
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.to_string(),
+                    table_key: format!("public__table_{index}"),
+                    first_sequence: 10 + index as u64,
+                    status: CdcBatchLoadJobStatus::Failed,
+                    stage: CdcLedgerStage::Failed,
+                    payload_json: "{}".to_string(),
+                    attempt_count: 1,
+                    retry_class,
+                    last_error: Some(error.to_string()),
+                    created_at: now + index as i64,
+                    updated_at: now + index as i64,
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await?;
+    }
+
+    let summary = store.load_cdc_batch_load_queue_summary("app").await?;
+    assert_eq!(summary.failed_jobs, 4);
+    assert_eq!(summary.failed_retryable_jobs, 2);
+    assert_eq!(summary.failed_snapshot_handoff_jobs, 1);
+    assert_eq!(summary.failed_permanent_jobs, 1);
+    assert_eq!(summary.failed_unclassified_jobs, 1);
+    assert_eq!(summary.latest_failed_retry_class, None);
+    assert_eq!(
+        summary.latest_failed_error.as_deref(),
+        Some("legacy failed row without retry class")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_releases_snapshot_handoff_waiting_jobs_when_snapshot_completes()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+    let job_id = "job-snapshot-wait".to_string();
+    let reason = "CDC batch-load waiting for snapshot handoff for public.accounts";
+
+    handle
+        .save_postgres_checkpoint(
+            "public.accounts",
+            &TableCheckpoint {
+                snapshot_chunks: vec![SnapshotChunkCheckpoint {
+                    start_primary_key: Some("1".to_string()),
+                    end_primary_key: Some("10".to_string()),
+                    last_primary_key: Some("5".to_string()),
+                    complete: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await?;
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: job_id.clone(),
+                table_key: "public__accounts".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Running,
+                stage: CdcLedgerStage::Applying,
+                payload_json: reducer_payload_json(&job_id, "accounts"),
+                attempt_count: 1,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            },
+            &[CdcCommitFragmentRecord {
+                fragment_id: format!("{job_id}:10"),
+                job_id: job_id.clone(),
+                sequence: 10,
+                commit_lsn: "0/AAA".to_string(),
+                table_key: "public__accounts".to_string(),
+                status: CdcCommitFragmentStatus::Pending,
+                row_count: 1,
+                upserted_count: 1,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            }],
+        )
+        .await?;
+    handle
+        .mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
+            std::slice::from_ref(&job_id),
+            reason,
+        )
+        .await?;
+
+    let summary = store.load_cdc_batch_load_queue_summary("app").await?;
+    assert_eq!(summary.failed_jobs, 0);
+    assert_eq!(summary.blocked_jobs, 1);
+    assert_eq!(summary.snapshot_handoff_waiting_jobs, 1);
+    assert_eq!(
+        store
+            .release_snapshot_handoff_blocked_cdc_batch_load_jobs("app")
+            .await?,
+        0
+    );
+
+    handle
+        .save_postgres_checkpoint(
+            "public.accounts",
+            &TableCheckpoint {
+                snapshot_chunks: vec![SnapshotChunkCheckpoint {
+                    start_primary_key: Some("1".to_string()),
+                    end_primary_key: Some("10".to_string()),
+                    last_primary_key: Some("10".to_string()),
+                    complete: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        store
+            .release_snapshot_handoff_blocked_cdc_batch_load_jobs("app")
+            .await?,
+        1
+    );
+    let jobs = store
+        .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, job_id);
+    assert_eq!(jobs[0].stage, CdcLedgerStage::Loaded);
+    assert_eq!(jobs[0].last_error, None);
+
+    let fragments = store
+        .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Pending])
+        .await?;
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].stage, CdcLedgerStage::Received);
+    assert_eq!(fragments[0].last_error, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_enqueue_bundle_persists_job_fragments_and_watermark()
 -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {

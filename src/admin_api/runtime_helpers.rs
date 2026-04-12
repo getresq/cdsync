@@ -193,8 +193,18 @@ pub(super) fn build_cdc_progress_insight(
     let failed_fragments = cdc_coordinator.map(|summary| summary.failed_fragments);
     let pending_jobs = batch_load_queue.map(|summary| summary.pending_jobs);
     let running_jobs = batch_load_queue.map(|summary| summary.running_jobs);
+    let snapshot_handoff_waiting_jobs =
+        batch_load_queue.map(|summary| summary.snapshot_handoff_waiting_jobs);
     let jobs_per_minute = batch_load_queue.map(|summary| summary.jobs_per_minute);
     let rows_per_minute = batch_load_queue.map(|summary| summary.rows_per_minute);
+    let failed_jobs = batch_load_queue.map(|summary| summary.failed_jobs);
+    let failed_permanent_jobs = batch_load_queue.map(|summary| summary.failed_permanent_jobs);
+    let failed_snapshot_handoff_jobs =
+        batch_load_queue.map(|summary| summary.failed_snapshot_handoff_jobs);
+    let failed_retryable_jobs = batch_load_queue.map(|summary| summary.failed_retryable_jobs);
+    let failed_unclassified_jobs = batch_load_queue.map(|summary| summary.failed_unclassified_jobs);
+    let has_recent_completions =
+        rows_per_minute.unwrap_or_default() > 0 || jobs_per_minute.unwrap_or_default() > 0;
 
     let (status, primary_blocker, detail) = if cdc.sampler_status != "ok" {
         (
@@ -203,14 +213,69 @@ pub(super) fn build_cdc_progress_insight(
             format!("CDC sampler status is {}", cdc.sampler_status),
         )
     } else if failed_fragments.unwrap_or_default() > 0
-        || batch_load_queue.is_some_and(|summary| summary.failed_jobs > 0)
+        || failed_permanent_jobs.unwrap_or_default() > 0
     {
         (
             "blocked",
             "failed_work",
-            "Failed CDC fragments or batch-load jobs require retry or intervention".to_string(),
+            "Failed CDC fragments or terminal batch-load jobs require retry or intervention"
+                .to_string(),
         )
-    } else if rows_per_minute.unwrap_or_default() > 0 || jobs_per_minute.unwrap_or_default() > 0 {
+    } else if snapshot_handoff_waiting_jobs.unwrap_or_default() > 0 {
+        (
+            if has_recent_completions {
+                "moving"
+            } else {
+                "backlogged"
+            },
+            "snapshot_handoff_wait",
+            "CDC jobs are parked while table snapshots finish handoff".to_string(),
+        )
+    } else if failed_snapshot_handoff_jobs.unwrap_or_default() > 0
+        && failed_snapshot_handoff_jobs == failed_jobs
+    {
+        (
+            if has_recent_completions {
+                "moving"
+            } else {
+                "backlogged"
+            },
+            "snapshot_handoff_retry",
+            "CDC jobs are retrying while table snapshots finish handoff".to_string(),
+        )
+    } else if failed_retryable_jobs.unwrap_or_default() > 0 && failed_retryable_jobs == failed_jobs
+    {
+        (
+            if has_recent_completions {
+                "moving"
+            } else {
+                "backlogged"
+            },
+            "retryable_job_backoff",
+            "Retryable CDC batch-load jobs are waiting for backoff; no terminal failure is visible"
+                .to_string(),
+        )
+    } else if failed_unclassified_jobs.unwrap_or_default() > 0
+        && failed_unclassified_jobs.unwrap_or_default() + failed_retryable_jobs.unwrap_or_default()
+            == failed_jobs.unwrap_or_default()
+    {
+        (
+            if has_recent_completions {
+                "watch"
+            } else {
+                "backlogged"
+            },
+            "unclassified_failed_jobs",
+            "Unclassified CDC batch-load failures are visible; inspect retry metadata if they do not drain"
+                .to_string(),
+        )
+    } else if failed_jobs.unwrap_or_default() > 0 {
+        (
+            "blocked",
+            "failed_work",
+            "Failed CDC batch-load jobs require retry or intervention".to_string(),
+        )
+    } else if has_recent_completions {
         (
             "moving",
             "none",
