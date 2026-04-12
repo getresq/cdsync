@@ -1195,6 +1195,59 @@ async fn postgres_state_store_requeues_retryable_batch_load_job_by_id() -> anyho
 }
 
 #[tokio::test]
+async fn postgres_state_store_loads_retryable_failed_jobs_for_durable_retry() -> anyhow::Result<()>
+{
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for (index, (job_id, retry_class)) in [
+        ("job-transient", Some(SyncRetryClass::Transient)),
+        ("job-backpressure", Some(SyncRetryClass::Backpressure)),
+        ("job-permanent", Some(SyncRetryClass::Permanent)),
+        ("job-unclassified", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.to_string(),
+                    table_key: format!("public__table_{index}"),
+                    first_sequence: 10 + index as u64,
+                    status: CdcBatchLoadJobStatus::Failed,
+                    stage: CdcLedgerStage::Failed,
+                    payload_json: "{}".to_string(),
+                    attempt_count: 2,
+                    retry_class,
+                    last_error: Some("failed".to_string()),
+                    created_at: now + index as i64,
+                    updated_at: now + index as i64,
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await?;
+    }
+
+    let jobs = store
+        .load_retryable_failed_cdc_batch_load_jobs("app")
+        .await?;
+    let job_ids = jobs
+        .iter()
+        .map(|job| job.job_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(job_ids, vec!["job-transient", "job-backpressure"]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_batch_load_queue_summary_classifies_failed_jobs() -> anyhow::Result<()>
 {
     let Some(config) = test_state_config() else {

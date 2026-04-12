@@ -104,6 +104,14 @@ impl StateHandle {
             .await
     }
 
+    pub async fn load_retryable_failed_cdc_batch_load_jobs(
+        &self,
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        self.store
+            .load_retryable_failed_cdc_batch_load_jobs(&self.connection_id)
+            .await
+    }
+
     pub async fn mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
         &self,
         job_ids: &[String],

@@ -1,6 +1,6 @@
 [package]
 name = "cdsync"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 autotests = false
 

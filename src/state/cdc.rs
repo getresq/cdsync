@@ -249,6 +249,38 @@ impl SyncStateStore {
             .collect()
     }
 
+    pub async fn load_retryable_failed_cdc_batch_load_jobs(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select job_id, table_key, first_sequence, status, payload_json, attempt_count,
+                   retry_class, last_error, stage, staging_table, artifact_uri, load_job_id,
+                   merge_job_id, primary_key_lane, barrier_kind, ledger_metadata_json,
+                   created_at, updated_at
+            from {}
+            where connection_id = $1
+              and status = $2
+              and retry_class = any($3)
+            order by updated_at asc, first_sequence asc, created_at asc
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .bind([
+            SyncRetryClass::Backpressure.as_str(),
+            SyncRetryClass::Transient.as_str(),
+        ])
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| cdc_batch_load_job_record_from_row(&row))
+            .collect()
+    }
+
     pub async fn claim_next_cdc_batch_load_staging_job(
         &self,
         connection_id: &str,

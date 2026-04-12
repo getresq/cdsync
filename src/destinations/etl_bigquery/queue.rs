@@ -131,7 +131,6 @@ fn should_mark_cdc_batch_load_fragments_failed(
 }
 
 const CDC_SNAPSHOT_HANDOFF_WAIT_PREFIX: &str = "CDC batch-load waiting for snapshot handoff";
-
 fn cdc_snapshot_handoff_wait_reason(source_table: &str) -> String {
     format!("{CDC_SNAPSHOT_HANDOFF_WAIT_PREFIX} for {source_table}")
 }
@@ -147,6 +146,28 @@ fn cdc_batch_load_retry_delay(attempt_count: i32, table_key: &str) -> Duration {
         attempt_count.max(1) as u32,
         1_000,
     )
+}
+
+fn cdc_batch_load_retry_due_at_ms(record: &CdcBatchLoadJobRecord) -> i64 {
+    let delay_ms = i64::try_from(
+        cdc_batch_load_retry_delay(record.attempt_count, &record.table_key).as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    record.updated_at.saturating_add(delay_ms)
+}
+
+fn cdc_batch_load_retry_is_due(record: &CdcBatchLoadJobRecord, now_ms: i64) -> bool {
+    cdc_batch_load_retry_due_at_ms(record) <= now_ms
+}
+
+fn due_retryable_failed_cdc_batch_load_jobs(
+    records: Vec<CdcBatchLoadJobRecord>,
+    now_ms: i64,
+) -> Vec<CdcBatchLoadJobRecord> {
+    records
+        .into_iter()
+        .filter(|record| cdc_batch_load_retry_is_due(record, now_ms))
+        .collect()
 }
 
 fn checkpoint_has_incomplete_snapshot(checkpoint: &TableCheckpoint) -> bool {
@@ -693,6 +714,7 @@ impl CdcBatchLoadManager {
     }
 
     async fn claim_next_staging_job(&self) -> EtlResult<Option<CdcQueuedBatchLoadJob>> {
+        self.requeue_due_retryable_failed_jobs().await?;
         let stale_before_ms =
             Utc::now().timestamp_millis() - CDC_BATCH_LOAD_JOB_STALE_TIMEOUT.as_millis() as i64;
         let Some(record) = self
@@ -754,6 +776,66 @@ impl CdcBatchLoadManager {
             jobs.push(CdcQueuedBatchLoadJob { record, payload });
         }
         Ok(Some(CdcQueuedBatchLoadWindow { jobs }))
+    }
+
+    async fn requeue_due_retryable_failed_jobs(&self) -> EtlResult<u64> {
+        let records = self
+            .state_handle
+            .load_retryable_failed_cdc_batch_load_jobs()
+            .await
+            .map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to load retryable failed CDC batch-load jobs",
+                    err.to_string()
+                )
+            })?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut requeued = 0_u64;
+        for record in due_retryable_failed_cdc_batch_load_jobs(records, now_ms) {
+            let retry_due_at_ms = cdc_batch_load_retry_due_at_ms(&record);
+            let retry_class = record.retry_class.map_or("unknown", SyncRetryClass::as_str);
+            match self
+                .state_handle
+                .requeue_cdc_batch_load_job(&record.job_id)
+                .await
+            {
+                Ok(true) => {
+                    requeued = requeued.saturating_add(1);
+                    info!(
+                        component = "consumer",
+                        event = "cdc_consumer_job_retry_requeued_from_durable_state",
+                        connection_id = self.state_handle.connection_id(),
+                        job_id = %record.job_id,
+                        table = %record.table_key,
+                        retry_class,
+                        attempt_count = record.attempt_count,
+                        retry_due_at_ms,
+                        "requeued retryable failed CDC batch-load job from durable state"
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => warn!(
+                    component = "consumer",
+                    event = "cdc_consumer_job_retry_requeue_from_durable_state_failed",
+                    connection_id = self.state_handle.connection_id(),
+                    job_id = %record.job_id,
+                    table = %record.table_key,
+                    retry_class,
+                    error = %err,
+                    "failed to requeue retryable failed CDC batch-load job from durable state"
+                ),
+            }
+        }
+
+        if requeued > 0 {
+            self.notify.notify_one();
+        }
+        Ok(requeued)
     }
 
     async fn run_staging_job(&self, job: CdcQueuedBatchLoadJob) {
@@ -1300,7 +1382,7 @@ impl CdcBatchLoadManager {
             .state_handle
             .mark_cdc_batch_load_window_failed(
                 &job_ids,
-                &err.to_string(),
+                &format!("{err:#}"),
                 retry_class,
                 mark_fragments_failed,
             )
@@ -1388,7 +1470,7 @@ impl CdcBatchLoadManager {
             .state_handle
             .mark_cdc_batch_load_bundle_failed(
                 &job_id,
-                &err.to_string(),
+                &format!("{err:#}"),
                 retry_class,
                 mark_fragments_failed,
             )
@@ -1491,6 +1573,136 @@ mod tests {
         let delay = cdc_batch_load_retry_delay(1, "public.accounts");
         assert!(delay >= Duration::from_secs(16));
         assert!(delay <= Duration::from_secs(20));
+    }
+
+    #[test]
+    fn batch_load_retry_due_uses_durable_failure_timestamp() {
+        let record = CdcBatchLoadJobRecord {
+            table_key: "public.accounts".to_string(),
+            attempt_count: 1,
+            updated_at: 1_000,
+            ..Default::default()
+        };
+        let due_at = cdc_batch_load_retry_due_at_ms(&record);
+        assert!(!cdc_batch_load_retry_is_due(&record, due_at - 1));
+        assert!(cdc_batch_load_retry_is_due(&record, due_at));
+    }
+
+    #[test]
+    fn retry_due_filter_does_not_depend_on_failed_job_order() {
+        let now = 2_000_000;
+        let not_due = CdcBatchLoadJobRecord {
+            job_id: "not-due".to_string(),
+            table_key: "public.accounts".to_string(),
+            attempt_count: 30,
+            updated_at: now - 100_000,
+            retry_class: Some(SyncRetryClass::Transient),
+            ..Default::default()
+        };
+        let due = CdcBatchLoadJobRecord {
+            job_id: "due".to_string(),
+            table_key: "public.accounts".to_string(),
+            attempt_count: 1,
+            updated_at: now - 100_000,
+            retry_class: Some(SyncRetryClass::Transient),
+            ..Default::default()
+        };
+
+        assert!(!cdc_batch_load_retry_is_due(&not_due, now));
+        assert!(cdc_batch_load_retry_is_due(&due, now));
+        let due_jobs = due_retryable_failed_cdc_batch_load_jobs(vec![not_due, due], now);
+
+        assert_eq!(due_jobs.len(), 1);
+        assert_eq!(due_jobs[0].job_id, "due");
+    }
+
+    #[tokio::test]
+    async fn manager_requeues_due_failed_jobs_from_durable_state() -> anyhow::Result<()> {
+        let Some(pg_url) = std::env::var("CDSYNC_E2E_PG_URL").ok() else {
+            return Ok(());
+        };
+        let state_config = crate::config::StateConfig {
+            url: pg_url,
+            schema: Some(format!(
+                "cdsync_state_queue_{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        crate::state::SyncStateStore::migrate_with_config(&state_config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&state_config, 16).await?;
+        let handle = store.handle("app");
+        let now = Utc::now().timestamp_millis();
+
+        for (job_id, updated_at) in [
+            ("job-retry-due", now - 2_000_000),
+            ("job-retry-not-due", now),
+        ] {
+            handle
+                .enqueue_cdc_batch_load_bundle(
+                    &CdcBatchLoadJobRecord {
+                        job_id: job_id.to_string(),
+                        table_key: "public__accounts".to_string(),
+                        first_sequence: 10,
+                        status: CdcBatchLoadJobStatus::Failed,
+                        stage: CdcLedgerStage::Failed,
+                        payload_json: "{}".to_string(),
+                        attempt_count: 1,
+                        retry_class: Some(SyncRetryClass::Transient),
+                        last_error: Some("transient failure".to_string()),
+                        created_at: updated_at,
+                        updated_at,
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .await?;
+        }
+
+        let inner = BigQueryDestination::new(
+            crate::config::BigQueryConfig {
+                project_id: "project".to_string(),
+                dataset: "dataset".to_string(),
+                location: None,
+                service_account_key_path: None,
+                service_account_key: None,
+                partition_by_synced_at: Some(false),
+                batch_load_bucket: None,
+                batch_load_prefix: None,
+                emulator_http: Some("http://localhost:9050".to_string()),
+                emulator_grpc: Some("localhost:9051".to_string()),
+            },
+            true,
+            MetadataColumns::default(),
+        )
+        .await?;
+        let manager = CdcBatchLoadManager {
+            inner,
+            stats: None,
+            state_handle: handle.clone(),
+            mixed_mode_gate_enabled: Arc::new(AtomicBool::new(false)),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
+            reducer_max_jobs: 1,
+            local_retry_retryable_failures: true,
+        };
+
+        assert_eq!(manager.requeue_due_retryable_failed_jobs().await?, 1);
+
+        let pending = store
+            .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+            .await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].job_id, "job-retry-due");
+        assert_eq!(pending[0].stage, CdcLedgerStage::Received);
+        assert_eq!(pending[0].last_error, None);
+
+        let failed = store
+            .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Failed])
+            .await?;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].job_id, "job-retry-not-due");
+
+        Ok(())
     }
 
     #[test]
