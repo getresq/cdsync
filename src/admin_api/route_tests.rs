@@ -1132,11 +1132,8 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(progress_json["cdc"]["slot_active"], true);
     assert_eq!(progress_json["cdc"]["confirmed_flush_lsn"], "0/16B6C50");
     assert!(progress_json["cdc"]["sampled_at"].is_string());
-    assert_eq!(progress_json["cdc_progress"]["status"], "watch");
-    assert_eq!(
-        progress_json["cdc_progress"]["primary_blocker"],
-        "unattributed_wal_gap"
-    );
+    assert_eq!(progress_json["cdc_progress"]["status"], "idle");
+    assert_eq!(progress_json["cdc_progress"]["primary_blocker"], "none");
     assert_eq!(progress_json["tables"][0]["table_name"], "public.accounts");
     assert_eq!(
         progress_json["tables"][0]["checkpoint"]["last_primary_key"],

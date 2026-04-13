@@ -1,5 +1,34 @@
 # Next
 
+## CDC Dashboard WAL Gap Signal
+
+Mission:
+- Keep idle/unattributed WAL drift from surfacing as a scary blocking signal unless the admin data shows actual blocking/backlogged work.
+
+Checklist:
+- [x] Reclassify idle WAL gap in CDSync admin progress insight.
+- [x] Adjust the ResQ dashboard label for non-blocking progress states.
+- [x] Add focused regression coverage.
+- [x] Run focused ResQ checks and Rust formatting.
+- [x] Review the diff.
+- [x] Re-run focused Rust checks in an isolated target dir.
+- [x] Bump CDSync version and release pin.
+- [x] Commit and tag the release.
+
+Validation:
+- `cargo fmt` passed in `/Users/mazdak/Code/cdsync`.
+- `uvx ruff format common/admin/cdsync.py common/tests/test_cdsync_admin_view.py && uvx ruff check common/admin/cdsync.py common/tests/test_cdsync_admin_view.py` passed in `/Users/mazdak/Code/resq-fullstack`.
+- `./resq test common/tests/test_cdsync_admin_view.py` passed in `/Users/mazdak/Code/resq-fullstack` with 12 tests.
+- `cargo test --lib admin_api::tests::cdc_progress_insight` in the default target dir and `cargo check --lib --tests` both stalled with idle rustc children at 0% CPU and were stopped.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --lib admin_api::tests::cdc_progress_insight` passed with 8 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --lib admin_api::route_tests::admin_api_in_process_stateful_routes_work` passed with 1 test.
+- After bumping CDSync to `0.4.6`, `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::tests::cdc_progress_insight` passed with 8 tests.
+- After bumping CDSync to `0.4.6`, `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::route_tests::admin_api_in_process_stateful_routes_work` passed with 1 test.
+- `bunx prettier --check infra/shared/platform-cdsync-ecs-service.ts templates/admin/cdsync_dashboard.html` passed in `/Users/mazdak/Code/resq-fullstack`.
+
+Review:
+- Subagent review found no issues.
+
 ## Staging BigQuery `totalRows` Decode Backlog
 
 - [x] Confirm `jobs.getQueryResults` decode fails before local query-response normalization when BigQuery omits `totalRows`.

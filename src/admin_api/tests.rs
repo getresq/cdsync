@@ -523,7 +523,7 @@ fn cdc_progress_insight_treats_legacy_unclassified_failures_as_watch() {
 }
 
 #[test]
-fn cdc_progress_insight_describes_idle_wal_gap_direction() {
+fn cdc_progress_insight_ignores_tiny_idle_wal_gap() {
     let cdc = ConnectionCdcSnapshot {
         sampler_status: "ok",
         sampled_at: None,
@@ -532,8 +532,37 @@ fn cdc_progress_insight_describes_idle_wal_gap_direction() {
         current_wal_lsn: Some("0/20".to_string()),
         restart_lsn: Some("0/10".to_string()),
         confirmed_flush_lsn: Some("0/10".to_string()),
-        wal_bytes_retained_by_slot: Some(16),
-        wal_bytes_behind_confirmed: Some(16),
+        wal_bytes_retained_by_slot: Some(1_176),
+        wal_bytes_behind_confirmed: Some(1_176),
+    };
+
+    let insight = build_cdc_progress_insight(
+        &cdc,
+        Some(&CdcBatchLoadQueueSummary::default()),
+        Some(&CdcCoordinatorSummary::default()),
+    )
+    .expect("progress insight");
+
+    assert_eq!(insight.status, "idle");
+    assert_eq!(insight.primary_blocker, "none");
+    assert_eq!(
+        insight.detail,
+        "No CDC backlog is visible in the admin summaries"
+    );
+}
+
+#[test]
+fn cdc_progress_insight_watches_large_idle_wal_gap_without_blocker() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: Some("0/20".to_string()),
+        restart_lsn: Some("0/10".to_string()),
+        confirmed_flush_lsn: Some("0/10".to_string()),
+        wal_bytes_retained_by_slot: Some(1_000_000),
+        wal_bytes_behind_confirmed: Some(1_000_000),
     };
 
     let insight = build_cdc_progress_insight(
@@ -544,7 +573,7 @@ fn cdc_progress_insight_describes_idle_wal_gap_direction() {
     .expect("progress insight");
 
     assert_eq!(insight.status, "watch");
-    assert_eq!(insight.primary_blocker, "unattributed_wal_gap");
+    assert_eq!(insight.primary_blocker, "none");
     assert_eq!(
         insight.detail,
         "Current WAL is ahead of confirmed flush while no queued CDC work is visible"

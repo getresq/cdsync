@@ -4,6 +4,7 @@ use crate::types::{TableRuntimeState, TableRuntimeStatus};
 
 pub(super) const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
+const CDC_PROGRESS_IDLE_WAL_GAP_WATCH_BYTES: i64 = 1_000_000;
 
 pub(super) fn is_postgres_cdc_connection(connection: &ConnectionConfig) -> bool {
     matches!(
@@ -281,14 +282,15 @@ pub(super) fn build_cdc_progress_insight(
             "none",
             "Queued CDC work is completing recently".to_string(),
         )
-    } else if cdc.wal_bytes_behind_confirmed.unwrap_or_default() > 0
+    } else if cdc.wal_bytes_behind_confirmed.unwrap_or_default()
+        >= CDC_PROGRESS_IDLE_WAL_GAP_WATCH_BYTES
         && pending_fragments.unwrap_or_default() == 0
         && pending_jobs.unwrap_or_default() == 0
         && running_jobs.unwrap_or_default() == 0
     {
         (
             "watch",
-            "unattributed_wal_gap",
+            "none",
             "Current WAL is ahead of confirmed flush while no queued CDC work is visible"
                 .to_string(),
         )
