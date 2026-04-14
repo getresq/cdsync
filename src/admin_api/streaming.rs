@@ -171,6 +171,43 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
         },
     )?);
 
+    if uses_cdc_batch_load_queue(connection) {
+        let cdc = ConnectionCdcSnapshot::from_cached(cached_cdc_state.as_ref());
+        let batch_load_queue = cursor
+            .state
+            .state_store
+            .load_cdc_batch_load_queue_summary(&cursor.connection_id)
+            .await?;
+        let cdc_coordinator = cursor
+            .state
+            .state_store
+            .load_cdc_coordinator_summary(&cursor.connection_id, cdc.wal_bytes_behind_confirmed)
+            .await?;
+
+        if let Some(cdc_progress) =
+            build_cdc_progress_insight(&cdc, Some(&batch_load_queue), Some(&cdc_coordinator))
+        {
+            events.push_back(next_stream_event(
+                &mut cursor.seq,
+                &cursor.connection_id,
+                "connection.cdc_progress",
+                cdc_progress,
+            )?);
+        }
+        events.push_back(next_stream_event(
+            &mut cursor.seq,
+            &cursor.connection_id,
+            "connection.cdc_queue",
+            &batch_load_queue,
+        )?);
+        events.push_back(next_stream_event(
+            &mut cursor.seq,
+            &cursor.connection_id,
+            "connection.cdc_coordinator",
+            &cdc_coordinator,
+        )?);
+    }
+
     let active_tables = select_active_tables(&tables);
     if !active_tables.is_empty() {
         events.push_back(next_stream_event(

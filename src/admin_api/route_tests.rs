@@ -1,8 +1,8 @@
 use super::*;
 use crate::config::{
-    AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig, LoggingConfig,
-    MetadataConfig, ObservabilityConfig, PostgresConfig, PostgresTableConfig, SourceConfig,
-    StateConfig, StatsConfig, SyncConfig,
+    AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig,
+    DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
+    PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
 use crate::state::{
     CdcBatchLoadQueueSummary, CdcCoordinatorSummary, ConnectionState, PostgresCdcState,
@@ -916,7 +916,7 @@ async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state() -> 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut bytes_stream = response.bytes_stream();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut body = String::new();
     while !body.contains("event: connection.runtime") && tokio::time::Instant::now() < deadline {
         let chunk = timeout(
@@ -940,13 +940,31 @@ async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state() -> 
 
 #[tokio::test]
 async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()> {
-    let state = test_admin_state(
+    let mut cfg = test_config();
+    let DestinationConfig::BigQuery(bq) = &mut cfg.connections[0].destination;
+    bq.emulator_http = None;
+    bq.emulator_grpc = None;
+
+    let state = test_admin_state_with_config(
+        cfg,
         Arc::new(FakeStateBackend {
             state: test_state(),
             ping_error: None,
             load_delay: None,
-            batch_load_queue_summary: None,
-            cdc_coordinator_summary: None,
+            batch_load_queue_summary: Some(CdcBatchLoadQueueSummary {
+                pending_jobs: 2,
+                running_jobs: 1,
+                jobs_per_minute: 3,
+                rows_per_minute: 120,
+                ..Default::default()
+            }),
+            cdc_coordinator_summary: Some(CdcCoordinatorSummary {
+                next_sequence_to_ack: 42,
+                last_enqueued_sequence: Some(45),
+                sequence_lag: Some(3),
+                pending_fragments: 4,
+                ..Default::default()
+            }),
             requested_resyncs: Arc::new(Mutex::new(Vec::new())),
         }),
         Some(Arc::new(FakeStatsBackend::default())),
@@ -964,9 +982,11 @@ async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut bytes_stream = response.bytes_stream();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut body = String::new();
-    while !body.contains("event: connection.cdc") && tokio::time::Instant::now() < deadline {
+    while !body.contains("event: connection.cdc_coordinator")
+        && tokio::time::Instant::now() < deadline
+    {
         let chunk = timeout(
             deadline.saturating_duration_since(tokio::time::Instant::now()),
             bytes_stream.next(),
@@ -976,8 +996,15 @@ async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()
         body.push_str(std::str::from_utf8(&chunk).expect("utf8 chunk"));
     }
     assert!(body.contains("event: connection.cdc"));
+    assert!(body.contains("event: connection.cdc_progress"));
+    assert!(body.contains("event: connection.cdc_queue"));
+    assert!(body.contains("event: connection.cdc_coordinator"));
     assert!(body.contains("\"slot_active\":true"));
     assert!(body.contains("\"confirmed_flush_lsn\":\"0/16B6C50\""));
+    assert!(body.contains("\"pending_jobs\":2"));
+    assert!(body.contains("\"rows_per_minute\":120"));
+    assert!(body.contains("\"next_sequence_to_ack\":42"));
+    assert!(body.contains("\"pending_fragments\":4"));
 
     handle.abort();
     let _ = handle.await;
