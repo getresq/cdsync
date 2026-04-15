@@ -1,5 +1,88 @@
 # Next
 
+## Deploy CDSync Relation Lock Fix
+
+Mission:
+- Release and deploy the CDC relation-lock fix to `resq-fullstack` production.
+
+Checklist:
+- [x] Bump CDSync version for a patch release.
+- [x] Run release-grade local checks without building Linux artifacts locally.
+- [x] Commit and tag CDSync release.
+- [ ] Push commit and tag; wait for GitHub release artifact.
+- [ ] Update `resq-fullstack` CDSync release pin.
+- [ ] Deploy production CDSync ECS service.
+- [ ] Wait about 3 minutes, then verify ECS health, admin progress, Datadog logs, and source slot feedback.
+
+Guardrails:
+- Do not build Linux release artifacts locally.
+- Do not revert unrelated work.
+- Report actual CDC movement, not only ECS stabilization.
+
+Validation:
+- `cargo fmt --check` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib relation_lock_wait_ -- --nocapture` passed with 3 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::postgres::cdc_loop -- --nocapture` passed with 8 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets -- -D warnings` passed after a test-only `let...else` cleanup.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets --all-features -- -D warnings` passed; this matches the pre-push clippy hook with a reliable target dir.
+
+## Production Unattributed WAL Gap Investigation
+
+Mission:
+- Explain why the `resq-fullstack` production dashboard showed a very large Unattributed / Idle WAL Gap.
+
+Checklist:
+- [x] Trace the dashboard metric to the CDSync admin/state calculation.
+- [x] Verify the deployed production CDSync version and task health.
+- [x] Inspect the production Postgres replication slot, replication sender state, and CDSync durable state.
+- [x] Inspect production CDSync logs around the last observed feedback movement.
+- [x] Summarize the cause and a follow-up fix path.
+
+Findings:
+- Production is running CDSync `0.4.7` on task definition revision `21`; ECS reports one healthy running task started on 2026-04-14 20:48:05 UTC.
+- At 2026-04-15 19:20:11 UTC, source slot `supabase_etl_apply_1101` was active, but `confirmed_flush_lsn` was still `1DFB/98383AF0` while `pg_current_wal_lsn()` was `1DFF/700F76A0`, producing about 16.5 GB behind confirmed.
+- CDSync durable feedback for `app_production` last updated at 2026-04-15 09:57:17 UTC with `last_slot_feedback_lsn = 1DFB/98383AF0`.
+- Durable CDC fragments and batch-load jobs had no pending or failed rows; all rows were `succeeded`, with latest job completions around 2026-04-15 09:57:41 UTC.
+- The latest enqueued sequence was `9428`, but durable feedback still had `next_sequence_to_ack = 9418`, so the final small CDC frontier did not get flushed; the much larger WAL gap accumulated afterward while the source kept generating WAL.
+- Datadog returned no CDSync app logs after 2026-04-15 09:57:41 UTC in the inspected window, even though the task and replication slot remained active.
+- Deeper cause: the WAL loop advanced to sequence `9418` at 2026-04-15 09:57:17 UTC, then dispatched table batches for OIDs `984824`, `19260`, `17739`, and `18317`. OID `18317` is `public.core_recordofworklineitem`.
+- At 2026-04-15 09:57:18 UTC the WAL loop logged `processing cdc relation change` for OID `18317`, but never logged `cdc relation change applied`. The relation path waits on that table's apply lock before its 120s relation timeout starts, so a held table lock can block the WAL loop indefinitely.
+- Inference from logs and code: the table dispatch for OID `18317` held the table apply lock and did not reach a durable `cdc_producer_enqueued_job` / `cdc table batch apply completed` log for that final batch. While the WAL loop waited on the lock, it stopped draining completed waiter futures and coordinator advances, so background worker successes through sequence `9428` never translated into replication feedback.
+
+Parked follow-up:
+- Fix the CDC relation/table-lock stall. Starting points: `src/sources/postgres/cdc_runtime.rs`, `src/sources/postgres/cdc_loop.rs`, `src/sources/postgres/cdc_pipeline.rs`, and `src/destinations/etl_bigquery/queue.rs`. Validate by reproducing a relation message arriving while a same-table deferred dispatch is in progress; the WAL loop must keep draining completed jobs/frontier and the relation wait must be timeout-bounded/observable.
+
+## Fix CDC Relation Lock Stall
+
+Mission:
+- Prevent a relation/schema-change message from freezing CDC feedback when same-table CDC dispatch work is already in flight.
+
+Checklist:
+- [x] Patch relation handling so it keeps draining in-flight dispatch/apply work while waiting for the table apply lock.
+- [x] Make relation lock waits timeout-bounded and observable.
+- [x] Add focused regression coverage for a relation wait that must poll an in-flight dispatch future to release the lock.
+- [x] Run focused Rust tests.
+- [x] Review the diff and address findings.
+
+Current context:
+- Production v0.4.7 most likely stalled after `processing cdc relation change` for OID `18317` / `public.core_recordofworklineitem`.
+- The relation path currently awaits `table_lock.lock().await` directly; the timeout only wraps the later buffered-apply and relation-update operations.
+- Dispatch futures are stored in `FuturesUnordered`, not spawned, so the main loop must poll them for same-table locks to be released.
+
+Validation:
+- `cargo fmt` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --lib relation_lock_wait_ -- --nocapture` passed with 3 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --lib sources::postgres::cdc_loop -- --nocapture` passed with 8 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --lib` passed.
+- After the observability tweak, `cargo fmt && CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --lib relation_lock_wait_ -- --nocapture && CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --lib` passed.
+
+Review:
+- Subagent found the first patch still allowed relation handling to acquire a free mutex while same-table dispatch was active but not yet polled. The invariant must check `active_table_applies`, not only mutex availability.
+- Addressed by passing the relation table id into the wait helper and disabling lock acquisition while that table remains active. Added a regression for the unlocked-but-active same-table dispatch case.
+- Second subagent review found no correctness issues. It noted the active-but-unlocked wait should be observable; the relation wait log now includes both `relation_table_active` and `relation_lock_busy`.
+
 ## CDC Dashboard WAL Gap Signal
 
 Mission:

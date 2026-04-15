@@ -2,6 +2,12 @@ use super::*;
 
 const CDC_DURABLE_FRONTIER_SCAN_LIMIT: usize = 4096;
 
+pub(super) enum CdcRelationLockWaitProgress<'a> {
+    Acquired(tokio::sync::MutexGuard<'a, ()>),
+    ApplyAcks(Vec<CdcApplyFragmentAck>),
+    WatermarkAdvance(CdcWatermarkAdvance),
+}
+
 pub(super) struct CdcIdleState {
     pub(super) follow: bool,
     pub(super) in_tx: bool,
@@ -139,6 +145,43 @@ pub(super) fn submit_cdc_apply_acks(
             .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
     }
     Ok(())
+}
+
+pub(super) async fn wait_for_table_apply_lock_or_cdc_progress<'a>(
+    table_id: TableId,
+    table_lock: &'a Arc<Mutex<()>>,
+    inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
+    inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
+    active_table_applies: &mut HashSet<TableId>,
+    coordinator_advances_rx: &mut mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
+    wait_timeout: Duration,
+) -> Result<CdcRelationLockWaitProgress<'a>> {
+    tokio::select! {
+        guard = table_lock.lock(), if !active_table_applies.contains(&table_id) => {
+            Ok(CdcRelationLockWaitProgress::Acquired(guard))
+        }
+        result = inflight_dispatch.next(), if !inflight_dispatch.is_empty() => {
+            Ok(CdcRelationLockWaitProgress::ApplyAcks(
+                handle_cdc_dispatch_result(result, inflight_apply, active_table_applies)?
+            ))
+        }
+        result = inflight_apply.next(), if !inflight_apply.is_empty() => {
+            Ok(CdcRelationLockWaitProgress::ApplyAcks(
+                handle_cdc_apply_result(result, active_table_applies)?
+            ))
+        }
+        advance = coordinator_advances_rx.recv() => {
+            Ok(CdcRelationLockWaitProgress::WatermarkAdvance(
+                advance.context("CDC coordinator task stopped")?
+            ))
+        }
+        () = tokio::time::sleep(wait_timeout) => {
+            anyhow::bail!(
+                "timed out after {}s waiting for CDC table apply lock while draining in-flight work",
+                wait_timeout.as_secs()
+            )
+        }
+    }
 }
 
 pub(super) async fn submit_cdc_durable_frontier_acks(
@@ -659,6 +702,164 @@ mod tests {
                 &state,
             ),
             etl::types::PgLsn::from(0x10_u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_lock_wait_drains_dispatch_ack_while_lock_is_held() -> anyhow::Result<()> {
+        let table_id = TableId::new(7);
+        let table_lock = Arc::new(Mutex::new(()));
+        let guard = table_lock.lock().await;
+        let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
+        let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
+        let mut active_table_applies = HashSet::new();
+        let (_advance_tx, mut advance_rx) = mpsc::unbounded_channel();
+        let dispatch: CdcDispatchFuture = Box::pin(async {
+            Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
+                sequences: vec![7],
+                released_table: None,
+            }))
+        });
+        inflight_dispatch.push(dispatch);
+
+        let progress = wait_for_table_apply_lock_or_cdc_progress(
+            table_id,
+            &table_lock,
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut active_table_applies,
+            &mut advance_rx,
+            Duration::from_secs(1),
+        )
+        .await?;
+
+        match progress {
+            CdcRelationLockWaitProgress::ApplyAcks(acks) => {
+                assert_eq!(acks.len(), 1);
+                assert_eq!(acks[0].sequences, vec![7]);
+            }
+            CdcRelationLockWaitProgress::Acquired(_)
+            | CdcRelationLockWaitProgress::WatermarkAdvance(_) => {
+                anyhow::bail!("expected relation wait to drain dispatch progress first")
+            }
+        }
+
+        drop(guard);
+        let progress = wait_for_table_apply_lock_or_cdc_progress(
+            table_id,
+            &table_lock,
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut active_table_applies,
+            &mut advance_rx,
+            Duration::from_secs(1),
+        )
+        .await?;
+        match progress {
+            CdcRelationLockWaitProgress::Acquired(_guard) => {}
+            CdcRelationLockWaitProgress::ApplyAcks(_)
+            | CdcRelationLockWaitProgress::WatermarkAdvance(_) => {
+                anyhow::bail!("expected relation wait to acquire the released table lock")
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relation_lock_wait_drains_active_same_table_dispatch_before_acquiring_free_lock()
+    -> anyhow::Result<()> {
+        let table_id = TableId::new(7);
+        let table_lock = Arc::new(Mutex::new(()));
+        let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
+        let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
+        let mut active_table_applies = HashSet::from([table_id]);
+        let (_advance_tx, mut advance_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let dispatch: CdcDispatchFuture = Box::pin(async move {
+            release_rx.await?;
+            Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
+                sequences: vec![7],
+                released_table: Some(table_id),
+            }))
+        });
+        inflight_dispatch.push(dispatch);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = release_tx.send(());
+        });
+
+        let progress = wait_for_table_apply_lock_or_cdc_progress(
+            table_id,
+            &table_lock,
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut active_table_applies,
+            &mut advance_rx,
+            Duration::from_secs(1),
+        )
+        .await?;
+
+        match progress {
+            CdcRelationLockWaitProgress::ApplyAcks(acks) => {
+                assert_eq!(acks.len(), 1);
+                assert_eq!(acks[0].sequences, vec![7]);
+                assert!(!active_table_applies.contains(&table_id));
+            }
+            CdcRelationLockWaitProgress::Acquired(_)
+            | CdcRelationLockWaitProgress::WatermarkAdvance(_) => {
+                anyhow::bail!("expected active same-table dispatch to drain before lock acquire")
+            }
+        }
+
+        let progress = wait_for_table_apply_lock_or_cdc_progress(
+            table_id,
+            &table_lock,
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut active_table_applies,
+            &mut advance_rx,
+            Duration::from_secs(1),
+        )
+        .await?;
+        match progress {
+            CdcRelationLockWaitProgress::Acquired(_guard) => {}
+            CdcRelationLockWaitProgress::ApplyAcks(_)
+            | CdcRelationLockWaitProgress::WatermarkAdvance(_) => {
+                anyhow::bail!("expected relation wait to acquire after same-table work drained")
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relation_lock_wait_times_out_without_progress() {
+        let table_id = TableId::new(7);
+        let table_lock = Arc::new(Mutex::new(()));
+        let _guard = table_lock.lock().await;
+        let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
+        let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
+        let mut active_table_applies = HashSet::new();
+        let (_advance_tx, mut advance_rx) = mpsc::unbounded_channel();
+
+        let Err(err) = wait_for_table_apply_lock_or_cdc_progress(
+            table_id,
+            &table_lock,
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut active_table_applies,
+            &mut advance_rx,
+            Duration::from_millis(10),
+        )
+        .await
+        else {
+            panic!("relation lock wait should time out");
+        };
+
+        assert!(
+            err.to_string().contains("waiting for CDC table apply lock"),
+            "{err}"
         );
     }
 

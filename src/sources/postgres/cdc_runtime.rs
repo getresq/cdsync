@@ -7,6 +7,7 @@ use super::*;
 
 const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
     crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
+const CDC_RELATION_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 const CDC_IDLE_KEEPALIVE_FEEDBACK_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -742,7 +743,80 @@ impl PostgresSource {
                                 .entry(table_id)
                                 .or_insert_with(|| Arc::new(Mutex::new(())))
                                 .clone();
-                            let _guard = table_lock.lock().await;
+                            let relation_table_active = active_table_applies.contains(&table_id);
+                            let relation_lock_busy = table_lock.try_lock().is_err();
+                            if relation_table_active || relation_lock_busy {
+                                info!(
+                                    component = "coordinator",
+                                    event = "cdc_relation_waiting_table_apply_lock",
+                                    slot_name = slot_name,
+                                    table_id = table_id.into_inner(),
+                                    relation_table_active,
+                                    relation_lock_busy,
+                                    timeout_secs = CDC_RELATION_LOCK_TIMEOUT.as_secs(),
+                                    "waiting for CDC table apply lock before relation change"
+                                );
+                            }
+                            let relation_lock_started_at = Instant::now();
+                            let _guard = loop {
+                                drain_ready_cdc_coordinator_advances(
+                                    &coordinator_tx,
+                                    &mut coordinator_advances_rx,
+                                    &coordinator_state_rx,
+                                    &stats,
+                                    table_configs,
+                                    state,
+                                    state_handle.as_ref(),
+                                    stream.as_mut(),
+                                    last_received_lsn,
+                                    &mut last_flushed_lsn,
+                                )
+                                .await?;
+                                let elapsed = relation_lock_started_at.elapsed();
+                                if elapsed >= CDC_RELATION_LOCK_TIMEOUT {
+                                    anyhow::bail!(
+                                        "waiting for CDC table apply lock before relation change for {} timed out after {}s",
+                                        table_id.into_inner(),
+                                        CDC_RELATION_LOCK_TIMEOUT.as_secs()
+                                    );
+                                }
+                                match wait_for_table_apply_lock_or_cdc_progress(
+                                    table_id,
+                                    &table_lock,
+                                    &mut inflight_dispatch,
+                                    &mut inflight_apply,
+                                    &mut active_table_applies,
+                                    &mut coordinator_advances_rx,
+                                    CDC_RELATION_LOCK_TIMEOUT.saturating_sub(elapsed),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "waiting for CDC table apply lock before relation change for {}",
+                                        table_id.into_inner()
+                                    )
+                                })? {
+                                    CdcRelationLockWaitProgress::Acquired(guard) => break guard,
+                                    CdcRelationLockWaitProgress::ApplyAcks(acks) => {
+                                        submit_cdc_apply_acks(&coordinator_tx, acks)?;
+                                    }
+                                    CdcRelationLockWaitProgress::WatermarkAdvance(advance) => {
+                                        apply_cdc_watermark_advance(
+                                            advance,
+                                            &mut CdcWatermarkRuntime {
+                                                stats: &stats,
+                                                table_configs,
+                                                state,
+                                                state_handle: state_handle.as_ref(),
+                                            },
+                                            stream.as_mut(),
+                                            last_received_lsn,
+                                            &mut last_flushed_lsn,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            };
                             if let Some(pending_batch) = pending_table_batches.remove(&table_id) {
                                 let buffered_event_count = pending_batch.events.len();
                                 await_cdc_timeout(
