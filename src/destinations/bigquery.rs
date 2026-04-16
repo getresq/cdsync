@@ -2,9 +2,12 @@ mod batch_load;
 mod values;
 
 use crate::config::BigQueryConfig;
-use crate::destinations::{Destination, WriteMode, with_metadata_schema};
+use crate::destinations::{ChangeApplier, Destination, WriteMode, with_metadata_schema};
+use crate::sources::contract::records_to_dataframe;
 use crate::tls;
-use crate::types::{MetadataColumns, TableSchema};
+use crate::types::{
+    META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns, SourceChangeBatch, TableSchema,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1178,6 +1181,50 @@ impl BigQueryDestination {
         Ok(())
     }
 
+    async fn merge_change_batch_staging(
+        &self,
+        target: &str,
+        staging: &str,
+        schema: &TableSchema,
+        primary_key: &str,
+    ) -> Result<()> {
+        if self.dry_run {
+            info!("dry-run: merge change staging {} into {}", staging, target);
+            return Ok(());
+        }
+
+        if self.config.emulator_http.is_some() {
+            return self
+                .merge_staging(target, staging, schema, primary_key)
+                .await;
+        }
+
+        let merge_lock = self.table_merge_lock(target).await;
+        let _merge_permit = merge_lock
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to acquire BigQuery merge lock for {}", target))?;
+        let sql = dynamodb_change_merge_sql(
+            &self.config.project_id,
+            &self.config.dataset,
+            target,
+            staging,
+            schema,
+            &self.metadata,
+            primary_key,
+        );
+        self.run_query_with_request_id(
+            &sql,
+            Some(stable_query_request_id(
+                "dynamodb_merge",
+                &format!("{}:{}:{}", self.config.dataset, target, staging),
+            )),
+        )
+        .await
+        .with_context(|| format!("merging change staging {} into {}", staging, target))?;
+        Ok(())
+    }
+
     async fn drop_table_if_exists(&self, table: &str) -> Result<()> {
         if self.dry_run {
             info!("dry-run: drop {}", table);
@@ -1397,6 +1444,48 @@ impl Destination for BigQueryDestination {
     }
 }
 
+#[async_trait]
+impl ChangeApplier for BigQueryDestination {
+    async fn apply_change_batch(&self, batch: &SourceChangeBatch) -> Result<()> {
+        if batch.records.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_table(&batch.entity.schema).await?;
+        let staging = upsert_staging_table_id(&batch.entity.destination_name);
+        self.ensure_table_internal(&batch.entity.schema, &staging, false)
+            .await?;
+
+        let records = batch
+            .records
+            .iter()
+            .map(|record| record.record.clone())
+            .collect::<Vec<_>>();
+        let frame = records_to_dataframe(&batch.entity.schema, &records, &self.metadata)?;
+
+        let result = async {
+            self.append_rows(
+                &staging,
+                &batch.entity.schema,
+                &frame,
+                Some(batch.entity.primary_key.as_str()),
+            )
+            .await?;
+            self.merge_change_batch_staging(
+                &batch.entity.destination_name,
+                &staging,
+                &batch.entity.schema,
+                &batch.entity.primary_key,
+            )
+            .await
+        }
+        .await;
+
+        self.spawn_drop_table_if_exists(staging).await;
+        result
+    }
+}
+
 async fn emulator_insert_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
     if frame.height() < EMULATOR_INSERT_BLOCKING_ROWS {
         return dataframe_to_json_rows(frame);
@@ -1488,6 +1577,62 @@ fn cdc_reducer_merge_sql(
          WHERE _cdsync_reducer_rank = 1) S ON T.{pk} = S.{pk} \
          WHEN MATCHED THEN UPDATE SET {updates} \
          WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+    )
+}
+
+fn dynamodb_change_merge_sql(
+    project: &str,
+    dataset: &str,
+    target: &str,
+    staging: &str,
+    schema: &TableSchema,
+    metadata: &MetadataColumns,
+    primary_key: &str,
+) -> String {
+    let schema = with_metadata_schema(schema, metadata);
+    let columns: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let projection = columns
+        .iter()
+        .map(|column| bq_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updates = columns
+        .iter()
+        .map(|column| format!("{} = S.{}", bq_ident(column), bq_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_cols = columns
+        .iter()
+        .map(|column| bq_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = columns
+        .iter()
+        .map(|column| format!("S.{}", bq_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pk = bq_ident(primary_key);
+    let source_event_at = bq_ident(META_SOURCE_EVENT_AT);
+    let source_event_id = bq_ident(META_SOURCE_EVENT_ID);
+    let deleted_at = bq_ident(&metadata.deleted_at);
+
+    format!(
+        "MERGE `{project}.{dataset}.{target}` T USING (\
+         SELECT {projection} FROM (\
+         SELECT {projection}, ROW_NUMBER() OVER (PARTITION BY {pk} \
+         ORDER BY {source_event_at} DESC, {source_event_id} DESC, {deleted_at} DESC) AS _cdsync_rank \
+         FROM `{project}.{dataset}.{staging}`) \
+         WHERE _cdsync_rank = 1) S ON T.{pk} = S.{pk} \
+         WHEN MATCHED AND (\
+             T.{source_event_at} IS NULL \
+             OR S.{source_event_at} > T.{source_event_at} \
+             OR (S.{source_event_at} = T.{source_event_at} AND S.{source_event_id} >= T.{source_event_id})\
+         ) THEN UPDATE SET {updates} \
+         WHEN NOT MATCHED AND S.{deleted_at} IS NULL THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
     )
 }
 

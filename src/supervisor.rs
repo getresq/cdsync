@@ -6,6 +6,7 @@ pub(crate) fn connection_run_mode(connection: &crate::config::ConnectionConfig) 
             "cdc_follow"
         }
         (SourceConfig::Postgres(_), DestinationConfig::BigQuery(_)) => "scheduled_polling",
+        (SourceConfig::DynamoDb(_), DestinationConfig::BigQuery(_)) => "kinesis_follow",
     }
 }
 
@@ -103,6 +104,41 @@ pub(crate) async fn run_connection_worker(
             );
             result
         }
+        (SourceConfig::DynamoDb(_), DestinationConfig::BigQuery(_)) => {
+            let cfg = Config::load(&config_path).await?;
+            let checkpoint_age_task =
+                spawn_checkpoint_age_reporter(&cfg, &connection, shutdown_signal.clone()).await?;
+            let result = if shutdown_signal.is_shutdown() {
+                Ok(())
+            } else {
+                Box::pin(cmd_run_once(RunCommandRequest {
+                    config_path: config_path.clone(),
+                    connection_filter: Some(connection.id.clone()),
+                    once: true,
+                    full: false,
+                    incremental: true,
+                    dry_run: false,
+                    schema_diff_enabled: false,
+                    follow: true,
+                    shutdown: Some(shutdown_signal.clone()),
+                }))
+                .await
+            };
+            if let Some(task) = checkpoint_age_task {
+                task.abort();
+                let _ = task.await;
+            }
+            telemetry::record_connection_worker_event(
+                &connection.id,
+                mode,
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+            );
+            result
+        }
         _ => {
             let interval = schedule_interval(&connection)?;
             loop {
@@ -160,17 +196,21 @@ pub(crate) fn run_connection_label(
 pub(crate) fn connection_source_kind(connection: &crate::config::ConnectionConfig) -> &'static str {
     match &connection.source {
         SourceConfig::Postgres(_) => "postgres",
+        SourceConfig::DynamoDb(_) => "dynamodb",
     }
 }
 
 fn configured_entity_names(
     connection: &crate::config::ConnectionConfig,
 ) -> std::collections::BTreeSet<String> {
-    let SourceConfig::Postgres(pg) = &connection.source;
-    pg.tables
-        .as_ref()
-        .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
-        .unwrap_or_default()
+    match &connection.source {
+        SourceConfig::Postgres(pg) => pg
+            .tables
+            .as_ref()
+            .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
+            .unwrap_or_default(),
+        SourceConfig::DynamoDb(dynamo) => std::iter::once(dynamo.table_name.clone()).collect(),
+    }
 }
 
 fn connection_checkpoint_age_seconds(
@@ -190,7 +230,10 @@ pub(crate) fn max_checkpoint_age_seconds(
     now: chrono::DateTime<Utc>,
 ) -> Option<u64> {
     let configured = configured_entity_names(connection);
-    let checkpoints = state.postgres.iter().collect::<Vec<_>>();
+    let checkpoints = match &connection.source {
+        SourceConfig::Postgres(_) => state.postgres.iter().collect::<Vec<_>>(),
+        SourceConfig::DynamoDb(_) => state.dynamodb.iter().collect::<Vec<_>>(),
+    };
     checkpoints
         .into_iter()
         .filter(|(entity_name, _)| configured.is_empty() || configured.contains(*entity_name))

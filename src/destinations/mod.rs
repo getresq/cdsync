@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::types::{MetadataColumns, TableSchema};
+use crate::types::{MetadataColumns, SourceChangeBatch, TableSchema};
 use polars::prelude::DataFrame;
 
 pub mod bigquery;
@@ -28,6 +28,11 @@ pub trait Destination: Send + Sync {
     async fn shutdown(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+#[async_trait]
+pub trait ChangeApplier: Send + Sync {
+    async fn apply_change_batch(&self, batch: &SourceChangeBatch) -> anyhow::Result<()>;
 }
 
 pub fn with_metadata_schema(schema: &TableSchema, metadata: &MetadataColumns) -> TableSchema {

@@ -2,6 +2,8 @@ use super::*;
 use crate::retry::{
     SyncRetryClass, classify_error_reason, classify_sync_retry, compute_sync_retry_backoff,
 };
+use crate::sources::dynamodb::{DynamoDbSource, DynamoDbSyncRequest};
+use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 
 pub(crate) fn select_sync_connections<'a>(
     connections: &'a [crate::config::ConnectionConfig],
@@ -133,6 +135,15 @@ pub(crate) async fn cmd_init(config_path: PathBuf) -> Result<()> {
                     );
                 }
             }
+            SourceConfig::DynamoDb(dynamo) => {
+                let source = DynamoDbSource::new(dynamo.clone(), metadata.clone()).await?;
+                let entity = source.validate().await?;
+                info!(
+                    "dynamodb schema: {} ({} columns)",
+                    entity.schema.name,
+                    entity.schema.columns.len()
+                );
+            }
         }
 
         match &connection.destination {
@@ -179,7 +190,7 @@ pub(crate) async fn cmd_run_once(request: RunCommandRequest) -> Result<()> {
     let metadata = cfg.metadata_columns();
 
     if follow && connection_filter.is_none() {
-        anyhow::bail!("--follow requires --connection for a single postgres CDC connection");
+        anyhow::bail!("--follow requires --connection for a single live source connection");
     }
 
     let state_store =
@@ -583,6 +594,29 @@ pub(crate) async fn sync_connection(request: SyncConnectionRequest<'_>) -> Resul
                 }
                 Ok(())
             }
+        }
+        SourceConfig::DynamoDb(dynamo) => {
+            let source = DynamoDbSource::new(dynamo.clone(), metadata.clone()).await?;
+            info!(
+                connection = %connection.id,
+                run_id = run_id.as_deref().unwrap_or("none"),
+                follow,
+                "syncing dynamodb via PITR export and Kinesis follow"
+            );
+            source
+                .sync(DynamoDbSyncRequest {
+                    dest: &dest,
+                    change_applier: &dest,
+                    state,
+                    state_handle: Some(state_handle.clone()),
+                    mode,
+                    dry_run,
+                    follow,
+                    default_batch_size,
+                    shutdown,
+                })
+                .await
+                .with_context(|| "syncing dynamodb")
         }
     };
 

@@ -123,6 +123,15 @@ pub(super) fn load_cdc_state_from_row(row: &PgRow) -> anyhow::Result<Option<Post
     }))
 }
 
+pub(super) fn load_dynamodb_follow_state_from_row(
+    row: &PgRow,
+) -> anyhow::Result<Option<DynamoDbFollowState>> {
+    let raw: Option<String> = row.try_get("dynamodb_follow_state_json")?;
+    raw.map(|value| serde_json::from_str(&value))
+        .transpose()
+        .context("parsing dynamodb follow state JSON")
+}
+
 pub(super) fn parse_optional_rfc3339(value: Option<String>) -> Option<DateTime<Utc>> {
     value
         .as_deref()

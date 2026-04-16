@@ -688,7 +688,11 @@ async fn request_resync_table(
         )
         .into());
     }
-    let SourceConfig::Postgres(pg) = &connection.source;
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return Err(
+            anyhow::anyhow!("table resync is only supported for postgres CDC connections").into(),
+        );
+    };
     if !pg.cdc.unwrap_or(true) {
         return Err(
             anyhow::anyhow!("table resync is only supported for postgres CDC connections").into(),

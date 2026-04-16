@@ -332,6 +332,7 @@ pub(super) fn active_checkpoint_map<'a>(
 ) -> &'a std::collections::HashMap<String, TableCheckpoint> {
     match source {
         SourceConfig::Postgres(_) => &state.postgres,
+        SourceConfig::DynamoDb(_) => &state.dynamodb,
     }
 }
 
@@ -344,6 +345,7 @@ pub(super) fn configured_entity_names(
             .as_ref()
             .map(|tables| tables.iter().map(|table| table.name.clone()).collect())
             .unwrap_or_default(),
+        SourceConfig::DynamoDb(dynamo) => std::iter::once(dynamo.table_name.clone()).collect(),
     }
 }
 
@@ -376,7 +378,9 @@ pub(super) async fn load_postgres_cdc_slot_snapshot(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
 ) -> Result<Option<PostgresCdcSlotSnapshot>, ()> {
-    let SourceConfig::Postgres(pg) = &connection.source;
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return Ok(None);
+    };
     if !pg.cdc.unwrap_or(true) {
         return Ok(None);
     }

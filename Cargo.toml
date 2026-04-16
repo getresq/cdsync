@@ -13,6 +13,13 @@ real-bq-tests = []
 [dependencies]
 async-trait = "0.1"
 anyhow = "1"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+aws-config = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-kinesis = "1"
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 axum = { version = "0.8.8", features = ["json", "tokio", "http1"] }
 base64 = "0.22"
 bigdecimal = "0.4"
@@ -52,6 +59,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chron
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
 tokio-native-tls = "0.3"
 tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "c4b473b478b3adfbf8667d2fbe895d8423f1290b" }
+tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tonic = "0.14"
 token-source = "1"

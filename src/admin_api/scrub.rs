@@ -62,6 +62,9 @@ pub(super) fn scrub_connection(connection: &ConnectionConfig) -> ScrubbedConnect
         enabled: connection.enabled,
         source: match &connection.source {
             SourceConfig::Postgres(pg) => ScrubbedSourceConfig::Postgres(scrub_postgres_config(pg)),
+            SourceConfig::DynamoDb(dynamo) => {
+                ScrubbedSourceConfig::DynamoDb(scrub_dynamodb_config(dynamo))
+            }
         },
         destination: match &connection.destination {
             DestinationConfig::BigQuery(bq) => {
@@ -116,9 +119,26 @@ pub(super) fn scrub_bigquery_config(bq: &BigQueryConfig) -> ScrubbedBigQueryConf
     }
 }
 
+pub(super) fn scrub_dynamodb_config(
+    dynamo: &crate::config::DynamoDbConfig,
+) -> ScrubbedDynamoDbConfig {
+    ScrubbedDynamoDbConfig {
+        table_name: dynamo.table_name.clone(),
+        region: dynamo.region.clone(),
+        export_bucket: dynamo.export_bucket.clone(),
+        export_prefix: dynamo.export_prefix.clone(),
+        kinesis_stream_name: dynamo.kinesis_stream_name.clone(),
+        kinesis_stream_arn: dynamo.kinesis_stream_arn.clone(),
+        raw_item_column: dynamo.raw_item_column.clone(),
+        key_attributes: dynamo.key_attributes.clone(),
+        attributes: dynamo.attributes.clone(),
+    }
+}
+
 pub(super) fn source_kind(source: &crate::config::SourceConfig) -> &'static str {
     match source {
         crate::config::SourceConfig::Postgres(_) => "postgres",
+        crate::config::SourceConfig::DynamoDb(_) => "dynamodb",
     }
 }
 

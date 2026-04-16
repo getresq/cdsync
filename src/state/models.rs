@@ -15,6 +15,22 @@ pub struct PostgresCdcState {
     pub slot_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DynamoDbShardState {
+    pub sequence_number: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DynamoDbFollowState {
+    pub table_name: String,
+    pub stream_arn: Option<String>,
+    pub cutover_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub shard_checkpoints: HashMap<String, DynamoDbShardState>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdcReplayCleanupSummary {
     pub discarded_jobs: u64,
@@ -311,7 +327,10 @@ pub struct PostgresTableResyncRequest {
 pub struct ConnectionState {
     #[serde(default)]
     pub postgres: HashMap<String, TableCheckpoint>,
+    #[serde(default)]
+    pub dynamodb: HashMap<String, TableCheckpoint>,
     pub postgres_cdc: Option<PostgresCdcState>,
+    pub dynamodb_follow: Option<DynamoDbFollowState>,
     pub last_sync_started_at: Option<DateTime<Utc>>,
     pub last_sync_finished_at: Option<DateTime<Utc>>,
     pub last_sync_status: Option<String>,

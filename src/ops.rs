@@ -1,5 +1,6 @@
 use crate::config::{Config, SourceConfig};
 use crate::destinations::bigquery::BigQueryDestination;
+use crate::sources::dynamodb::DynamoDbSource;
 use crate::sources::postgres::PostgresSource;
 use crate::state::SyncState;
 use crate::stats::StatsDb;
@@ -91,6 +92,18 @@ pub(crate) async fn cmd_validate(
                     source.validate_cdc_publication(&tables, verbose).await?;
                 }
             }
+            SourceConfig::DynamoDb(dynamo) => {
+                let source = DynamoDbSource::new(dynamo.clone(), metadata.clone()).await?;
+                let entity = source.validate().await?;
+                if verbose {
+                    info!(
+                        table = %entity.source_name,
+                        columns = entity.schema.columns.len(),
+                        destination_table = %entity.destination_name,
+                        "dynamodb source validated"
+                    );
+                }
+            }
         }
         match &connection.destination {
             crate::config::DestinationConfig::BigQuery(bq) => {
@@ -164,7 +177,10 @@ pub(crate) async fn cmd_reconcile(
         .context("connection not found")?;
 
     let (SourceConfig::Postgres(pg), crate::config::DestinationConfig::BigQuery(bq)) =
-        (&connection.source, &connection.destination);
+        (&connection.source, &connection.destination)
+    else {
+        anyhow::bail!("reconcile is currently only supported for postgres -> bigquery connections");
+    };
     let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
     let tables = source.resolve_tables().await?;
     let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
