@@ -931,6 +931,7 @@ impl BigQueryDestination {
         &self,
         connection_id: &str,
         payload: &CdcBatchLoadJobPayload,
+        apply_attempt_key: &str,
     ) -> Result<()> {
         let target_started_at = std::time::Instant::now();
         let target_span = info_span!(
@@ -989,6 +990,7 @@ impl BigQueryDestination {
                 &payload.steps,
                 &payload.schema,
                 &payload.primary_key,
+                Some(apply_attempt_key),
             )
             .instrument(merge_span)
             .await?;
@@ -1038,6 +1040,7 @@ impl BigQueryDestination {
                     &step.staging_table,
                     &payload.schema,
                     &payload.primary_key,
+                    Some(apply_attempt_key),
                 )
                 .instrument(merge_span)
                 .await?;
@@ -1071,6 +1074,7 @@ impl BigQueryDestination {
         staging: &str,
         schema: &TableSchema,
         primary_key: &str,
+        apply_attempt_key: Option<&str>,
     ) -> Result<()> {
         if self.dry_run {
             info!("dry-run: merge staging {} into {}", staging, target);
@@ -1111,9 +1115,11 @@ impl BigQueryDestination {
 
         self.run_query_with_request_id(
             &sql,
-            Some(stable_query_request_id(
-                "merge",
-                &format!("{}:{}:{}", self.config.dataset, target, staging),
+            Some(merge_query_request_id(
+                &self.config.dataset,
+                target,
+                staging,
+                apply_attempt_key,
             )),
         )
         .await
@@ -1127,6 +1133,7 @@ impl BigQueryDestination {
         steps: &[CdcBatchLoadJobStep],
         schema: &TableSchema,
         primary_key: &str,
+        apply_attempt_key: Option<&str>,
     ) -> Result<()> {
         if steps.is_empty() {
             return Ok(());
@@ -1162,9 +1169,11 @@ impl BigQueryDestination {
             .join(",");
         self.run_query_with_request_id(
             &sql,
-            Some(stable_query_request_id(
-                "merge",
-                &format!("{}:{}:{}", self.config.dataset, target, staging_key),
+            Some(merge_query_request_id(
+                &self.config.dataset,
+                target,
+                &staging_key,
+                apply_attempt_key,
             )),
         )
         .await
@@ -1370,7 +1379,7 @@ impl Destination for BigQueryDestination {
                             rows = frame.height(),
                             "starting BigQuery merge from staging table"
                         );
-                        self.merge_staging(table, &staging, schema, pk).await
+                        self.merge_staging(table, &staging, schema, pk, None).await
                     }
                     .await;
                     if result.is_ok() {
@@ -1500,6 +1509,21 @@ fn stable_query_request_id(prefix: &str, key: &str) -> String {
     format!("{prefix}_{}", &digest[..24])
 }
 
+fn merge_query_request_id(
+    dataset: &str,
+    target: &str,
+    staging_key: &str,
+    apply_attempt_key: Option<&str>,
+) -> String {
+    let base = format!("{dataset}:{target}:{staging_key}");
+    let key = if let Some(attempt) = apply_attempt_key {
+        format!("{base}:{attempt}")
+    } else {
+        base
+    };
+    stable_query_request_id("merge", &key)
+}
+
 fn query_job_completed(label: &str, job: &Job) -> Result<bool> {
     if job.status.state != JobState::Done {
         return Ok(false);
@@ -1623,7 +1647,7 @@ mod tests {
     use super::{
         BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, cdc_reducer_merge_sql,
         drain_cleanup_task_handles, fetch_query_results_response_from_http,
-        get_query_results_to_query_response, query_job_completed,
+        get_query_results_to_query_response, merge_query_request_id, query_job_completed,
         reap_finished_cleanup_task_handles, stable_query_request_id, upsert_staging_table_id,
     };
     use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
@@ -1716,6 +1740,34 @@ mod tests {
             stable_query_request_id(
                 "merge",
                 "cdsync_app_public_production:public__accounts:public__accounts_staging_upsert_abc"
+            )
+        );
+    }
+
+    #[test]
+    fn merge_query_request_id_rotates_by_apply_attempt_key() {
+        let first_attempt = merge_query_request_id(
+            "cdsync_app_public_production",
+            "public__core_workordernote",
+            "public__core_workordernote_staging_upsert_abc",
+            Some("cdc_job_abc:1"),
+        );
+        let retry_attempt = merge_query_request_id(
+            "cdsync_app_public_production",
+            "public__core_workordernote",
+            "public__core_workordernote_staging_upsert_abc",
+            Some("cdc_job_abc:2"),
+        );
+
+        assert_eq!(first_attempt.len(), 30);
+        assert_ne!(first_attempt, retry_attempt);
+        assert_eq!(
+            first_attempt,
+            merge_query_request_id(
+                "cdsync_app_public_production",
+                "public__core_workordernote",
+                "public__core_workordernote_staging_upsert_abc",
+                Some("cdc_job_abc:1"),
             )
         );
     }
