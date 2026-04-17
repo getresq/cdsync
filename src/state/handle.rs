@@ -30,12 +30,37 @@ impl StateHandle {
             .await
     }
 
+    pub async fn save_dynamodb_checkpoint(
+        &self,
+        table_name: &str,
+        checkpoint: &TableCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.store
+            .save_table_checkpoint(&self.connection_id, "dynamodb", table_name, checkpoint)
+            .await
+    }
+
     pub async fn save_postgres_cdc_state(
         &self,
         cdc_state: &PostgresCdcState,
     ) -> anyhow::Result<()> {
         self.store
             .save_postgres_cdc_state(&self.connection_id, cdc_state)
+            .await
+    }
+
+    pub async fn save_dynamodb_follow_state(
+        &self,
+        state: &DynamoDbFollowState,
+    ) -> anyhow::Result<()> {
+        let mut connection_state = self
+            .store
+            .load_connection_state(&self.connection_id)
+            .await?
+            .unwrap_or_default();
+        connection_state.dynamodb_follow = Some(state.clone());
+        self.store
+            .save_connection_meta(&self.connection_id, &connection_state)
             .await
     }
 

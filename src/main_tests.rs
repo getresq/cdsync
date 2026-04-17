@@ -201,7 +201,9 @@ mod sync_selection_tests {
 
     fn test_cdc_connection(id: &str) -> crate::config::ConnectionConfig {
         let mut connection = test_connection(id, Some(true));
-        let crate::config::SourceConfig::Postgres(pg) = &mut connection.source;
+        let crate::config::SourceConfig::Postgres(pg) = &mut connection.source else {
+            panic!("expected postgres source in test config");
+        };
         pg.cdc = Some(true);
         pg.publication = Some("cdsync_app_pub".to_string());
         connection

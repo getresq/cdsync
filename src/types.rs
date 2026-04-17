@@ -1,9 +1,12 @@
 use crate::retry::ErrorReasonCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const META_SYNCED_AT: &str = "_cdsync_synced_at";
 pub const META_DELETED_AT: &str = "_cdsync_deleted_at";
+pub const META_SOURCE_EVENT_AT: &str = "_cdsync_source_event_at";
+pub const META_SOURCE_EVENT_ID: &str = "_cdsync_source_event_id";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataColumns {
@@ -21,13 +24,30 @@ impl Default for MetadataColumns {
 }
 
 pub fn destination_table_name(source_name: &str) -> String {
-    source_name.replace('.', "__")
+    let normalized = source_name.replace('.', "__");
+    normalized
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncMode {
     Full,
     Incremental,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Postgres,
+    DynamoDb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -88,6 +108,55 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
     pub primary_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceEntity {
+    pub kind: SourceKind,
+    pub source_name: String,
+    pub destination_name: String,
+    pub schema: TableSchema,
+    pub primary_key: String,
+}
+
+pub type SourceRecordValues = BTreeMap<String, serde_json::Value>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRecord {
+    pub values: SourceRecordValues,
+    pub synced_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSnapshotChunk {
+    pub entity: SourceEntity,
+    #[serde(default)]
+    pub records: Vec<SourceRecord>,
+    pub checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOperation {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceChangeRecord {
+    pub operation: ChangeOperation,
+    pub event_time: DateTime<Utc>,
+    pub event_id: String,
+    pub record: SourceRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceChangeBatch {
+    pub entity: SourceEntity,
+    #[serde(default)]
+    pub records: Vec<SourceChangeRecord>,
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

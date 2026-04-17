@@ -85,17 +85,18 @@ impl Config {
             .iter()
             .filter(|connection| connection.enabled())
         {
-            let SourceConfig::Postgres(pg) = &connection.source;
-            if !pg.cdc.unwrap_or(true) {
-                continue;
+            if let SourceConfig::Postgres(pg) = &connection.source {
+                if !pg.cdc.unwrap_or(true) {
+                    continue;
+                }
+                cdc_connection_count = cdc_connection_count.saturating_add(1);
+                let apply_concurrency = pg.cdc_apply_concurrency(fallback_snapshot_concurrency);
+                let worker_count = pg
+                    .cdc_batch_load_staging_worker_count(apply_concurrency)
+                    .saturating_add(pg.cdc_batch_load_reducer_worker_count(apply_concurrency));
+                batch_load_workers = batch_load_workers
+                    .saturating_add(u32::try_from(worker_count).unwrap_or(u32::MAX));
             }
-            cdc_connection_count = cdc_connection_count.saturating_add(1);
-            let apply_concurrency = pg.cdc_apply_concurrency(fallback_snapshot_concurrency);
-            let worker_count = pg
-                .cdc_batch_load_staging_worker_count(apply_concurrency)
-                .saturating_add(pg.cdc_batch_load_reducer_worker_count(apply_concurrency));
-            batch_load_workers =
-                batch_load_workers.saturating_add(u32::try_from(worker_count).unwrap_or(u32::MAX));
         }
 
         let control_headroom = cdc_connection_count
@@ -292,17 +293,21 @@ pub struct ScheduleConfig {
     pub every: Option<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SourceConfig {
     #[serde(rename = "postgres")]
     Postgres(PostgresConfig),
+    #[serde(rename = "dynamodb")]
+    DynamoDb(DynamoDbConfig),
 }
 
 impl SourceConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
             SourceConfig::Postgres(pg) => pg.validate(),
+            SourceConfig::DynamoDb(dynamo) => dynamo.validate(),
         }
     }
 }
@@ -349,6 +354,153 @@ pub struct PostgresConfig {
     pub cdc_tls: Option<bool>,
     pub cdc_tls_ca_path: Option<PathBuf>,
     pub cdc_tls_ca: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamoDbConfig {
+    pub table_name: String,
+    pub region: String,
+    pub export_bucket: String,
+    pub export_prefix: Option<String>,
+    pub kinesis_stream_name: Option<String>,
+    pub kinesis_stream_arn: Option<String>,
+    pub raw_item_column: Option<String>,
+    #[serde(default)]
+    pub key_attributes: Vec<String>,
+    #[serde(default)]
+    pub attributes: Vec<DynamoDbAttributeConfig>,
+}
+
+impl DynamoDbConfig {
+    pub fn raw_item_column_name(&self) -> &str {
+        self.raw_item_column
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("raw_item_json")
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.table_name.trim().is_empty() {
+            anyhow::bail!("dynamodb.table_name is required");
+        }
+        if self.region.trim().is_empty() {
+            anyhow::bail!("dynamodb.region is required");
+        }
+        if self.export_bucket.trim().is_empty() {
+            anyhow::bail!("dynamodb.export_bucket is required");
+        }
+        if self.key_attributes.is_empty() {
+            anyhow::bail!("dynamodb.key_attributes must include at least one key field");
+        }
+        if self.key_attributes.len() != 1 {
+            anyhow::bail!("dynamodb currently supports exactly one key attribute per connection");
+        }
+        let has_stream_name = self
+            .kinesis_stream_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_stream_arn = self
+            .kinesis_stream_arn
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_stream_name == has_stream_arn {
+            anyhow::bail!(
+                "dynamodb must set exactly one of dynamodb.kinesis_stream_name or dynamodb.kinesis_stream_arn"
+            );
+        }
+
+        let raw_item_column = self.raw_item_column_name();
+        if self
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name == raw_item_column)
+        {
+            anyhow::bail!("dynamodb.raw_item_column must not reuse an attribute name");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for key in &self.key_attributes {
+            if key.trim().is_empty() {
+                anyhow::bail!("dynamodb.key_attributes entries must not be empty");
+            }
+            if !seen.insert(key.clone()) {
+                anyhow::bail!("duplicate dynamodb.key_attributes entry `{}`", key);
+            }
+        }
+        for attribute in &self.attributes {
+            attribute.validate()?;
+            if !seen.insert(attribute.name.clone()) {
+                anyhow::bail!("duplicate dynamodb attribute `{}`", attribute.name);
+            }
+        }
+        for key in &self.key_attributes {
+            if !self
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name == *key)
+            {
+                anyhow::bail!(
+                    "dynamodb key attribute `{}` must also appear in dynamodb.attributes",
+                    key
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamoDbAttributeConfig {
+    pub name: String,
+    pub data_type: DynamoDbAttributeType,
+    pub nullable: Option<bool>,
+}
+
+impl DynamoDbAttributeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.trim().is_empty() {
+            anyhow::bail!("dynamodb.attributes[].name is required");
+        }
+        Ok(())
+    }
+
+    pub fn to_column_schema(&self) -> crate::types::ColumnSchema {
+        crate::types::ColumnSchema {
+            name: self.name.clone(),
+            data_type: self.data_type.to_data_type(),
+            nullable: self.nullable.unwrap_or(true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamoDbAttributeType {
+    String,
+    Int64,
+    Float64,
+    Bool,
+    Timestamp,
+    Date,
+    Bytes,
+    Numeric,
+    Json,
+}
+
+impl DynamoDbAttributeType {
+    fn to_data_type(&self) -> crate::types::DataType {
+        match self {
+            Self::String => crate::types::DataType::String,
+            Self::Int64 => crate::types::DataType::Int64,
+            Self::Float64 => crate::types::DataType::Float64,
+            Self::Bool => crate::types::DataType::Bool,
+            Self::Timestamp => crate::types::DataType::Timestamp,
+            Self::Date => crate::types::DataType::Date,
+            Self::Bytes => crate::types::DataType::Bytes,
+            Self::Numeric => crate::types::DataType::Numeric,
+            Self::Json => crate::types::DataType::Json,
+        }
+    }
 }
 
 impl PostgresConfig {

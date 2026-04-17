@@ -167,11 +167,14 @@ pub(super) struct ScrubbedConnectionConfig {
     pub(super) schedule: Option<crate::config::ScheduleConfig>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub(super) enum ScrubbedSourceConfig {
     #[serde(rename = "postgres")]
     Postgres(ScrubbedPostgresConfig),
+    #[serde(rename = "dynamodb")]
+    DynamoDb(ScrubbedDynamoDbConfig),
 }
 
 #[derive(Serialize)]
@@ -221,6 +224,19 @@ pub(super) struct ScrubbedBigQueryConfig {
     pub(super) batch_load_prefix: Option<String>,
     pub(super) emulator_http: Option<String>,
     pub(super) emulator_grpc: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ScrubbedDynamoDbConfig {
+    pub(super) table_name: String,
+    pub(super) region: String,
+    pub(super) export_bucket: String,
+    pub(super) export_prefix: Option<String>,
+    pub(super) kinesis_stream_name: Option<String>,
+    pub(super) kinesis_stream_arn: Option<String>,
+    pub(super) raw_item_column: Option<String>,
+    pub(super) key_attributes: Vec<String>,
+    pub(super) attributes: Vec<crate::config::DynamoDbAttributeConfig>,
 }
 
 #[derive(serde::Deserialize)]

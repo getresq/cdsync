@@ -531,7 +531,9 @@ async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown
 async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_scan() {
     let mut cfg = test_config();
     let mut connection = cfg.connections[0].clone();
-    let SourceConfig::Postgres(pg) = &mut connection.source;
+    let SourceConfig::Postgres(pg) = &mut connection.source else {
+        panic!("expected postgres source in test config");
+    };
     pg.url = "postgres://127.0.0.1:1/postgres".to_string();
     let load_state_calls = Arc::new(AtomicUsize::new(0));
     let load_connection_state_calls = Arc::new(AtomicUsize::new(0));
@@ -554,7 +556,9 @@ async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_sca
 async fn sample_and_publish_postgres_cdc_state_marks_cache_unknown_when_slot_sampling_fails() {
     let cfg = test_config();
     let mut connection = cfg.connections[0].clone();
-    let SourceConfig::Postgres(pg) = &mut connection.source;
+    let SourceConfig::Postgres(pg) = &mut connection.source else {
+        panic!("expected postgres source in test config");
+    };
     pg.url = "postgres://127.0.0.1:1/postgres".to_string();
 
     let backend: Arc<dyn AdminStateBackend> = Arc::new(FakeStateBackend {
@@ -590,7 +594,9 @@ async fn sample_and_publish_postgres_cdc_state_marks_cache_unknown_when_slot_sam
 async fn cdc_slot_sampler_samples_queue_and_coordinator_summaries_for_batch_load_connections() {
     let cfg = test_config();
     let mut connection = cfg.connections[0].clone();
-    let SourceConfig::Postgres(pg) = &mut connection.source;
+    let SourceConfig::Postgres(pg) = &mut connection.source else {
+        panic!("expected postgres source in test config");
+    };
     pg.url = "postgres://127.0.0.1:1/postgres".to_string();
     let DestinationConfig::BigQuery(bigquery) = &mut connection.destination;
     bigquery.emulator_http = None;
@@ -620,7 +626,9 @@ async fn spawn_cdc_slot_sampler_tasks_samples_batch_load_summaries_on_interval()
 -> anyhow::Result<()> {
     let mut cfg = test_config();
     let mut connection = cfg.connections[0].clone();
-    let SourceConfig::Postgres(pg) = &mut connection.source;
+    let SourceConfig::Postgres(pg) = &mut connection.source else {
+        panic!("expected postgres source in test config");
+    };
     pg.url = "postgres://127.0.0.1:1/postgres".to_string();
     let DestinationConfig::BigQuery(bigquery) = &mut connection.destination;
     bigquery.emulator_http = None;
@@ -829,7 +837,9 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
 #[tokio::test]
 async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
     let mut cfg = test_config();
-    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source;
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source else {
+        panic!("expected postgres source in test config");
+    };
     pg.cdc = Some(false);
 
     let state = test_admin_state_with_config(
@@ -879,7 +889,9 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
 #[tokio::test]
 async fn admin_api_stream_route_keeps_polling_connections_in_syncing_state() -> anyhow::Result<()> {
     let mut cfg = test_config();
-    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source;
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source else {
+        panic!("expected postgres source in test config");
+    };
     pg.cdc = Some(false);
 
     let mut sync_state = test_state();

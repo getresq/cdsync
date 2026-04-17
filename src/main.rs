@@ -24,7 +24,6 @@ use crate::destinations::bigquery::BigQueryDestination;
 use crate::runner::{
     ConnectionRestartRegistry, ShutdownController, ShutdownSignal, schedule_interval,
 };
-use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use crate::state::{ConnectionState, SyncStateStore};
 use crate::stats::{StatsDb, StatsHandle};
 use crate::types::{SyncMode, TableCheckpoint};

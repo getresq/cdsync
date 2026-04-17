@@ -88,7 +88,7 @@ impl SyncStateStore {
 
     pub async fn load_state(&self) -> anyhow::Result<SyncState> {
         let rows = sqlx::query(&format!(
-            "select connection_id, last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, updated_at from {}",
+            "select connection_id, last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, dynamodb_follow_state_json, updated_at from {}",
             self.table("connection_state")
         ))
         .fetch_all(&self.pool)
@@ -109,7 +109,9 @@ impl SyncStateStore {
             let updated_at_ms: i64 = row.try_get("updated_at")?;
             let connection_state = ConnectionState {
                 postgres: HashMap::new(),
+                dynamodb: HashMap::new(),
                 postgres_cdc: load_cdc_state_from_row(&row)?,
+                dynamodb_follow: load_dynamodb_follow_state_from_row(&row)?,
                 last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
                 last_sync_finished_at: parse_optional_rfc3339(
                     row.try_get("last_sync_finished_at")?,
@@ -132,8 +134,14 @@ impl SyncStateStore {
                     format!("parsing checkpoint for {}:{}", connection_id, entity_name)
                 })?;
             let connection = connections.entry(connection_id).or_default();
-            if source_kind.as_str() == "postgres" {
-                connection.postgres.insert(entity_name, checkpoint);
+            match source_kind.as_str() {
+                "postgres" => {
+                    connection.postgres.insert(entity_name, checkpoint);
+                }
+                "dynamodb" => {
+                    connection.dynamodb.insert(entity_name, checkpoint);
+                }
+                _ => {}
             }
         }
 
@@ -148,7 +156,7 @@ impl SyncStateStore {
         connection_id: &str,
     ) -> anyhow::Result<Option<ConnectionState>> {
         let row = sqlx::query(&format!(
-            "select last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name from {} where connection_id = $1",
+            "select last_sync_started_at, last_sync_finished_at, last_sync_status, last_error_reason, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, dynamodb_follow_state_json from {} where connection_id = $1",
             self.table("connection_state")
         ))
         .bind(connection_id)
@@ -161,7 +169,9 @@ impl SyncStateStore {
 
         Ok(Some(ConnectionState {
             postgres: HashMap::new(),
+            dynamodb: HashMap::new(),
             postgres_cdc: load_cdc_state_from_row(&row)?,
+            dynamodb_follow: load_dynamodb_follow_state_from_row(&row)?,
             last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
             last_sync_finished_at: parse_optional_rfc3339(row.try_get("last_sync_finished_at")?),
             last_sync_status: row.try_get("last_sync_status")?,
@@ -186,6 +196,10 @@ impl SyncStateStore {
             self.save_table_checkpoint(connection_id, "postgres", table_name, checkpoint)
                 .await?;
         }
+        for (table_name, checkpoint) in &connection_state.dynamodb {
+            self.save_table_checkpoint(connection_id, "dynamodb", table_name, checkpoint)
+                .await?;
+        }
         Ok(())
     }
 
@@ -196,6 +210,11 @@ impl SyncStateStore {
     ) -> anyhow::Result<()> {
         let updated_at = now_millis();
         let cdc_state = connection_state.postgres_cdc.as_ref();
+        let dynamodb_follow_state_json = connection_state
+            .dynamodb_follow
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         sqlx::query(&format!(
             r#"
             insert into {} (
@@ -207,8 +226,9 @@ impl SyncStateStore {
                 last_error,
                 postgres_cdc_last_lsn,
                 postgres_cdc_slot_name,
+                dynamodb_follow_state_json,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             on conflict(connection_id) do update set
                 last_sync_started_at = excluded.last_sync_started_at,
                 last_sync_finished_at = excluded.last_sync_finished_at,
@@ -217,6 +237,7 @@ impl SyncStateStore {
                 last_error = excluded.last_error,
                 postgres_cdc_last_lsn = excluded.postgres_cdc_last_lsn,
                 postgres_cdc_slot_name = excluded.postgres_cdc_slot_name,
+                dynamodb_follow_state_json = excluded.dynamodb_follow_state_json,
                 updated_at = excluded.updated_at
             "#,
             self.table("connection_state")
@@ -241,6 +262,7 @@ impl SyncStateStore {
         .bind(connection_state.last_error.clone())
         .bind(cdc_state.and_then(|state| state.last_lsn.clone()))
         .bind(cdc_state.and_then(|state| state.slot_name.clone()))
+        .bind(dynamodb_follow_state_json)
         .bind(updated_at)
         .execute(&self.pool)
         .await?;
