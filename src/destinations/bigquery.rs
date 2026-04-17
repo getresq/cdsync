@@ -1646,12 +1646,20 @@ fn dynamodb_change_merge_sql(
 }
 
 fn stable_query_request_id(prefix: &str, key: &str) -> String {
+    const BIGQUERY_REQUEST_ID_MAX_LEN: usize = 36;
+    const DEFAULT_HASH_LEN: usize = 24;
+
     let mut hasher = Sha256::new();
     hasher.update(prefix.as_bytes());
     hasher.update(b"\0");
     hasher.update(key.as_bytes());
     let digest = hex::encode(hasher.finalize());
-    format!("{prefix}_{}", &digest[..24])
+    let hash_len = DEFAULT_HASH_LEN.min(
+        BIGQUERY_REQUEST_ID_MAX_LEN
+            .checked_sub(prefix.len() + 1)
+            .expect("BigQuery request id prefix must leave room for a hash suffix"),
+    );
+    format!("{prefix}_{}", &digest[..hash_len])
 }
 
 fn merge_query_request_id(
@@ -1885,6 +1893,24 @@ mod tests {
             stable_query_request_id(
                 "merge",
                 "cdsync_app_public_production:public__accounts:public__accounts_staging_upsert_abc"
+            )
+        );
+    }
+
+    #[test]
+    fn stable_query_request_id_shortens_hash_for_longer_prefixes() {
+        let request_id = stable_query_request_id(
+            "dynamodb_merge",
+            "cdsync_sites_public_production:resq_sites_production_RevisionTableTable_zbhdrvwk:resq_sites_production_RevisionTableTable_zbhdrvwk_staging_50fe4f3b39074ae3b813bcbcdf6c47c7",
+        );
+
+        assert_eq!(request_id.len(), 36);
+        assert!(request_id.starts_with("dynamodb_merge_"));
+        assert_eq!(
+            request_id,
+            stable_query_request_id(
+                "dynamodb_merge",
+                "cdsync_sites_public_production:resq_sites_production_RevisionTableTable_zbhdrvwk:resq_sites_production_RevisionTableTable_zbhdrvwk_staging_50fe4f3b39074ae3b813bcbcdf6c47c7"
             )
         );
     }
