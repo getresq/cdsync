@@ -85,6 +85,17 @@ Progress:
 - Validation strategy note:
   - LocalStack should be used for fast AWS SDK/API wiring tests around DynamoDB, Kinesis, and S3, but not as the final release proof for DynamoDB PITR export, Kinesis streaming destinations, IAM, or BigQuery behavior.
   - Release confidence still needs a small real-AWS staging run with PITR export, Kinesis follow, Umami Postgres CDC, BigQuery destination writes, and admin/dashboard checks.
+- Started confidence-plan implementation:
+  - Added optional LocalStack service to `docker-compose.e2e.yml`.
+  - Added `CDSYNC_AWS_ENDPOINT_URL` / `CDSYNC_E2E_LOCALSTACK_ENDPOINT` support for the DynamoDB source AWS SDK clients.
+  - Added `e2e_dynamodb_localstack` integration test for DynamoDB/Kinesis follow wiring and shard checkpoint state.
+- Confidence-plan validation:
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_dynamodb_localstack -- --nocapture` passed with 1 test against the local LocalStack endpoint.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::dynamodb -- --nocapture` passed with 12 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- Confidence-plan review:
+  - First review found ambient AWS credentials dependency, overbroad test naming, and cleanup gaps; all were fixed.
+  - Second review found no issues.
 
 ## Prior Work History
 

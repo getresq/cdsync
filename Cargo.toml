@@ -117,6 +117,11 @@ path = "tests/e2e_postgres_soft_deletes.rs"
 required-features = ["integration-tests"]
 
 [[test]]
+name = "e2e_dynamodb_localstack"
+path = "tests/e2e_dynamodb_localstack.rs"
+required-features = ["integration-tests"]
+
+[[test]]
 name = "e2e_runner_graceful_shutdown"
 path = "tests/e2e_runner_graceful_shutdown.rs"
 required-features = ["integration-tests"]

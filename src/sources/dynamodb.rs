@@ -54,7 +54,7 @@ struct DynamoDbResolvedTable {
     entity: SourceEntity,
     table_arn: String,
     stream_arn: String,
-    snapshot_cutover_time: DateTime<Utc>,
+    snapshot_cutover_time: Option<DateTime<Utc>>,
 }
 
 struct DecodedChangeBatch {
@@ -65,10 +65,12 @@ struct DecodedChangeBatch {
 
 impl DynamoDbSource {
     pub async fn new(config: DynamoDbConfig, metadata: MetadataColumns) -> Result<Self> {
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(config.region.clone()))
-            .load()
-            .await;
+        let mut sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(config.region.clone()));
+        if let Some(endpoint_url) = dynamodb_aws_endpoint_url() {
+            sdk_config = sdk_config.endpoint_url(endpoint_url).test_credentials();
+        }
+        let sdk_config = sdk_config.load().await;
         Ok(Self {
             config,
             metadata,
@@ -79,7 +81,7 @@ impl DynamoDbSource {
     }
 
     pub async fn validate(&self) -> Result<SourceEntity> {
-        Ok(self.resolve_table().await?.entity)
+        Ok(self.resolve_table(true).await?.entity)
     }
 
     pub async fn sync(&self, request: DynamoDbSyncRequest<'_>) -> Result<()> {
@@ -95,7 +97,6 @@ impl DynamoDbSource {
             shutdown,
         } = request;
 
-        let resolved = self.resolve_table().await?;
         let table_name = self.config.table_name.clone();
         let should_run_snapshot = matches!(mode, crate::types::SyncMode::Full)
             || state
@@ -103,9 +104,12 @@ impl DynamoDbSource {
                 .get(&table_name)
                 .and_then(|checkpoint| checkpoint.last_synced_at)
                 .is_none();
+        let resolved = self.resolve_table(should_run_snapshot).await?;
 
         if should_run_snapshot {
-            let cutover_time = resolved.snapshot_cutover_time;
+            let cutover_time = resolved
+                .snapshot_cutover_time
+                .context("dynamodb snapshot cutover missing")?;
             let follow_state = DynamoDbFollowState {
                 table_name: table_name.clone(),
                 stream_arn: Some(resolved.stream_arn.clone()),
@@ -183,7 +187,7 @@ impl DynamoDbSource {
         .await
     }
 
-    async fn resolve_table(&self) -> Result<DynamoDbResolvedTable> {
+    async fn resolve_table(&self, require_snapshot_cutover: bool) -> Result<DynamoDbResolvedTable> {
         let describe = self
             .dynamodb
             .describe_table()
@@ -200,34 +204,38 @@ impl DynamoDbSource {
         let key_schema = table.key_schema.unwrap_or_default();
         let primary_key = self.resolve_primary_key(&key_schema)?;
 
-        let backups = self
-            .dynamodb
-            .describe_continuous_backups()
-            .table_name(&self.config.table_name)
-            .send()
-            .await
-            .with_context(|| format!("describing PITR state for {}", self.config.table_name))?;
-        let backup_description = backups
-            .continuous_backups_description
-            .context("continuous backups description missing")?;
-        let pitr = backup_description
-            .point_in_time_recovery_description
-            .context("point in time recovery description missing")?;
-        if pitr.point_in_time_recovery_status != Some(PointInTimeRecoveryStatus::Enabled) {
-            anyhow::bail!(
-                "dynamodb PITR is not enabled for {}; CDSync requires PITR exports",
-                self.config.table_name
-            );
-        }
-        let snapshot_cutover_time = latest_restorable_time(&pitr, &self.config.table_name)?;
-
         let stream_arn = self.resolve_stream_arn().await?;
-        let stream_created_at = self.stream_creation_time(&stream_arn).await?;
-        ensure_stream_covers_cutover(
-            stream_created_at,
-            snapshot_cutover_time,
-            &self.config.table_name,
-        )?;
+        let snapshot_cutover_time = if require_snapshot_cutover {
+            let backups = self
+                .dynamodb
+                .describe_continuous_backups()
+                .table_name(&self.config.table_name)
+                .send()
+                .await
+                .with_context(|| format!("describing PITR state for {}", self.config.table_name))?;
+            let backup_description = backups
+                .continuous_backups_description
+                .context("continuous backups description missing")?;
+            let pitr = backup_description
+                .point_in_time_recovery_description
+                .context("point in time recovery description missing")?;
+            if pitr.point_in_time_recovery_status != Some(PointInTimeRecoveryStatus::Enabled) {
+                anyhow::bail!(
+                    "dynamodb PITR is not enabled for {}; CDSync requires PITR exports",
+                    self.config.table_name
+                );
+            }
+            let snapshot_cutover_time = latest_restorable_time(&pitr, &self.config.table_name)?;
+            let stream_created_at = self.stream_creation_time(&stream_arn).await?;
+            ensure_stream_covers_cutover(
+                stream_created_at,
+                snapshot_cutover_time,
+                &self.config.table_name,
+            )?;
+            Some(snapshot_cutover_time)
+        } else {
+            None
+        };
         let destination_name = destination_table_name(&self.config.table_name);
         let entity = SourceEntity {
             kind: SourceKind::DynamoDb,
@@ -858,6 +866,14 @@ impl DynamoDbSource {
 
 fn shutdown_requested(shutdown: &Option<ShutdownSignal>) -> bool {
     shutdown.as_ref().is_some_and(ShutdownSignal::is_shutdown)
+}
+
+fn dynamodb_aws_endpoint_url() -> Option<String> {
+    std::env::var("CDSYNC_AWS_ENDPOINT_URL")
+        .ok()
+        .or_else(|| std::env::var("CDSYNC_E2E_LOCALSTACK_ENDPOINT").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn timestamp_seconds_to_utc(seconds: f64) -> DateTime<Utc> {
