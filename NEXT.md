@@ -6,6 +6,7 @@ Mission:
 - Harden DynamoDB and Umami PostgreSQL source support for the `resq-sites` CDSync release while preserving PostgreSQL, BigQuery, admin API, dashboard, and infra behavior across `cdsync`, `resq-sites`, and `resq-fullstack`.
 
 Checklist:
+- [x] Bump CDSync release version to `0.5.0`.
 - [x] Record active mission baseline and guardrails.
 - [ ] Audit existing `cdsync` source/destination/admin implementation for PostgreSQL, DynamoDB, and BigQuery correctness risks.
 - [ ] Verify PostgreSQL parallelism, data correctness, WAL CDC handling, and initial snapshot behavior remain intact.
@@ -102,6 +103,15 @@ Progress:
   - First review found ambient AWS credentials dependency, overbroad test naming, and cleanup gaps; all were fixed.
   - A real LocalStack run exposed stream readiness and missing precision quirks; fixed with readiness polling and strict-production/local-emulator precision handling.
   - Final review found no issues.
+- Release prep:
+  - Bumped CDSync crate/package version to `0.5.0`.
+  - `cargo fmt --check` passed.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::dynamodb -- --nocapture` passed with 12 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::tests -- --nocapture` passed with 23 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib destinations::bigquery::tests -- --nocapture` passed with 15 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::postgres::cdc_loop -- --nocapture` passed with 8 tests.
+  - `CDSYNC_E2E_LOCALSTACK_ENDPOINT=http://localhost:4566 CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_dynamodb_localstack -- --nocapture` passed with 1 test.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
 
 ## Prior Work History
 
