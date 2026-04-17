@@ -282,8 +282,9 @@ impl DynamoDbSource {
                 matches_arn || matches_name
             })
             .context("configured kinesis destination not found on dynamodb table")?;
-        if destination.approximate_creation_date_time_precision
-            != Some(ApproximateCreationDateTimePrecision::Microsecond)
+        let precision = destination.approximate_creation_date_time_precision;
+        if (precision.is_some() || dynamodb_aws_endpoint_url().is_none())
+            && precision != Some(ApproximateCreationDateTimePrecision::Microsecond)
         {
             anyhow::bail!(
                 "kinesis destination for {} must use MICROSECOND precision",

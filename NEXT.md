@@ -91,11 +91,14 @@ Progress:
   - Added `e2e_dynamodb_localstack` integration test for DynamoDB/Kinesis follow wiring and shard checkpoint state.
 - Confidence-plan validation:
   - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_dynamodb_localstack -- --nocapture` passed with 1 test against the local LocalStack endpoint.
+  - `CDSYNC_E2E_LOCALSTACK_ENDPOINT=http://localhost:4566 CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_dynamodb_localstack -- --nocapture` passed with 1 test against the running local LocalStack container.
+  - `CDSYNC_E2E_PG_URL=postgres://cdsync:cdsync@localhost:5433/cdsync CDSYNC_E2E_BQ_HTTP=http://localhost:9050 CDSYNC_E2E_BQ_GRPC=localhost:9051 CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_postgres_bigquery -- --nocapture` passed with 2 tests against local Postgres + BigQuery emulator.
   - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::dynamodb -- --nocapture` passed with 12 tests.
   - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
 - Confidence-plan review:
   - First review found ambient AWS credentials dependency, overbroad test naming, and cleanup gaps; all were fixed.
-  - Second review found no issues.
+  - A real LocalStack run exposed stream readiness and missing precision quirks; fixed with readiness polling and strict-production/local-emulator precision handling.
+  - Final review found no issues.
 
 ## Prior Work History
 

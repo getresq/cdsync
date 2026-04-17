@@ -4,9 +4,10 @@ use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::types::{
     ApproximateCreationDateTimePrecision, AttributeDefinition, BillingMode, KeySchemaElement,
-    KeyType, ScalarAttributeType,
+    KeyType, ScalarAttributeType, TableStatus,
 };
 use aws_sdk_kinesis::Client as KinesisClient;
+use aws_sdk_kinesis::types::StreamStatus;
 use aws_smithy_types::Blob;
 use cdsync::config::{DynamoDbAttributeConfig, DynamoDbAttributeType, DynamoDbConfig};
 use cdsync::destinations::{ChangeApplier, Destination, WriteMode};
@@ -88,6 +89,7 @@ async fn e2e_dynamodb_localstack_follow_consumes_synthetic_kinesis_records() -> 
         .send()
         .await
         .with_context(|| format!("creating localstack kinesis stream {stream_name}"))?;
+    wait_for_stream_active(&kinesis, &stream_name).await?;
     dynamodb
         .create_table()
         .table_name(&table_name)
@@ -107,6 +109,7 @@ async fn e2e_dynamodb_localstack_follow_consumes_synthetic_kinesis_records() -> 
         .send()
         .await
         .with_context(|| format!("creating localstack dynamodb table {table_name}"))?;
+    wait_for_table_active(&dynamodb, &table_name).await?;
 
     let stream = kinesis
         .describe_stream_summary()
@@ -277,6 +280,46 @@ async fn put_dynamodb_kinesis_record(
         .send()
         .await?;
     Ok(())
+}
+
+async fn wait_for_stream_active(kinesis: &KinesisClient, stream_name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = kinesis
+            .describe_stream_summary()
+            .stream_name(stream_name)
+            .send()
+            .await?
+            .stream_description_summary
+            .map(|summary| summary.stream_status);
+        if status == Some(StreamStatus::Active) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("localstack kinesis stream {stream_name} did not become active");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_table_active(dynamodb: &DynamoClient, table_name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = dynamodb
+            .describe_table()
+            .table_name(table_name)
+            .send()
+            .await?
+            .table
+            .and_then(|table| table.table_status);
+        if status == Some(TableStatus::Active) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("localstack dynamodb table {table_name} did not become active");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn put_dynamodb_remove_record(
