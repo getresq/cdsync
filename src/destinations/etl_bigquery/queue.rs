@@ -160,6 +160,16 @@ fn cdc_batch_load_retry_is_due(record: &CdcBatchLoadJobRecord, now_ms: i64) -> b
     cdc_batch_load_retry_due_at_ms(record) <= now_ms
 }
 
+fn cdc_batch_load_apply_attempt_key<'a>(
+    records: impl IntoIterator<Item = &'a CdcBatchLoadJobRecord>,
+) -> String {
+    records
+        .into_iter()
+        .map(|record| format!("{}:{}", record.job_id, record.attempt_count.max(0)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn due_retryable_failed_cdc_batch_load_jobs(
     records: Vec<CdcBatchLoadJobRecord>,
     now_ms: i64,
@@ -188,6 +198,12 @@ pub(super) fn should_check_table_apply_readiness(mixed_mode_gate_enabled: bool) 
     mixed_mode_gate_enabled
 }
 
+impl CdcQueuedBatchLoadJob {
+    fn apply_attempt_key(&self) -> String {
+        cdc_batch_load_apply_attempt_key(std::slice::from_ref(&self.record))
+    }
+}
+
 impl CdcQueuedBatchLoadWindow {
     fn first(&self) -> Option<&CdcQueuedBatchLoadJob> {
         self.jobs.first()
@@ -208,6 +224,10 @@ impl CdcQueuedBatchLoadWindow {
             .iter()
             .map(|job| job.record.job_id.clone())
             .collect()
+    }
+
+    fn apply_attempt_key(&self) -> String {
+        cdc_batch_load_apply_attempt_key(self.jobs.iter().map(|job| &job.record))
     }
 
     fn merged_payload(&self) -> EtlResult<CdcBatchLoadJobPayload> {
@@ -889,6 +909,7 @@ impl CdcBatchLoadManager {
         let job_ids = window.job_ids();
         let records: Vec<CdcBatchLoadJobRecord> =
             window.jobs.iter().map(|job| job.record.clone()).collect();
+        let apply_attempt_key = window.apply_attempt_key();
         let table_key = window.table_key().to_string();
         let started_at = Instant::now();
         let payload = match window.merged_payload() {
@@ -958,6 +979,7 @@ impl CdcBatchLoadManager {
                                 .apply_cdc_batch_load_job(
                                     self.state_handle.connection_id(),
                                     &payload,
+                                    &apply_attempt_key,
                                 )
                                 .await
                         }
@@ -984,7 +1006,11 @@ impl CdcBatchLoadManager {
                     }
                 } else {
                     self.inner
-                        .apply_cdc_batch_load_job(self.state_handle.connection_id(), &payload)
+                        .apply_cdc_batch_load_job(
+                            self.state_handle.connection_id(),
+                            &payload,
+                            &apply_attempt_key,
+                        )
                         .await
                 }
             }
@@ -1158,6 +1184,7 @@ impl CdcBatchLoadManager {
         let job_id = job.record.job_id.clone();
         let table_key = job.record.table_key.clone();
         let record = job.record.clone();
+        let apply_attempt_key = job.apply_attempt_key();
         let started_at = Instant::now();
         let span = info_span!(
             "cdc_batch_load_job",
@@ -1204,6 +1231,7 @@ impl CdcBatchLoadManager {
                                 .apply_cdc_batch_load_job(
                                     self.state_handle.connection_id(),
                                     &job.payload,
+                                    &apply_attempt_key,
                                 )
                                 .await
                         }
@@ -1233,6 +1261,7 @@ impl CdcBatchLoadManager {
                         .apply_cdc_batch_load_job(
                             self.state_handle.connection_id(),
                             &job.payload,
+                            &apply_attempt_key,
                         )
                         .await
                 }
@@ -1614,6 +1643,73 @@ mod tests {
 
         assert_eq!(due_jobs.len(), 1);
         assert_eq!(due_jobs[0].job_id, "due");
+    }
+
+    fn test_payload(job_id: &str) -> CdcBatchLoadJobPayload {
+        CdcBatchLoadJobPayload {
+            job_id: job_id.to_string(),
+            source_table: "public.accounts".to_string(),
+            target_table: "public__accounts".to_string(),
+            schema: TableSchema {
+                name: "public__accounts".to_string(),
+                columns: Vec::new(),
+                primary_key: Some("id".to_string()),
+            },
+            staging_schema: None,
+            primary_key: "id".to_string(),
+            truncate: false,
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn queued_job_apply_attempt_key_changes_after_durable_retry_attempt_changes() {
+        let first_attempt = CdcBatchLoadJobRecord {
+            job_id: "cdc_job_abc".to_string(),
+            attempt_count: 1,
+            ..Default::default()
+        };
+        let retry_attempt = CdcBatchLoadJobRecord {
+            attempt_count: 2,
+            ..first_attempt.clone()
+        };
+        let first_job = super::super::CdcQueuedBatchLoadJob {
+            record: first_attempt,
+            payload: test_payload("cdc_job_abc"),
+        };
+        let retry_job = super::super::CdcQueuedBatchLoadJob {
+            record: retry_attempt,
+            payload: test_payload("cdc_job_abc"),
+        };
+
+        assert_eq!(first_job.apply_attempt_key(), "cdc_job_abc:1");
+        assert_ne!(first_job.apply_attempt_key(), retry_job.apply_attempt_key());
+    }
+
+    #[test]
+    fn queued_window_apply_attempt_key_keeps_job_attempts_ordered() {
+        let window = super::super::CdcQueuedBatchLoadWindow {
+            jobs: vec![
+                super::super::CdcQueuedBatchLoadJob {
+                    record: CdcBatchLoadJobRecord {
+                        job_id: "job-1".to_string(),
+                        attempt_count: 3,
+                        ..Default::default()
+                    },
+                    payload: test_payload("job-1"),
+                },
+                super::super::CdcQueuedBatchLoadJob {
+                    record: CdcBatchLoadJobRecord {
+                        job_id: "job-2".to_string(),
+                        attempt_count: 1,
+                        ..Default::default()
+                    },
+                    payload: test_payload("job-2"),
+                },
+            ],
+        };
+
+        assert_eq!(window.apply_attempt_key(), "job-1:3,job-2:1");
     }
 
     #[tokio::test]

@@ -1,5 +1,37 @@
 # Next
 
+## Release/Deploy CDSync `v0.4.9`
+
+Mission:
+- Release CDSync `v0.4.9` for the BigQuery MERGE retry pinning fix and roll it through `resq-fullstack` staging/production, then Nora/resq-agent production.
+
+Checklist:
+- [x] Bump CDSync crate/package version to `0.4.9`.
+- [x] Run release-grade local checks without building Linux artifacts locally.
+- [x] Review release-prep diff.
+- [ ] Commit and tag `v0.4.9`.
+- [ ] Push commit/tag and wait for GitHub release artifact.
+- [ ] Update `resq-fullstack` CDSync pins to `v0.4.9`.
+- [ ] Deploy `resq-fullstack` staging CDSync.
+- [ ] Deploy `resq-fullstack` production CDSync.
+- [ ] Update `resq-agent` Nora CDSync pin to `v0.4.9`.
+- [ ] Deploy `resq-agent` production Nora CDSync.
+- [ ] Verify ECS/admin/progress/log behavior after each deploy.
+
+Guardrails:
+- Do not build Linux release artifacts locally.
+- Accept normal ECS drain-then-start zero-target windows.
+- Do not force a replacement deployment while SST/ECS is still in the normal 1-3 minute handoff.
+- Report actual CDC progress, not only ECS stabilization.
+
+Validation:
+- `cargo fmt --check` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets --all-features -- -D warnings` passed.
+
+Review:
+- Subagent release-prep review found no issues and confirmed no Linux release artifacts were added.
+
 ## Deploy CDSync Relation Lock Fix
 
 Mission:
@@ -27,6 +59,67 @@ Validation:
 - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked` passed.
 - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets -- -D warnings` passed after a test-only `let...else` cleanup.
 - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --all-targets --all-features -- -D warnings` passed; this matches the pre-push clippy hook with a reliable target dir.
+
+## Production Retryable BigQuery Backlog Investigation
+
+Mission:
+- Explain the current `resq-fullstack` production CDC backlog and determine whether it needs intervention or should drain by retry.
+
+Checklist:
+- [x] Interpret the dashboard screenshot against CDSync admin progress semantics.
+- [x] Verify the deployed CDSync version and task identity from Datadog startup logs.
+- [ ] Inspect admin progress twice for real CDC movement.
+- [x] Inspect Datadog (`pup`) logs around the latest failed BigQuery merge.
+- [x] Identify the failing table/error class and next operator action.
+
+Current findings:
+- The dashboard shows actual CDC backlog, not only idle/unattributed WAL drift.
+- Head-of-line acknowledgement is stuck at sequence `25013` while the coordinator has enqueued through `25028`, so the sequence lag is `15`.
+- One CDC batch-load job is pending/queued, one retryable failed job is visible, and no jobs or rows completed in the last minute.
+- Production `production-cdsync-app` started CDSync `v0.4.8` at `2026-04-15 20:16:45 UTC` on task version `22`.
+- The failing job is `cdc_job_ec1085312949c50047595e97` for `public__core_workordernote`, first sequence `25013`, one CDC row.
+- Datadog shows repeated failure/retry scheduling for that same job from `2026-04-16 08:05:33 UTC` through at least `2026-04-16 18:09:27 UTC`.
+- Staging/load succeeds; the job fails at the reduced BigQuery MERGE into target `public__core_workordernote`.
+- The latest observed retry at `2026-04-16 18:09:27 UTC` was classified `transient` and scheduled the next retry after `972800 ms` (about `16m 13s`).
+- WAL is accumulating behind confirmed flush because the coordinator cannot acknowledge sequence `25013` until the pending/retryable job succeeds.
+- Direct BigQuery job-history lookup works after granting the service account additional permissions.
+- BigQuery job `job_XyFzZQsBdnjTh9Se3i7wJQinBRbE` failed at `2026-04-16 08:05:33 UTC` with `backendError`: `Error encountered during execution. Retrying may solve the problem.`
+- The staging table has exactly one row: `id=588391`, `_cdsync_sequence=25013`, `_cdsync_operation=upsert`; the target table currently has zero rows for that id.
+- Inference: CDSync's deterministic BigQuery query request id is likely causing repeated retries to observe/reuse the same failed BigQuery job instead of forcing a fresh MERGE attempt.
+- Next operator action: with explicit approval, run the same MERGE manually without the deterministic request id, then verify the durable job drains and coordinator advances beyond sequence `25013`.
+
+## Fix BigQuery MERGE Retry Pinning
+
+Mission:
+- Prevent retryable BigQuery MERGE backend errors from pinning a queued CDC job to the original failed BigQuery query job forever.
+
+Checklist:
+- [x] Confirm the defect from production evidence.
+- [x] Make queued CDC MERGE request ids include the durable apply attempt.
+- [x] Add focused regression coverage for retry request id rotation.
+- [x] Run focused Rust checks.
+- [x] Review the diff and address findings.
+
+Guardrails:
+- Preserve same-attempt idempotency for stale/running claim recovery.
+- Rotate the BigQuery request id only after CDSync has durably failed and requeued retryable work.
+- Do not build Linux release artifacts locally.
+
+Validation:
+- `cargo fmt` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib merge_query_request_id_rotates_by_apply_attempt_key -- --nocapture` passed with 1 test.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib apply_attempt_key -- --nocapture` passed with 3 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib destinations::bigquery::tests -- --nocapture` passed with 15 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib destinations::etl_bigquery::queue::tests -- --nocapture` passed with 15 tests.
+- `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo clippy --locked --lib -- -D warnings` passed.
+
+Review:
+- First subagent review found the initial tests were too helper-level and did not cover queue object wiring.
+- Addressed by moving attempt-key generation onto queued job/window types and testing those types directly.
+- Second subagent review still noted the destination apply API could be called without the attempt key.
+- Addressed by making `BigQueryDestination::apply_cdc_batch_load_job` require an apply attempt key.
+- Third subagent review found no issues.
 
 ## Production Unattributed WAL Gap Investigation
 
