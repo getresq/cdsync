@@ -418,18 +418,19 @@ impl DynamoDbConfig {
             anyhow::bail!("dynamodb.raw_item_column must not reuse an attribute name");
         }
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_keys = std::collections::HashSet::new();
         for key in &self.key_attributes {
             if key.trim().is_empty() {
                 anyhow::bail!("dynamodb.key_attributes entries must not be empty");
             }
-            if !seen.insert(key.clone()) {
+            if !seen_keys.insert(key.clone()) {
                 anyhow::bail!("duplicate dynamodb.key_attributes entry `{}`", key);
             }
         }
+        let mut seen_attributes = std::collections::HashSet::new();
         for attribute in &self.attributes {
             attribute.validate()?;
-            if !seen.insert(attribute.name.clone()) {
+            if !seen_attributes.insert(attribute.name.clone()) {
                 anyhow::bail!("duplicate dynamodb attribute `{}`", attribute.name);
             }
         }
@@ -889,6 +890,37 @@ connections:
             err.to_string()
                 .contains("bigquery.batch_load_bucket is required")
         );
+    }
+
+    #[test]
+    fn validate_allows_dynamodb_key_attribute_projection() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@host:5432/db"
+connections:
+  - id: "sites_build"
+    source:
+      type: dynamodb
+      table_name: "build"
+      region: "us-east-1"
+      export_bucket: "exports"
+      kinesis_stream_name: "build-stream"
+      key_attributes: ["id"]
+      attributes:
+        - name: "id"
+          data_type: "string"
+          nullable: false
+        - name: "status"
+          data_type: "string"
+          nullable: true
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+"#;
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -112,6 +112,14 @@ Progress:
   - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::postgres::cdc_loop -- --nocapture` passed with 8 tests.
   - `CDSYNC_E2E_LOCALSTACK_ENDPOINT=http://localhost:4566 CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --features integration-tests --test e2e_dynamodb_localstack -- --nocapture` passed with 1 test.
   - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- Production `resq-sites` deploy monitoring:
+  - After enabling desired count 1, ECS task definition `:7` failed before container startup because the Datadog sidecar/FireLens config referenced a hardcoded SSM parameter ARN for the Datadog API key and the Umami private subnets have no SSM egress.
+  - Set the production SST `DatadogApiKey` secret from the existing Datadog parameter and patched local `resq-sites` infra to remove the hardcoded SSM dependency from the CDSync task.
+  - User chose private subnets with managed NAT. Patched `resq-sites` to add `nat: "managed"` to the Umami VPC and to feed Datadog ECS secret retrieval from a managed SecureString parameter sourced from the SST `DatadogApiKey` secret.
+  - Review found and fixed an intermediate secret exposure regression: the Datadog key must not be placed in normal ECS environment/log options or linked as `SST_RESOURCE_DatadogApiKey`; it now stays behind ECS `ssm`/FireLens `secretOptions`.
+  - SST deploy created the managed NAT gateways and private route-table default routes, then CDSync started and exited with code 1.
+  - Root cause of the app exit was in CDSync `v0.5.0`: `DynamoDbConfig::validate` rejected valid configs where `key_attributes` also appeared in declared `attributes`, even though that projection is required. Added a regression test and bumped CDSync to `0.5.1`.
+  - Validation: focused config regression test passed, DynamoDB unit tests passed, `cargo check --locked --lib` passed, and the rendered `resq-sites` config now passes config validation and reaches AWS API validation.
 
 ## Prior Work History
 
