@@ -1204,7 +1204,7 @@ impl BigQueryDestination {
 
         if self.config.emulator_http.is_some() {
             return self
-                .merge_staging(target, staging, schema, primary_key)
+                .merge_staging(target, staging, schema, primary_key, None)
                 .await;
         }
 
