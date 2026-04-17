@@ -120,6 +120,10 @@ Progress:
   - SST deploy created the managed NAT gateways and private route-table default routes, then CDSync started and exited with code 1.
   - Root cause of the app exit was in CDSync `v0.5.0`: `DynamoDbConfig::validate` rejected valid configs where `key_attributes` also appeared in declared `attributes`, even though that projection is required. Added a regression test and bumped CDSync to `0.5.1`.
   - Validation: focused config regression test passed, DynamoDB unit tests passed, `cargo check --locked --lib` passed, and the rendered `resq-sites` config now passes config validation and reaches AWS API validation.
+  - Released CDSync `v0.5.1`; GitHub release workflow passed and published `cdsync-x86_64-unknown-linux-gnu.tar.gz`.
+  - Deployed `resq-sites` production with managed NAT, v0.5.1, top-level task role permissions, and Datadog FireLens sidecars.
+  - Production validation: ECS desired/running `1/1`, target group healthy, Datadog app logs present for the current task, and admin API reports `sites_build`, `sites_domain_mapping`, and `sites_revision` as `kinesis_following` and `sites_umami` as `cdc_following`.
+  - Merged `resq-sites` PR #305 (`Stabilize production CDSync networking`) into `master`.
 
 ## Prior Work History
 
