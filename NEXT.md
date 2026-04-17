@@ -1,5 +1,93 @@
 # Next
 
+## Current Mission: DynamoDB Source Release Readiness
+
+Mission:
+- Harden DynamoDB and Umami PostgreSQL source support for the `resq-sites` CDSync release while preserving PostgreSQL, BigQuery, admin API, dashboard, and infra behavior across `cdsync`, `resq-sites`, and `resq-fullstack`.
+
+Checklist:
+- [x] Record active mission baseline and guardrails.
+- [ ] Audit existing `cdsync` source/destination/admin implementation for PostgreSQL, DynamoDB, and BigQuery correctness risks.
+- [ ] Verify PostgreSQL parallelism, data correctness, WAL CDC handling, and initial snapshot behavior remain intact.
+- [ ] Verify or fix DynamoDB S3 snapshot ingestion, Kinesis follow, parallelism, and data type mapping.
+- [ ] Verify or fix BigQuery compatibility for both PostgreSQL and DynamoDB sources.
+- [ ] Verify or fix admin API DynamoDB fidelity without regressing PostgreSQL progress/state reporting.
+- [x] Update `resq-fullstack` CDSync dashboard for DynamoDB.
+- [x] Add CDSync infra to `resq-sites` comparable to `resq-fullstack` and `resq-agent`.
+- [x] Add `resq-sites` Umami Postgres as a CDSync PostgreSQL CDC source.
+- [x] Add `resq-sites` VPC/CDSync instance to the `resq-fullstack` production monitored CDSync instances list.
+- [ ] Run focused and broad validation across touched repos.
+- [ ] Run subagent review after each meaningful code chunk and fix confirmed findings.
+- [ ] Add or run an emulated/local integration confidence layer for DynamoDB/Kinesis/S3, Postgres CDC, and BigQuery behavior where practical.
+
+Guardrails:
+- PostgreSQL CDC/snapshot correctness is release-blocking.
+- Do not build Linux release artifacts locally.
+- Do not revert unrelated changes in any repository.
+- Ask before AWS actions that require SSO or mutate deployed infrastructure.
+- Use `bun`/`bunx` for TypeScript and JavaScript, `uv`/`uvx` for Python.
+- Do not preserve legacy/dead code or add backwards-compatible branches without explicit approval.
+- Umami Postgres is in scope as a required `resq-sites` CDSync source, not an optional follow-up.
+
+Progress:
+- Mission baseline written to `MISSION.md`.
+- Completed first `cdsync` hardening chunk:
+  - DynamoDB bootstrap now chooses PITR `latest_restorable_date_time` and refuses to bootstrap until the configured Kinesis stream covers that cutover.
+  - DynamoDB snapshot S3 reads are scoped to the current export ID, preventing stale export files from being appended after a retry.
+  - DynamoDB snapshot batch loads append after the target truncate instead of doing per-batch BigQuery merges.
+  - Admin progress now keeps PostgreSQL CDC queue/coordinator data PostgreSQL-only and adds explicit DynamoDB follow-state summary.
+- Review:
+  - First subagent review found two high-severity DynamoDB correctness issues; both were fixed.
+  - Second subagent review found no issues.
+- Validation:
+  - `cargo fmt --check` passed.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::dynamodb -- --nocapture` passed with 12 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::tests -- --nocapture` passed with 21 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::route_tests::admin_api_in_process_stateful_routes_work -- --nocapture` passed with 1 test.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::postgres::tests::snapshot -- --nocapture` passed with 19 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::postgres::cdc_loop -- --nocapture` passed with 8 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib destinations::bigquery::tests -- --nocapture` passed with 15 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- Umami scope update:
+  - Subagent confirmed `resq-sites` deploys Umami Postgres for staging and production via `infra/umami.ts` and `infra/internal-analytics-config.ts`.
+  - Umami is not currently wired as a CDSync source; adding it requires PostgreSQL CDC infra/config in addition to the existing DynamoDB/Kinesis targets.
+- Completed dashboard/admin stream chunk:
+  - CDSync streams a nullable `connection.dynamodb_follow` event and filters DynamoDB follow summaries to DynamoDB connections.
+  - DynamoDB follow state records observed shard count separately from checkpointed shards.
+  - DynamoDB full resyncs stay in `snapshot`/`snapshot_in_progress` while `snapshot_in_progress=true`, even with an existing prior checkpoint.
+  - `resq-fullstack` dashboard has a DynamoDB Follow card and a `kinesis` mode that keeps PostgreSQL CDC/WAL details separate.
+- Dashboard/admin stream validation:
+  - `uvx ruff check common/admin/cdsync.py common/tests/test_cdsync_admin_view.py` passed.
+  - `bunx prettier --check templates/admin/cdsync_dashboard.html` passed.
+  - `./resq test common/tests/test_cdsync_admin_view.py` passed with 13 tests after starting the backend container.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::tests -- --nocapture` passed with 23 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib sources::dynamodb -- --nocapture` passed with 12 tests.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo test --locked --lib admin_api::route_tests::admin_api_in_process_stateful_routes_work -- --nocapture` passed with 1 test.
+  - `CARGO_TARGET_DIR=target/codex-check CARGO_INCREMENTAL=0 cargo check --locked --lib` passed.
+- Dashboard/admin stream review:
+  - First review found three issues around full-resync labeling, stale follow state, and shard count denominator; all were fixed.
+  - Final review found no issues.
+- Completed `resq-sites` infra and fullstack registry chunk:
+  - Added `resq-sites` CDSync Docker/runtime wrapper and a combined config template for Build, DomainMapping, Revision DynamoDB sources plus Umami Postgres CDC.
+  - Added `resq-sites` SST CDSync service scaffold in the Umami VPC, with internal NLB, PrivateLink endpoint service discovery, DynamoDB export bucket, BigQuery/GCP/admin JWT secrets, and task permissions for DynamoDB export/Kinesis/S3.
+  - Added `resq-fullstack` production consumer wiring for `/com/getresq/production/env/generated/SITES_CDSYNC_VPCE_SERVICE_NAME`, adding `resq-sites production` to the production CDSync admin instance registry.
+- Infra validation:
+  - `bunx oxfmt --check infra/cdsync.ts infra/secret.ts sst.config.ts` passed in `resq-sites`.
+  - `bunx oxlint infra/cdsync.ts infra/secret.ts sst.config.ts` passed in `resq-sites`.
+  - `bunx tsc -p tsconfig.json --noEmit` passed in `resq-sites`.
+  - `bash -n deploy/cdsync/cdsync-service.sh` passed in `resq-sites`.
+  - `bunx prettier --check infra/apps/platform/sst.config.ts` passed in `resq-fullstack`.
+  - Direct `bunx tsc --noEmit --skipLibCheck infra/apps/platform/sst.config.ts` in `resq-fullstack` is not usable as a focused check because it surfaces existing repo-wide SST/type errors unrelated to this patch.
+- Infra review:
+  - First review found missing DynamoDB export/S3 write permissions, an unmanaged Umami publication assumption, and ambiguous admin JWT key source. All were fixed.
+  - Second review found `DescribeExport` needed export ARNs; fixed by scoping it to `${tableArn}/export/*`.
+  - Final monitored-instance review found no issues.
+- Validation strategy note:
+  - LocalStack should be used for fast AWS SDK/API wiring tests around DynamoDB, Kinesis, and S3, but not as the final release proof for DynamoDB PITR export, Kinesis streaming destinations, IAM, or BigQuery behavior.
+  - Release confidence still needs a small real-AWS staging run with PITR export, Kinesis follow, Umami Postgres CDC, BigQuery destination writes, and admin/dashboard checks.
+
+## Prior Work History
+
 ## Release/Deploy CDSync `v0.4.9`
 
 Mission:

@@ -826,6 +826,8 @@ async fn progress(
     );
     let cdc =
         ConnectionCdcSnapshot::from_cached(cached_postgres_cdc_slot_state(&state, config).as_ref());
+    let dynamodb_follow =
+        DynamoDbFollowSnapshot::from_state_for_connection(connection_state.as_ref(), config);
     let batch_load_queue = if uses_cdc_batch_load_queue(config) {
         Some(
             state
@@ -855,6 +857,7 @@ async fn progress(
         current_run,
         runtime,
         cdc,
+        dynamodb_follow,
         cdc_progress,
         batch_load_queue,
         cdc_coordinator,

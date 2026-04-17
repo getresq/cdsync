@@ -14,11 +14,12 @@ pub(super) fn is_postgres_cdc_connection(connection: &ConnectionConfig) -> bool 
 }
 
 pub(super) fn uses_cdc_batch_load_queue(connection: &ConnectionConfig) -> bool {
-    matches!(
+    is_postgres_cdc_connection(connection)
+        && matches!(
         &connection.destination,
         DestinationConfig::BigQuery(bq)
             if bq.batch_load_bucket.is_some() && bq.emulator_http.is_none()
-    )
+        )
 }
 
 pub(super) fn build_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
@@ -512,6 +513,48 @@ pub(super) fn checkpoint_has_incomplete_snapshot(checkpoint: Option<&TableCheckp
     })
 }
 
+fn dynamodb_snapshot_in_progress(
+    state: Option<&ConnectionState>,
+    connection: &ConnectionConfig,
+) -> bool {
+    let SourceConfig::DynamoDb(dynamo) = &connection.source else {
+        return false;
+    };
+    let Some(state) = state else {
+        return false;
+    };
+    let Some(follow) = state
+        .dynamodb_follow
+        .as_ref()
+        .filter(|follow| follow.table_name == dynamo.table_name)
+    else {
+        return false;
+    };
+    if follow.snapshot_in_progress {
+        return true;
+    }
+    let checkpoint_time = state
+        .dynamodb
+        .get(&dynamo.table_name)
+        .and_then(|checkpoint| checkpoint.last_synced_at);
+    match (checkpoint_time, follow.cutover_time) {
+        (Some(last_synced_at), Some(cutover_time)) => last_synced_at < cutover_time,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
+fn dynamodb_table_snapshot_in_progress(
+    state: Option<&ConnectionState>,
+    connection: &ConnectionConfig,
+    table_name: &str,
+) -> bool {
+    let SourceConfig::DynamoDb(dynamo) = &connection.source else {
+        return false;
+    };
+    table_name == dynamo.table_name && dynamodb_snapshot_in_progress(state, connection)
+}
+
 pub(super) fn derive_connection_mode(
     state: Option<&ConnectionState>,
     connection: &ConnectionConfig,
@@ -523,14 +566,18 @@ pub(super) fn derive_connection_mode(
             .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
     });
 
-    if has_incomplete_snapshot {
+    if has_incomplete_snapshot || dynamodb_snapshot_in_progress(state, connection) {
         if matches!(cdc_runtime_state, Some(PostgresCdcRuntimeState::Following)) {
             "mixed"
         } else {
             "snapshot"
         }
-    } else {
+    } else if matches!(&connection.source, SourceConfig::DynamoDb(_)) {
+        "kinesis"
+    } else if is_postgres_cdc_connection(connection) {
         "cdc"
+    } else {
+        "scheduled_polling"
     }
 }
 
@@ -552,6 +599,12 @@ pub(super) fn derive_connection_runtime(
             }) =>
         {
             ("snapshotting", "snapshot_in_progress")
+        }
+        Some("running") if dynamodb_snapshot_in_progress(state, connection) => {
+            ("snapshotting", "snapshot_in_progress")
+        }
+        Some("running") if matches!(&connection.source, SourceConfig::DynamoDb(_)) => {
+            ("running", "kinesis_following")
         }
         Some("running") => match cdc_runtime_state {
             Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
@@ -653,6 +706,14 @@ pub(super) fn build_table_progress(
                     Some("failed") => ("error", connection_reason_code),
                     Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
                         ("snapshotting", "snapshot_in_progress")
+                    }
+                    Some("running")
+                        if dynamodb_table_snapshot_in_progress(state, connection, &table_name) =>
+                    {
+                        ("snapshotting", "snapshot_in_progress")
+                    }
+                    Some("running") if matches!(&connection.source, SourceConfig::DynamoDb(_)) => {
+                        ("running", "kinesis_following")
                     }
                     Some("running") => match cdc_runtime_state {
                         Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),

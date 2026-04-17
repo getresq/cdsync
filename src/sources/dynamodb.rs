@@ -14,7 +14,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::types::{
     ApproximateCreationDateTimePrecision, ExportFormat, ExportStatus, KeySchemaElement, KeyType,
-    PointInTimeRecoveryStatus,
+    PointInTimeRecoveryDescription, PointInTimeRecoveryStatus,
 };
 use aws_sdk_kinesis::Client as KinesisClient;
 use aws_sdk_kinesis::types::{Shard, ShardIteratorType};
@@ -54,6 +54,7 @@ struct DynamoDbResolvedTable {
     entity: SourceEntity,
     table_arn: String,
     stream_arn: String,
+    snapshot_cutover_time: DateTime<Utc>,
 }
 
 struct DecodedChangeBatch {
@@ -104,11 +105,13 @@ impl DynamoDbSource {
                 .is_none();
 
         if should_run_snapshot {
-            let cutover_time = Utc::now();
+            let cutover_time = resolved.snapshot_cutover_time;
             let follow_state = DynamoDbFollowState {
                 table_name: table_name.clone(),
                 stream_arn: Some(resolved.stream_arn.clone()),
                 cutover_time: Some(cutover_time),
+                snapshot_in_progress: true,
+                shard_count: None,
                 shard_checkpoints: std::collections::HashMap::new(),
                 updated_at: Some(Utc::now()),
             };
@@ -156,6 +159,16 @@ impl DynamoDbSource {
                     .save_dynamodb_checkpoint(&table_name, &checkpoint)
                     .await
                     .context("saving dynamodb snapshot checkpoint")?;
+            }
+            if let Some(follow_state) = state.dynamodb_follow.as_mut() {
+                follow_state.snapshot_in_progress = false;
+                follow_state.updated_at = Some(Utc::now());
+                if let Some(state_handle) = &state_handle {
+                    state_handle
+                        .save_dynamodb_follow_state(follow_state)
+                        .await
+                        .context("saving dynamodb follow state after snapshot")?;
+                }
             }
         }
 
@@ -206,8 +219,15 @@ impl DynamoDbSource {
                 self.config.table_name
             );
         }
+        let snapshot_cutover_time = latest_restorable_time(&pitr, &self.config.table_name)?;
 
         let stream_arn = self.resolve_stream_arn().await?;
+        let stream_created_at = self.stream_creation_time(&stream_arn).await?;
+        ensure_stream_covers_cutover(
+            stream_created_at,
+            snapshot_cutover_time,
+            &self.config.table_name,
+        )?;
         let destination_name = destination_table_name(&self.config.table_name);
         let entity = SourceEntity {
             kind: SourceKind::DynamoDb,
@@ -221,6 +241,7 @@ impl DynamoDbSource {
             entity,
             table_arn,
             stream_arn,
+            snapshot_cutover_time,
         })
     }
 
@@ -266,6 +287,22 @@ impl DynamoDbSource {
             .context("kinesis destination missing stream arn")
     }
 
+    async fn stream_creation_time(&self, stream_arn: &str) -> Result<DateTime<Utc>> {
+        let response = self
+            .kinesis
+            .describe_stream_summary()
+            .stream_arn(stream_arn)
+            .send()
+            .await
+            .with_context(|| format!("describing kinesis stream {}", stream_arn))?;
+        response
+            .stream_description_summary
+            .map(|summary| summary.stream_creation_timestamp)
+            .as_ref()
+            .and_then(aws_datetime_to_utc)
+            .with_context(|| format!("kinesis stream {} missing creation timestamp", stream_arn))
+    }
+
     async fn run_snapshot(
         &self,
         resolved: &DynamoDbResolvedTable,
@@ -291,6 +328,7 @@ impl DynamoDbSource {
             .export_description
             .and_then(|description| description.export_arn)
             .context("export response missing export arn")?;
+        let export_data_prefix = export_data_prefix(&prefix, &export_arn)?;
 
         loop {
             if shutdown_requested(&shutdown) {
@@ -325,7 +363,7 @@ impl DynamoDbSource {
                 .await?;
         }
 
-        let data_keys = self.list_export_data_keys(&prefix).await?;
+        let data_keys = self.list_export_data_keys(&export_data_prefix).await?;
         let mut pending_records = Vec::with_capacity(default_batch_size.max(1));
         for key in data_keys {
             if shutdown_requested(&shutdown) {
@@ -379,8 +417,8 @@ impl DynamoDbSource {
             &chunk.entity.destination_name,
             &chunk.entity.schema,
             &frame,
-            WriteMode::Upsert,
-            Some(chunk.entity.primary_key.as_str()),
+            WriteMode::Append,
+            None,
         )
         .await?;
         records.clear();
@@ -462,6 +500,15 @@ impl DynamoDbSource {
             }
 
             let shards = self.list_shards(&resolved.stream_arn).await?;
+            follow_state.shard_count = Some(shards.len());
+            follow_state.updated_at = Some(Utc::now());
+            state.dynamodb_follow = Some(follow_state.clone());
+            if let Some(state_handle) = state_handle {
+                state_handle
+                    .save_dynamodb_follow_state(&follow_state)
+                    .await
+                    .context("saving dynamodb shard count state")?;
+            }
             for shard in shards {
                 if shutdown_requested(&shutdown) {
                     break;
@@ -827,6 +874,50 @@ fn aws_datetime_to_utc(value: &AwsDateTime) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value.secs(), value.subsec_nanos())
 }
 
+fn latest_restorable_time(
+    pitr: &PointInTimeRecoveryDescription,
+    table_name: &str,
+) -> Result<DateTime<Utc>> {
+    pitr.latest_restorable_date_time
+        .as_ref()
+        .and_then(aws_datetime_to_utc)
+        .with_context(|| {
+            format!(
+                "dynamodb PITR latest restorable time is missing or invalid for {}",
+                table_name
+            )
+        })
+}
+
+fn ensure_stream_covers_cutover(
+    stream_created_at: DateTime<Utc>,
+    snapshot_cutover_time: DateTime<Utc>,
+    table_name: &str,
+) -> Result<()> {
+    if stream_created_at <= snapshot_cutover_time {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "dynamodb kinesis stream for {} was created at {}, after PITR latest restorable cutover {}; wait for PITR to catch up before bootstrapping",
+        table_name,
+        stream_created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+        snapshot_cutover_time.to_rfc3339_opts(SecondsFormat::Micros, true)
+    )
+}
+
+fn export_data_prefix(base_prefix: &str, export_arn: &str) -> Result<String> {
+    let export_id = export_arn
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("unable to derive dynamodb export id from {}", export_arn))?;
+    Ok(format!(
+        "{}/AWSDynamoDB/{}/",
+        base_prefix.trim_end_matches('/'),
+        export_id
+    ))
+}
+
 fn decode_export_item(line: &str) -> Result<Map<String, Value>> {
     let record: Value = serde_json::from_str(line).context("parsing export line")?;
     let item = record
@@ -896,9 +987,12 @@ fn decode_number_string(value: &Value) -> Value {
 mod tests {
     use super::*;
     use crate::config::{DynamoDbAttributeConfig, DynamoDbAttributeType};
+    use crate::destinations::{Destination, WriteMode};
     use aws_sdk_kinesis::types::Record;
     use aws_smithy_types::Blob;
     use chrono::TimeZone;
+    use polars::prelude::DataFrame;
+    use std::sync::Mutex;
 
     fn test_source() -> DynamoDbSource {
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
@@ -934,6 +1028,37 @@ mod tests {
             dynamodb: DynamoClient::new(&sdk_config),
             kinesis: KinesisClient::new(&sdk_config),
             s3: S3Client::new(&sdk_config),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDestination {
+        writes: Mutex<Vec<(WriteMode, Option<String>, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Destination for RecordingDestination {
+        async fn ensure_table(&self, _schema: &TableSchema) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn truncate_table(&self, _table: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &self,
+            _table: &str,
+            _schema: &TableSchema,
+            frame: &DataFrame,
+            mode: WriteMode,
+            primary_key: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.writes
+                .lock()
+                .expect("recording destination lock")
+                .push((mode, primary_key.map(ToOwned::to_owned), frame.height()));
+            Ok(())
         }
     }
 
@@ -996,6 +1121,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_flush_appends_after_target_truncate() -> anyhow::Result<()> {
+        let source = test_source();
+        let dest = RecordingDestination::default();
+        let entity = SourceEntity {
+            kind: SourceKind::DynamoDb,
+            source_name: "BuildTable".to_string(),
+            destination_name: "BuildTable".to_string(),
+            schema: source.entity_schema("BuildTable", "id"),
+            primary_key: "id".to_string(),
+        };
+        let mut records = vec![SourceRecord {
+            values: std::collections::BTreeMap::from([
+                ("id".to_string(), Value::String("build-1".to_string())),
+                ("status".to_string(), Value::String("queued".to_string())),
+            ]),
+            synced_at: Utc
+                .with_ymd_and_hms(2026, 4, 16, 10, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            deleted_at: None,
+        }];
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(source.flush_snapshot_batch(&dest, &entity, &mut records))?;
+
+        assert!(records.is_empty());
+        let writes = dest.writes.lock().expect("recorded writes");
+        assert_eq!(writes.len(), 1);
+        assert!(matches!(writes[0].0, WriteMode::Append));
+        assert_eq!(writes[0].1, None);
+        assert_eq!(writes[0].2, 1);
+        Ok(())
+    }
+
+    #[test]
     fn entity_schema_uses_destination_table_name() {
         let mut source = test_source();
         source.config.table_name = "orders-prod".to_string();
@@ -1047,6 +1208,74 @@ mod tests {
             .expect_err("mismatched keys should be rejected");
 
         assert!(err.to_string().contains("key attribute mismatch"));
+    }
+
+    #[test]
+    fn latest_restorable_time_uses_dynamodb_pitr_cutover() -> anyhow::Result<()> {
+        let pitr = PointInTimeRecoveryDescription::builder()
+            .point_in_time_recovery_status(PointInTimeRecoveryStatus::Enabled)
+            .latest_restorable_date_time(AwsDateTime::from_secs(1_776_344_400))
+            .build();
+
+        let cutover = latest_restorable_time(&pitr, "BuildTable")?;
+
+        assert_eq!(cutover.timestamp(), 1_776_344_400);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_restorable_time_requires_dynamodb_pitr_cutover() {
+        let pitr = PointInTimeRecoveryDescription::builder()
+            .point_in_time_recovery_status(PointInTimeRecoveryStatus::Enabled)
+            .build();
+
+        let err = latest_restorable_time(&pitr, "BuildTable")
+            .expect_err("missing latest restorable time should fail");
+
+        assert!(
+            err.to_string()
+                .contains("latest restorable time is missing")
+        );
+    }
+
+    #[test]
+    fn stream_cover_check_requires_kinesis_before_cutover() {
+        let cutover = Utc
+            .with_ymd_and_hms(2026, 4, 16, 10, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let before_cutover = Utc
+            .with_ymd_and_hms(2026, 4, 16, 9, 59, 59)
+            .single()
+            .expect("valid timestamp");
+        let after_cutover = Utc
+            .with_ymd_and_hms(2026, 4, 16, 10, 0, 1)
+            .single()
+            .expect("valid timestamp");
+
+        ensure_stream_covers_cutover(before_cutover, cutover, "BuildTable")
+            .expect("stream covers cutover");
+        ensure_stream_covers_cutover(cutover, cutover, "BuildTable")
+            .expect("stream covers exact cutover");
+
+        let err = ensure_stream_covers_cutover(after_cutover, cutover, "BuildTable")
+            .expect_err("stream created after cutover should fail");
+
+        assert!(err.to_string().contains("wait for PITR to catch up"));
+    }
+
+    #[test]
+    fn export_data_prefix_scopes_reads_to_current_export_id() -> anyhow::Result<()> {
+        let prefix = export_data_prefix(
+            "cdsync/dynamodb/BuildTable/20260416T100000",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/BuildTable/export/01693411234567-abcdef",
+        )?;
+
+        assert_eq!(
+            prefix,
+            "cdsync/dynamodb/BuildTable/20260416T100000/AWSDynamoDB/01693411234567-abcdef/"
+        );
+        Ok(())
     }
 
     #[test]

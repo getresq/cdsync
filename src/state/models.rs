@@ -27,6 +27,10 @@ pub struct DynamoDbFollowState {
     pub stream_arn: Option<String>,
     pub cutover_time: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub snapshot_in_progress: bool,
+    #[serde(default)]
+    pub shard_count: Option<usize>,
+    #[serde(default)]
     pub shard_checkpoints: HashMap<String, DynamoDbShardState>,
     pub updated_at: Option<DateTime<Utc>>,
 }

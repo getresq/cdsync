@@ -60,6 +60,7 @@ pub(super) struct ProgressResponse {
     pub(super) current_run: Option<RunSummary>,
     pub(super) runtime: ConnectionRuntime,
     pub(super) cdc: ConnectionCdcSnapshot,
+    pub(super) dynamodb_follow: Option<DynamoDbFollowSnapshot>,
     pub(super) cdc_progress: Option<CdcProgressInsight>,
     pub(super) batch_load_queue: Option<CdcBatchLoadQueueSummary>,
     pub(super) cdc_coordinator: Option<CdcCoordinatorSummary>,
@@ -309,6 +310,18 @@ pub(super) struct ConnectionCdcSnapshot {
     pub(super) wal_bytes_behind_confirmed: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct DynamoDbFollowSnapshot {
+    pub(super) table_name: String,
+    pub(super) stream_arn: Option<String>,
+    pub(super) cutover_time: Option<DateTime<Utc>>,
+    pub(super) shard_count: usize,
+    pub(super) shards_with_checkpoints: usize,
+    pub(super) latest_shard_checkpoint_at: Option<DateTime<Utc>>,
+    pub(super) shard_checkpoints: HashMap<String, crate::state::DynamoDbShardState>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
+}
+
 pub(super) type CdcSlotSamplerCache =
     Arc<HashMap<String, watch::Sender<CachedPostgresCdcSlotState>>>;
 
@@ -346,6 +359,41 @@ impl ConnectionCdcSnapshot {
             wal_bytes_behind_confirmed: snapshot
                 .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed),
         }
+    }
+}
+
+impl DynamoDbFollowSnapshot {
+    pub(super) fn from_state(state: Option<&ConnectionState>) -> Option<Self> {
+        let follow = state.and_then(|state| state.dynamodb_follow.as_ref())?;
+        let latest_shard_checkpoint_at = follow
+            .shard_checkpoints
+            .values()
+            .filter_map(|shard| shard.updated_at)
+            .max();
+        Some(Self {
+            table_name: follow.table_name.clone(),
+            stream_arn: follow.stream_arn.clone(),
+            cutover_time: follow.cutover_time,
+            shard_count: follow.shard_count.unwrap_or(follow.shard_checkpoints.len()),
+            shards_with_checkpoints: follow
+                .shard_checkpoints
+                .values()
+                .filter(|shard| shard.sequence_number.is_some())
+                .count(),
+            latest_shard_checkpoint_at,
+            shard_checkpoints: follow.shard_checkpoints.clone(),
+            updated_at: follow.updated_at,
+        })
+    }
+
+    pub(super) fn from_state_for_connection(
+        state: Option<&ConnectionState>,
+        connection: &ConnectionConfig,
+    ) -> Option<Self> {
+        let SourceConfig::DynamoDb(dynamo) = &connection.source else {
+            return None;
+        };
+        Self::from_state(state).filter(|snapshot| snapshot.table_name == dynamo.table_name)
     }
 }
 

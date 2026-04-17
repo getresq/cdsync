@@ -170,6 +170,12 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
                 .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed),
         },
     )?);
+    events.push_back(next_stream_event(
+        &mut cursor.seq,
+        &cursor.connection_id,
+        "connection.dynamodb_follow",
+        DynamoDbFollowSnapshot::from_state_for_connection(connection_state.as_ref(), connection),
+    )?);
 
     if uses_cdc_batch_load_queue(connection) {
         let cdc = ConnectionCdcSnapshot::from_cached(cached_cdc_state.as_ref());

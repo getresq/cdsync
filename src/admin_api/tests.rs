@@ -1,8 +1,9 @@
 use super::*;
 use crate::config::{
     AdminApiAuthConfig, AdminApiConfig, BigQueryConfig, Config, ConnectionConfig,
-    DestinationConfig, LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig,
-    PostgresTableConfig, SourceConfig, StateConfig, StatsConfig, SyncConfig,
+    DestinationConfig, DynamoDbAttributeConfig, DynamoDbAttributeType, DynamoDbConfig,
+    LoggingConfig, MetadataConfig, ObservabilityConfig, PostgresConfig, PostgresTableConfig,
+    SourceConfig, StateConfig, StatsConfig, SyncConfig,
 };
 use crate::retry::ErrorReasonCode;
 use crate::types::{
@@ -297,6 +298,48 @@ fn test_postgres_cdc_connection() -> ConnectionConfig {
     }
 }
 
+fn test_dynamodb_connection() -> ConnectionConfig {
+    ConnectionConfig {
+        id: "sites_production".to_string(),
+        enabled: Some(true),
+        source: SourceConfig::DynamoDb(DynamoDbConfig {
+            table_name: "SiteSessions".to_string(),
+            region: "us-east-1".to_string(),
+            export_bucket: "cdsync-exports".to_string(),
+            export_prefix: Some("dynamodb".to_string()),
+            kinesis_stream_name: Some("site-sessions-stream".to_string()),
+            kinesis_stream_arn: None,
+            raw_item_column: None,
+            key_attributes: vec!["id".to_string()],
+            attributes: vec![
+                DynamoDbAttributeConfig {
+                    name: "id".to_string(),
+                    data_type: DynamoDbAttributeType::String,
+                    nullable: Some(false),
+                },
+                DynamoDbAttributeConfig {
+                    name: "status".to_string(),
+                    data_type: DynamoDbAttributeType::String,
+                    nullable: Some(true),
+                },
+            ],
+        }),
+        destination: DestinationConfig::BigQuery(BigQueryConfig {
+            project_id: "proj".to_string(),
+            dataset: "dataset".to_string(),
+            location: Some("US".to_string()),
+            service_account_key_path: None,
+            service_account_key: None,
+            partition_by_synced_at: Some(true),
+            batch_load_bucket: Some("postgres-cdc-batch-load".to_string()),
+            batch_load_prefix: Some("cdsync".to_string()),
+            emulator_http: None,
+            emulator_grpc: None,
+        }),
+        schedule: None,
+    }
+}
+
 #[test]
 fn derive_connection_runtime_requires_real_cdc_follow_state() {
     let connection = test_postgres_cdc_connection();
@@ -320,6 +363,185 @@ fn derive_connection_runtime_requires_real_cdc_follow_state() {
 
     assert_eq!(runtime.phase, "starting");
     assert_eq!(runtime.reason_code, "cdc_initializing");
+}
+
+#[test]
+fn dynamodb_runtime_surfaces_snapshot_then_kinesis_follow() {
+    let connection = test_dynamodb_connection();
+    let now = Utc.with_ymd_and_hms(2026, 4, 16, 10, 0, 0).unwrap();
+    let mut state = ConnectionState {
+        last_sync_status: Some("running".to_string()),
+        dynamodb_follow: Some(crate::state::DynamoDbFollowState {
+            table_name: "SiteSessions".to_string(),
+            stream_arn: Some("arn:aws:kinesis:us-east-1:123:stream/site-sessions".to_string()),
+            cutover_time: Some(now),
+            snapshot_in_progress: true,
+            shard_count: None,
+            shard_checkpoints: HashMap::new(),
+            updated_at: Some(now),
+        }),
+        ..Default::default()
+    };
+
+    let runtime = derive_connection_runtime(
+        &connection,
+        Some(&state),
+        None,
+        None,
+        now,
+        RuntimeMetadata {
+            config_hash: "hash",
+            deploy_revision: Some("deploy"),
+            last_restart_reason: "startup",
+        },
+    );
+
+    assert_eq!(runtime.mode, "snapshot");
+    assert_eq!(runtime.phase, "snapshotting");
+    assert_eq!(runtime.reason_code, "snapshot_in_progress");
+
+    state.dynamodb.insert(
+        "SiteSessions".to_string(),
+        TableCheckpoint {
+            last_synced_at: Some(now),
+            ..Default::default()
+        },
+    );
+    state
+        .dynamodb_follow
+        .as_mut()
+        .expect("follow state")
+        .snapshot_in_progress = false;
+    let runtime = derive_connection_runtime(
+        &connection,
+        Some(&state),
+        None,
+        None,
+        now,
+        RuntimeMetadata {
+            config_hash: "hash",
+            deploy_revision: Some("deploy"),
+            last_restart_reason: "startup",
+        },
+    );
+
+    assert_eq!(runtime.mode, "kinesis");
+    assert_eq!(runtime.phase, "running");
+    assert_eq!(runtime.reason_code, "kinesis_following");
+}
+
+#[test]
+fn dynamodb_runtime_treats_newer_cutover_as_active_full_snapshot() {
+    let connection = test_dynamodb_connection();
+    let previous_checkpoint = Utc.with_ymd_and_hms(2026, 4, 16, 10, 5, 0).unwrap();
+    let cutover = Utc.with_ymd_and_hms(2026, 4, 16, 10, 0, 0).unwrap();
+    let mut state = ConnectionState {
+        last_sync_status: Some("running".to_string()),
+        dynamodb_follow: Some(crate::state::DynamoDbFollowState {
+            table_name: "SiteSessions".to_string(),
+            stream_arn: Some("arn:aws:kinesis:us-east-1:123:stream/site-sessions".to_string()),
+            cutover_time: Some(cutover),
+            snapshot_in_progress: true,
+            shard_count: Some(3),
+            shard_checkpoints: HashMap::new(),
+            updated_at: Some(cutover),
+        }),
+        ..Default::default()
+    };
+    state.dynamodb.insert(
+        "SiteSessions".to_string(),
+        TableCheckpoint {
+            last_synced_at: Some(previous_checkpoint),
+            ..Default::default()
+        },
+    );
+
+    let runtime = derive_connection_runtime(
+        &connection,
+        Some(&state),
+        None,
+        None,
+        cutover,
+        RuntimeMetadata {
+            config_hash: "hash",
+            deploy_revision: Some("deploy"),
+            last_restart_reason: "manual-full",
+        },
+    );
+
+    assert_eq!(runtime.mode, "snapshot");
+    assert_eq!(runtime.phase, "snapshotting");
+    assert_eq!(runtime.reason_code, "snapshot_in_progress");
+}
+
+#[test]
+fn dynamodb_connections_do_not_load_postgres_cdc_batch_queue() {
+    let connection = test_dynamodb_connection();
+
+    assert!(!uses_cdc_batch_load_queue(&connection));
+
+    let cdc = ConnectionCdcSnapshot::from_cached(None);
+    assert!(build_cdc_progress_insight(&cdc, None, None).is_none());
+}
+
+#[test]
+fn dynamodb_follow_snapshot_ignores_stale_state_for_postgres_connection() {
+    let connection = test_postgres_cdc_connection();
+    let now = Utc.with_ymd_and_hms(2026, 4, 16, 10, 0, 0).unwrap();
+    let state = ConnectionState {
+        dynamodb_follow: Some(crate::state::DynamoDbFollowState {
+            table_name: "SiteSessions".to_string(),
+            stream_arn: Some("arn:aws:kinesis:us-east-1:123:stream/site-sessions".to_string()),
+            cutover_time: Some(now),
+            snapshot_in_progress: false,
+            shard_count: Some(3),
+            shard_checkpoints: HashMap::new(),
+            updated_at: Some(now),
+        }),
+        ..Default::default()
+    };
+
+    assert!(DynamoDbFollowSnapshot::from_state_for_connection(Some(&state), &connection).is_none());
+}
+
+#[test]
+fn dynamodb_follow_snapshot_summarizes_shard_state() {
+    let now = Utc.with_ymd_and_hms(2026, 4, 16, 10, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2026, 4, 16, 10, 1, 0).unwrap();
+    let state = ConnectionState {
+        dynamodb_follow: Some(crate::state::DynamoDbFollowState {
+            table_name: "SiteSessions".to_string(),
+            stream_arn: Some("arn:aws:kinesis:us-east-1:123:stream/site-sessions".to_string()),
+            cutover_time: Some(now),
+            snapshot_in_progress: false,
+            shard_count: Some(3),
+            shard_checkpoints: HashMap::from([
+                (
+                    "shard-000".to_string(),
+                    crate::state::DynamoDbShardState {
+                        sequence_number: Some("100".to_string()),
+                        updated_at: Some(now),
+                    },
+                ),
+                (
+                    "shard-001".to_string(),
+                    crate::state::DynamoDbShardState {
+                        sequence_number: None,
+                        updated_at: Some(later),
+                    },
+                ),
+            ]),
+            updated_at: Some(later),
+        }),
+        ..Default::default()
+    };
+
+    let snapshot = DynamoDbFollowSnapshot::from_state(Some(&state)).expect("follow snapshot");
+
+    assert_eq!(snapshot.table_name, "SiteSessions");
+    assert_eq!(snapshot.shard_count, 3);
+    assert_eq!(snapshot.shards_with_checkpoints, 1);
+    assert_eq!(snapshot.latest_shard_checkpoint_at, Some(later));
 }
 
 #[test]
