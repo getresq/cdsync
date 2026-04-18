@@ -192,7 +192,10 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
     let Some(state_handle) = state_handle else {
         return Ok(());
     };
-    let from_sequence = coordinator_state_rx.borrow().next_sequence_to_ack;
+    let coordinator_sequence = coordinator_state_rx.borrow().next_sequence_to_ack;
+    let feedback_state = state_handle.load_cdc_feedback_state().await?;
+    let from_sequence =
+        durable_frontier_scan_start_sequence(coordinator_sequence, feedback_state.as_ref());
     let Some(frontier) = state_handle
         .load_cdc_durable_apply_frontier(from_sequence, CDC_DURABLE_FRONTIER_SCAN_LIMIT)
         .await?
@@ -202,7 +205,10 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
     if frontier.next_sequence_to_ack <= from_sequence {
         return Ok(());
     }
-    let sequences = (from_sequence..frontier.next_sequence_to_ack).collect::<Vec<_>>();
+    let sequence_count = frontier.next_sequence_to_ack.saturating_sub(from_sequence);
+    let commit_lsn = frontier.commit_lsn.parse().map_err(|_| {
+        anyhow::anyhow!("invalid durable CDC frontier LSN '{}'", frontier.commit_lsn)
+    })?;
     info!(
         component = "coordinator",
         event = "cdc_coordinator_durable_frontier_seen",
@@ -210,13 +216,25 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
         from_sequence,
         next_sequence_to_ack = frontier.next_sequence_to_ack,
         commit_lsn = %frontier.commit_lsn,
-        sequence_count = sequences.len(),
+        sequence_count,
         "submitting durable CDC frontier completions"
     );
     coordinator_tx
-        .send(CdcCoordinatorCommand::CompleteCommits { sequences })
+        .send(CdcCoordinatorCommand::AdvanceDurableFrontier {
+            next_sequence_to_ack: frontier.next_sequence_to_ack,
+            commit_lsn,
+        })
         .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
     Ok(())
+}
+
+fn durable_frontier_scan_start_sequence(
+    coordinator_sequence: u64,
+    feedback_state: Option<&crate::state::CdcWatermarkState>,
+) -> u64 {
+    feedback_state.map_or(coordinator_sequence, |state| {
+        state.next_sequence_to_ack.min(coordinator_sequence)
+    })
 }
 
 pub(super) async fn cdc_durable_backlog_backpressure_exceeded(
@@ -703,6 +721,20 @@ mod tests {
             ),
             etl::types::PgLsn::from(0x10_u64)
         );
+    }
+
+    #[test]
+    fn durable_frontier_scan_uses_persisted_feedback_when_it_lags_memory() {
+        let feedback = crate::state::CdcWatermarkState {
+            next_sequence_to_ack: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            durable_frontier_scan_start_sequence(13, Some(&feedback)),
+            10
+        );
+        assert_eq!(durable_frontier_scan_start_sequence(13, None), 13);
     }
 
     #[tokio::test]
