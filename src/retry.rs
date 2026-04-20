@@ -276,7 +276,58 @@ pub fn classify_sync_retry(error: &Error) -> SyncRetryClass {
         return SyncRetryClass::Backpressure;
     }
 
+    if let Some(classification) = classify_bigquery_reason_from_message(&message) {
+        return classification;
+    }
+
     SyncRetryClass::Transient
+}
+
+fn classify_bigquery_reason_from_message(message: &str) -> Option<SyncRetryClass> {
+    const BACKPRESSURE_REASONS: &[&str] = &[
+        "bigquery_reason=jobratelimitexceeded",
+        "bigquery_reason=quotaexceeded",
+        "bigquery_reason=ratelimitexceeded",
+    ];
+    const TRANSIENT_REASONS: &[&str] = &[
+        "bigquery_reason=backenderror",
+        "bigquery_reason=internalerror",
+        "bigquery_reason=jobbackenderror",
+        "bigquery_reason=jobinternalerror",
+        "bigquery_reason=tableunavailable",
+    ];
+    const PERMANENT_REASONS: &[&str] = &[
+        "bigquery_reason=accessdenied",
+        "bigquery_reason=billingnotenabled",
+        "bigquery_reason=billingtierlimitexceeded",
+        "bigquery_reason=duplicate",
+        "bigquery_reason=invalid",
+        "bigquery_reason=invalidquery",
+        "bigquery_reason=invaliduser",
+        "bigquery_reason=notfound",
+        "bigquery_reason=notimplemented",
+        "bigquery_reason=resourcesexceeded",
+        "bigquery_reason=responsetoolarge",
+    ];
+
+    if BACKPRESSURE_REASONS
+        .iter()
+        .any(|reason| message.contains(reason))
+    {
+        Some(SyncRetryClass::Backpressure)
+    } else if TRANSIENT_REASONS
+        .iter()
+        .any(|reason| message.contains(reason))
+    {
+        Some(SyncRetryClass::Transient)
+    } else if PERMANENT_REASONS
+        .iter()
+        .any(|reason| message.contains(reason))
+    {
+        Some(SyncRetryClass::Permanent)
+    } else {
+        None
+    }
 }
 
 pub fn classify_error_reason(error: &Error) -> ErrorReasonCode {
@@ -336,6 +387,24 @@ mod tests {
             "Quota exceeded: Your table exceeded quota for total number of dml jobs writing to a table, pending + running"
         );
         assert_eq!(classify_sync_retry(&err), SyncRetryClass::Backpressure);
+    }
+
+    #[test]
+    fn classify_sync_retry_uses_bigquery_reason_when_available() {
+        let invalid = anyhow::anyhow!(
+            "BigQuery load job cdsync_load_bad failed bigquery_reason=invalid: {{\"status\":{{}}}}"
+        );
+        assert_eq!(classify_sync_retry(&invalid), SyncRetryClass::Permanent);
+
+        let backend = anyhow::anyhow!(
+            "BigQuery load job cdsync_load_retry failed bigquery_reason=backendError: {{\"status\":{{}}}}"
+        );
+        assert_eq!(classify_sync_retry(&backend), SyncRetryClass::Transient);
+
+        let quota = anyhow::anyhow!(
+            "BigQuery query job merge_abc failed bigquery_reason=rateLimitExceeded: {{\"status\":{{}}}}"
+        );
+        assert_eq!(classify_sync_retry(&quota), SyncRetryClass::Backpressure);
     }
 
     #[test]

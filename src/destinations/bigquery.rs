@@ -20,7 +20,7 @@ use gcloud_bigquery::http::error::Error as BqError;
 use gcloud_bigquery::http::job::get::GetJobRequest;
 use gcloud_bigquery::http::job::get_query_results::GetQueryResultsRequest;
 use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
-use gcloud_bigquery::http::job::{Job, JobReference, JobState};
+use gcloud_bigquery::http::job::{Job, JobReference, JobState, JobType};
 use gcloud_bigquery::http::table::{
     Clustering, Table, TableReference, TableSchema as BqTableSchema, TimePartitionType,
     TimePartitioning,
@@ -1815,6 +1815,100 @@ fn merge_query_request_id(
     stable_query_request_id("merge", &key)
 }
 
+pub(super) fn bigquery_job_failure_message(label: &str, job: &Job) -> String {
+    let reason = bigquery_job_error_reason(job);
+    let reason_context = reason
+        .map(|reason| format!(" bigquery_reason={reason}"))
+        .unwrap_or_default();
+    let diagnostics = serde_json::to_string(&bigquery_job_failure_diagnostics(job))
+        .unwrap_or_else(|err| format!("{{\"diagnostics_error\":\"{}\"}}", err));
+    format!(
+        "{label} job {} failed{reason_context}: {diagnostics}",
+        job.job_reference.job_id
+    )
+}
+
+fn bigquery_job_error_reason(job: &Job) -> Option<&str> {
+    job.status
+        .error_result
+        .as_ref()
+        .and_then(|error| error.reason.as_deref())
+        .or_else(|| {
+            job.status
+                .errors
+                .as_ref()
+                .and_then(|errors| errors.iter().find_map(|error| error.reason.as_deref()))
+        })
+}
+
+fn bigquery_job_failure_diagnostics(job: &Job) -> Value {
+    json!({
+        "jobReference": &job.job_reference,
+        "status": &job.status,
+        "configuration": bigquery_job_configuration_diagnostics(job),
+        "statistics": job.statistics.as_ref().map(|statistics| json!({
+            "creationTime": statistics.creation_time,
+            "startTime": statistics.start_time,
+            "endTime": statistics.end_time,
+            "totalBytesProcessed": statistics.total_bytes_processed,
+            "totalSlotMs": statistics.total_slot_ms,
+            "reservationId": &statistics.reservation_id,
+            "finalExecutionDurationMs": statistics.final_execution_duration_ms,
+            "load": &statistics.load,
+        })),
+    })
+}
+
+fn bigquery_job_configuration_diagnostics(job: &Job) -> Value {
+    match &job.configuration.job {
+        JobType::Load(load) => json!({
+            "jobType": &job.configuration.job_type,
+            "load": {
+                "destinationTable": &load.destination_table,
+                "sourceUris": &load.source_uris,
+                "sourceFormat": &load.source_format,
+                "writeDisposition": &load.write_disposition,
+                "createDisposition": &load.create_disposition,
+                "schemaFieldCount": load.schema.as_ref().map(|schema| schema.fields.len()),
+                "maxBadRecords": load.max_bad_records,
+                "ignoreUnknownValues": load.ignore_unknown_values,
+            },
+        }),
+        JobType::Query(query) => {
+            let mut hasher = Sha256::new();
+            hasher.update(query.query.as_bytes());
+            let digest = hex::encode(hasher.finalize());
+            json!({
+                "jobType": &job.configuration.job_type,
+                "query": {
+                    "querySha256": digest,
+                    "queryLength": query.query.len(),
+                    "destinationTable": &query.destination_table,
+                    "priority": &query.priority,
+                    "useLegacySql": query.use_legacy_sql,
+                    "maximumBytesBilled": query.maximum_bytes_billed,
+                },
+            })
+        }
+        JobType::Copy(copy) => json!({
+            "jobType": &job.configuration.job_type,
+            "copy": {
+                "sourceTable": &copy.source_table,
+                "destinationTable": &copy.destination_table,
+                "writeDisposition": &copy.write_disposition,
+                "createDisposition": &copy.create_disposition,
+            },
+        }),
+        JobType::Extract(extract) => json!({
+            "jobType": &job.configuration.job_type,
+            "extract": {
+                "sourceTable": &extract.source,
+                "destinationUris": &extract.destination_uris,
+            },
+        }),
+    }
+}
+
 fn cdc_load_job_id_for_attempt(stable_job_id: &str, attempt_count: i32) -> String {
     let attempt_count = attempt_count.max(1);
     if attempt_count <= 1 {
@@ -1827,23 +1921,13 @@ fn query_job_completed(label: &str, job: &Job) -> Result<bool> {
     if job.status.state != JobState::Done {
         return Ok(false);
     }
-    if let Some(error_result) = &job.status.error_result {
-        anyhow::bail!(
-            "{} job {} failed: {:?}",
-            label,
-            job.job_reference.job_id,
-            error_result
-        );
+    if job.status.error_result.is_some() {
+        anyhow::bail!("{}", bigquery_job_failure_message(label, job));
     }
     if let Some(errors) = &job.status.errors
         && !errors.is_empty()
     {
-        anyhow::bail!(
-            "{} job {} reported errors: {:?}",
-            label,
-            job.job_reference.job_id,
-            errors
-        );
+        anyhow::bail!("{}", bigquery_job_failure_message(label, job));
     }
     Ok(true)
 }
@@ -1944,12 +2028,13 @@ fn get_query_results_to_query_response(result: QueryResponse) -> Result<QueryRes
 #[cfg(test)]
 mod tests {
     use super::{
-        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, bq_fields_from_schema,
-        cdc_load_job_id_for_attempt, cdc_reducer_merge_sql, drain_cleanup_task_handles,
-        dynamodb_change_merge_sql, fetch_query_results_response_from_http,
-        get_query_results_to_query_response, merge_query_request_id, primary_key_clustering,
-        query_job_completed, reap_finished_cleanup_task_handles, stable_query_request_id,
-        staging_merge_sql, update_table_for_missing_fields_and_clustering, upsert_staging_table_id,
+        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep,
+        bigquery_job_failure_message, bq_fields_from_schema, cdc_load_job_id_for_attempt,
+        cdc_reducer_merge_sql, drain_cleanup_task_handles, dynamodb_change_merge_sql,
+        fetch_query_results_response_from_http, get_query_results_to_query_response,
+        merge_query_request_id, primary_key_clustering, query_job_completed,
+        reap_finished_cleanup_task_handles, stable_query_request_id, staging_merge_sql,
+        update_table_for_missing_fields_and_clustering, upsert_staging_table_id,
     };
     use crate::types::{
         ColumnSchema, DataType, META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns,
@@ -1958,9 +2043,12 @@ mod tests {
     use gcloud_bigquery::http::error::Error as BqError;
     use gcloud_bigquery::http::job::query::QueryResponse;
     use gcloud_bigquery::http::job::{
-        Job, JobConfiguration, JobReference, JobState, JobStatus, JobType,
+        Job, JobConfiguration, JobConfigurationLoad, JobReference, JobState, JobStatus, JobType,
     };
-    use gcloud_bigquery::http::table::{Clustering, Table, TableSchema as BqTableSchema};
+    use gcloud_bigquery::http::table::{
+        Clustering, Table, TableReference, TableSchema as BqTableSchema,
+    };
+    use gcloud_bigquery::http::types::ErrorProto;
     use serde_json::json;
     use std::future::pending;
     use std::sync::Arc;
@@ -2245,6 +2333,48 @@ mod tests {
                 Some("cdc_job_abc:1"),
             )
         );
+    }
+
+    #[test]
+    fn bigquery_job_failure_message_includes_reason_and_load_context() {
+        let job = Job {
+            job_reference: JobReference {
+                project_id: "project".to_string(),
+                job_id: "cdsync_load_bad".to_string(),
+                location: Some("US".to_string()),
+            },
+            configuration: JobConfiguration {
+                job_type: "LOAD".to_string(),
+                job: JobType::Load(JobConfigurationLoad {
+                    source_uris: vec!["gs://bucket/object.parquet".to_string()],
+                    destination_table: TableReference {
+                        project_id: "project".to_string(),
+                        dataset_id: "dataset".to_string(),
+                        table_id: "stage_table".to_string(),
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: JobStatus {
+                state: JobState::Done,
+                error_result: Some(ErrorProto {
+                    reason: Some("invalid".to_string()),
+                    location: Some("gs://bucket/object.parquet".to_string()),
+                    message: Some("bad parquet file".to_string()),
+                }),
+                errors: None,
+            },
+            ..Default::default()
+        };
+
+        let message = bigquery_job_failure_message("BigQuery load", &job);
+
+        assert!(message.contains("BigQuery load job cdsync_load_bad failed"));
+        assert!(message.contains("bigquery_reason=invalid"));
+        assert!(message.contains("bad parquet file"));
+        assert!(message.contains("gs://bucket/object.parquet"));
+        assert!(message.contains("stage_table"));
     }
 
     #[test]

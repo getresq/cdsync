@@ -21,7 +21,7 @@ use gcloud_bigquery::http::table::{
 };
 
 use super::BIGQUERY_REQUEST_TIMEOUT;
-use super::BigQueryDestination;
+use super::{BigQueryDestination, bigquery_job_failure_message};
 use crate::destinations::bigquery::values::{
     anyvalue_to_bool, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
     anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
@@ -232,13 +232,19 @@ impl BigQueryDestination {
             }
 
             if current.status.state == JobState::Done {
-                if let Some(error_result) = current.status.error_result {
-                    anyhow::bail!("BigQuery load job {} failed: {:?}", job_id, error_result);
+                if current.status.error_result.is_some() {
+                    anyhow::bail!(
+                        "{}",
+                        bigquery_job_failure_message("BigQuery load", &current)
+                    );
                 }
-                if let Some(errors) = current.status.errors
+                if let Some(errors) = &current.status.errors
                     && !errors.is_empty()
                 {
-                    anyhow::bail!("BigQuery load job {} reported errors: {:?}", job_id, errors);
+                    anyhow::bail!(
+                        "{}",
+                        bigquery_job_failure_message("BigQuery load", &current)
+                    );
                 }
                 tracing::info!(
                     table = table_id,
