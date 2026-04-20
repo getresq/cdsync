@@ -871,7 +871,11 @@ impl CdcBatchLoadManager {
         );
         let result = self
             .inner
-            .stage_cdc_batch_load_job(self.state_handle.connection_id(), &job.payload)
+            .stage_cdc_batch_load_job(
+                self.state_handle.connection_id(),
+                &job.payload,
+                job.record.attempt_count,
+            )
             .instrument(span)
             .await;
         match result {

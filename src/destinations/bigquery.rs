@@ -836,6 +836,7 @@ impl BigQueryDestination {
         &self,
         connection_id: &str,
         payload: &CdcBatchLoadJobPayload,
+        attempt_count: i32,
     ) -> Result<()> {
         let staging_schema = payload.staging_schema.as_ref().unwrap_or(&payload.schema);
         for step in &payload.steps {
@@ -879,11 +880,17 @@ impl BigQueryDestination {
                 "queued staging table ensured for BigQuery merge"
             );
             let load_started_at = std::time::Instant::now();
+            let load_job_id = step
+                .load_job_id
+                .as_deref()
+                .map(|job_id| cdc_load_job_id_for_attempt(job_id, attempt_count));
             let load_span = info_span!(
                 "cdc_batch_load_job.load_job",
                 connection_id = connection_id,
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
+                load_job_id = load_job_id.as_deref().unwrap_or(""),
+                attempt_count = attempt_count,
                 rows = step.row_count
             );
             {
@@ -892,7 +899,7 @@ impl BigQueryDestination {
                     &with_metadata_schema(staging_schema, &self.metadata),
                     &step.object_uri,
                     gcloud_bigquery::http::job::WriteDisposition::WriteTruncate,
-                    step.load_job_id.as_deref(),
+                    load_job_id.as_deref(),
                 )
                 .instrument(load_span)
                 .await?;
@@ -1808,6 +1815,14 @@ fn merge_query_request_id(
     stable_query_request_id("merge", &key)
 }
 
+fn cdc_load_job_id_for_attempt(stable_job_id: &str, attempt_count: i32) -> String {
+    let attempt_count = attempt_count.max(1);
+    if attempt_count <= 1 {
+        return stable_job_id.to_string();
+    }
+    format!("{stable_job_id}_attempt_{attempt_count}")
+}
+
 fn query_job_completed(label: &str, job: &Job) -> Result<bool> {
     if job.status.state != JobState::Done {
         return Ok(false);
@@ -1930,11 +1945,11 @@ fn get_query_results_to_query_response(result: QueryResponse) -> Result<QueryRes
 mod tests {
     use super::{
         BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, bq_fields_from_schema,
-        cdc_reducer_merge_sql, drain_cleanup_task_handles, dynamodb_change_merge_sql,
-        fetch_query_results_response_from_http, get_query_results_to_query_response,
-        merge_query_request_id, primary_key_clustering, query_job_completed,
-        reap_finished_cleanup_task_handles, stable_query_request_id, staging_merge_sql,
-        update_table_for_missing_fields_and_clustering, upsert_staging_table_id,
+        cdc_load_job_id_for_attempt, cdc_reducer_merge_sql, drain_cleanup_task_handles,
+        dynamodb_change_merge_sql, fetch_query_results_response_from_http,
+        get_query_results_to_query_response, merge_query_request_id, primary_key_clustering,
+        query_job_completed, reap_finished_cleanup_task_handles, stable_query_request_id,
+        staging_merge_sql, update_table_for_missing_fields_and_clustering, upsert_staging_table_id,
     };
     use crate::types::{
         ColumnSchema, DataType, META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns,
@@ -2229,6 +2244,22 @@ mod tests {
                 "public__core_workordernote_staging_upsert_abc",
                 Some("cdc_job_abc:1"),
             )
+        );
+    }
+
+    #[test]
+    fn cdc_load_job_id_rotates_after_first_durable_attempt() {
+        let stable_job_id = "cdsync_load_42da264e6d0d6cfb157afa1d";
+
+        assert_eq!(cdc_load_job_id_for_attempt(stable_job_id, 0), stable_job_id);
+        assert_eq!(cdc_load_job_id_for_attempt(stable_job_id, 1), stable_job_id);
+        assert_eq!(
+            cdc_load_job_id_for_attempt(stable_job_id, 18),
+            "cdsync_load_42da264e6d0d6cfb157afa1d_attempt_18"
+        );
+        assert_ne!(
+            cdc_load_job_id_for_attempt(stable_job_id, 18),
+            cdc_load_job_id_for_attempt(stable_job_id, 19)
         );
     }
 
