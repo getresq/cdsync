@@ -485,6 +485,51 @@ fn dynamodb_connections_do_not_load_postgres_cdc_batch_queue() {
 }
 
 #[test]
+fn cdc_batch_load_runtime_config_exposes_effective_reducer_settings() {
+    let mut cfg = test_hash_config(HashMap::new(), HashMap::new());
+    let DestinationConfig::BigQuery(bq) = &mut cfg.connections[0].destination;
+    bq.batch_load_bucket = Some("bucket".to_string());
+    bq.emulator_http = None;
+    bq.emulator_grpc = None;
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source else {
+        panic!("expected postgres source");
+    };
+    pg.cdc_batch_load_staging_worker_count = Some(4);
+    pg.cdc_batch_load_reducer_worker_count = Some(2);
+    pg.cdc_batch_load_reducer_max_jobs = Some(32);
+    pg.cdc_batch_load_reducer_enabled = Some(true);
+
+    let runtime = build_cdc_batch_load_runtime_config(&cfg.connections[0], cfg.sync.as_ref())
+        .expect("batch-load runtime config");
+
+    assert!(runtime.queue_enabled);
+    assert!(runtime.reducer_enabled);
+    assert_eq!(runtime.reducer_max_jobs, 32);
+    assert_eq!(runtime.staging_worker_count, 4);
+    assert_eq!(runtime.reducer_worker_count, 2);
+}
+
+#[test]
+fn cdc_batch_load_runtime_config_shows_reducer_disabled_as_one_job_windows() {
+    let mut cfg = test_hash_config(HashMap::new(), HashMap::new());
+    let DestinationConfig::BigQuery(bq) = &mut cfg.connections[0].destination;
+    bq.batch_load_bucket = Some("bucket".to_string());
+    bq.emulator_http = None;
+    bq.emulator_grpc = None;
+    let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source else {
+        panic!("expected postgres source");
+    };
+    pg.cdc_batch_load_reducer_max_jobs = Some(32);
+    pg.cdc_batch_load_reducer_enabled = Some(false);
+
+    let runtime = build_cdc_batch_load_runtime_config(&cfg.connections[0], cfg.sync.as_ref())
+        .expect("batch-load runtime config");
+
+    assert!(!runtime.reducer_enabled);
+    assert_eq!(runtime.reducer_max_jobs, 1);
+}
+
+#[test]
 fn dynamodb_follow_snapshot_ignores_stale_state_for_postgres_connection() {
     let connection = test_postgres_cdc_connection();
     let now = Utc.with_ymd_and_hms(2026, 4, 16, 10, 0, 0).unwrap();

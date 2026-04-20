@@ -22,6 +22,31 @@ pub(super) fn uses_cdc_batch_load_queue(connection: &ConnectionConfig) -> bool {
         )
 }
 
+pub(super) fn build_cdc_batch_load_runtime_config(
+    connection: &ConnectionConfig,
+    sync: Option<&SyncConfig>,
+) -> Option<CdcBatchLoadRuntimeConfig> {
+    if !uses_cdc_batch_load_queue(connection) {
+        return None;
+    }
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return None;
+    };
+    let fallback_concurrency = sync
+        .and_then(|sync| sync.max_concurrency)
+        .unwrap_or(1)
+        .max(1);
+    let apply_concurrency = pg.cdc_apply_concurrency(fallback_concurrency);
+
+    Some(CdcBatchLoadRuntimeConfig {
+        queue_enabled: true,
+        reducer_enabled: pg.cdc_batch_load_reducer_enabled(),
+        reducer_max_jobs: pg.cdc_batch_load_reducer_max_jobs(),
+        staging_worker_count: pg.cdc_batch_load_staging_worker_count(apply_concurrency),
+        reducer_worker_count: pg.cdc_batch_load_reducer_worker_count(apply_concurrency),
+    })
+}
+
 pub(super) fn build_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
     Arc::new(
         cfg.connections

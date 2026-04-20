@@ -850,6 +850,8 @@ async fn progress(
     };
     let cdc_progress =
         build_cdc_progress_insight(&cdc, batch_load_queue.as_ref(), cdc_coordinator.as_ref());
+    let cdc_batch_load_runtime =
+        build_cdc_batch_load_runtime_config(config, state.cfg.sync.as_ref());
 
     Ok(Json(ProgressResponse {
         connection_id,
@@ -859,6 +861,7 @@ async fn progress(
         cdc,
         dynamodb_follow,
         cdc_progress,
+        cdc_batch_load_runtime,
         batch_load_queue,
         cdc_coordinator,
         tables,

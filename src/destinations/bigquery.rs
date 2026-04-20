@@ -6,7 +6,8 @@ use crate::destinations::{ChangeApplier, Destination, WriteMode, with_metadata_s
 use crate::sources::contract::records_to_dataframe;
 use crate::tls;
 use crate::types::{
-    META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns, SourceChangeBatch, TableSchema,
+    ColumnSchema, DataType, META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns,
+    SourceChangeBatch, TableSchema,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -21,7 +22,8 @@ use gcloud_bigquery::http::job::get_query_results::GetQueryResultsRequest;
 use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
 use gcloud_bigquery::http::job::{Job, JobReference, JobState};
 use gcloud_bigquery::http::table::{
-    Table, TableReference, TableSchema as BqTableSchema, TimePartitionType, TimePartitioning,
+    Clustering, Table, TableReference, TableSchema as BqTableSchema, TimePartitionType,
+    TimePartitioning,
 };
 use polars::prelude::DataFrame;
 use reqwest::StatusCode;
@@ -577,6 +579,7 @@ impl BigQueryDestination {
             "BigQuery dataset ensured before table ensure"
         );
         let schema = with_metadata_schema(schema, &self.metadata);
+        let desired_clustering = primary_key_clustering(&schema);
         let desired_fields = bq_fields_from_schema(&schema.columns);
         let bq_schema = BqTableSchema {
             fields: desired_fields.clone(),
@@ -646,27 +649,11 @@ impl BigQueryDestination {
         {
             Ok(mut table) => {
                 info!(table = table_id, "fetched BigQuery table metadata");
-                let existing_fields = table
-                    .schema
-                    .as_ref()
-                    .map(|s| s.fields.clone())
-                    .unwrap_or_default();
-                let existing_names: HashSet<String> = existing_fields
-                    .iter()
-                    .map(|f| f.name.to_lowercase())
-                    .collect();
-
-                let mut updated_fields = existing_fields;
-                for field in desired_fields.clone() {
-                    if !existing_names.contains(&field.name.to_lowercase()) {
-                        updated_fields.push(field);
-                    }
-                }
-
-                if updated_fields.len() != existing_names.len() {
-                    table.schema = Some(BqTableSchema {
-                        fields: updated_fields,
-                    });
+                if update_table_for_missing_fields_and_clustering(
+                    &mut table,
+                    &desired_fields,
+                    desired_clustering.as_ref(),
+                ) {
                     info!(table = table_id, "patching BigQuery table schema");
                     Self::await_bq_timeout(
                         format!("patching BigQuery table {}", table_id),
@@ -703,6 +690,7 @@ impl BigQueryDestination {
                         None
                     },
                     schema: Some(bq_schema),
+                    clustering: desired_clustering,
                     ..Default::default()
                 };
                 info!(table = table_id, "creating BigQuery table");
@@ -1084,36 +1072,20 @@ impl BigQueryDestination {
             return Ok(());
         }
 
-        let schema = with_metadata_schema(schema, &self.metadata);
-        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let updates: Vec<String> = columns
-            .iter()
-            .map(|col| format!("{} = S.{}", bq_ident(col), bq_ident(col)))
-            .collect();
-        let insert_cols: Vec<String> = columns.iter().map(|col| bq_ident(col)).collect();
-        let insert_vals: Vec<String> = columns
-            .iter()
-            .map(|col| format!("S.{}", bq_ident(col)))
-            .collect();
-
         let merge_lock = self.table_merge_lock(target).await;
         let _merge_permit = merge_lock
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("failed to acquire BigQuery merge lock for {}", target))?;
 
-        let sql = format!(
-            "MERGE `{project}.{dataset}.{target}` T USING `{project}.{dataset}.{staging}` S ON T.{pk} = S.{pk} \
-             WHEN MATCHED THEN UPDATE SET {updates} \
-             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})",
-            project = self.config.project_id,
-            dataset = self.config.dataset,
-            target = target,
-            staging = staging,
-            pk = bq_ident(primary_key),
-            updates = updates.join(", "),
-            insert_cols = insert_cols.join(", "),
-            insert_vals = insert_vals.join(", ")
+        let schema = with_metadata_schema(schema, &self.metadata);
+        let sql = staging_merge_sql(
+            &self.config.project_id,
+            &self.config.dataset,
+            target,
+            staging,
+            &schema,
+            primary_key,
         );
 
         self.run_query_with_request_id(
@@ -1528,6 +1500,150 @@ pub(crate) fn stable_cdc_batch_load_object_name(
     )
 }
 
+fn primary_key_column<'a>(schema: &'a TableSchema, primary_key: &str) -> Option<&'a ColumnSchema> {
+    schema
+        .columns
+        .iter()
+        .find(|column| column.name == primary_key)
+}
+
+fn primary_key_clustering(schema: &TableSchema) -> Option<Clustering> {
+    let primary_key = schema.primary_key.as_deref()?;
+    let column = primary_key_column(schema, primary_key)?;
+    bigquery_clustering_supported(&column.data_type).then(|| Clustering {
+        fields: vec![primary_key.to_string()],
+    })
+}
+
+fn update_table_for_missing_fields_and_clustering(
+    table: &mut Table,
+    desired_fields: &[gcloud_bigquery::http::table::TableFieldSchema],
+    desired_clustering: Option<&Clustering>,
+) -> bool {
+    let existing_fields = table
+        .schema
+        .as_ref()
+        .map(|schema| schema.fields.clone())
+        .unwrap_or_default();
+    let existing_names: HashSet<String> = existing_fields
+        .iter()
+        .map(|field| field.name.to_lowercase())
+        .collect();
+
+    let mut updated_fields = existing_fields;
+    for field in desired_fields {
+        if !existing_names.contains(&field.name.to_lowercase()) {
+            updated_fields.push(field.clone());
+        }
+    }
+
+    let mut needs_patch = false;
+    if updated_fields.len() != existing_names.len() {
+        table.schema = Some(BqTableSchema {
+            fields: updated_fields,
+        });
+        needs_patch = true;
+    }
+    if let Some(clustering) = desired_clustering
+        && table.clustering.as_ref() != Some(clustering)
+    {
+        table.clustering = Some(clustering.clone());
+        needs_patch = true;
+    }
+
+    needs_patch
+}
+
+fn bigquery_clustering_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::String
+            | DataType::Int64
+            | DataType::Bool
+            | DataType::Timestamp
+            | DataType::Date
+            | DataType::Bytes
+            | DataType::Numeric
+    )
+}
+
+fn primary_key_range_type(schema: &TableSchema, primary_key: &str) -> Option<&'static str> {
+    let column = primary_key_column(schema, primary_key)?;
+    match &column.data_type {
+        DataType::String | DataType::Bytes => Some("STRING"),
+        DataType::Int64 => Some("INT64"),
+        DataType::Bool => Some("BOOL"),
+        DataType::Timestamp => Some("TIMESTAMP"),
+        DataType::Date => Some("DATE"),
+        DataType::Numeric => Some("BIGNUMERIC"),
+        DataType::Float64 | DataType::Interval | DataType::Json => None,
+    }
+}
+
+fn primary_key_range_merge_parts(
+    schema: &TableSchema,
+    primary_key: &str,
+    range_source_sql: &str,
+) -> (String, String) {
+    let Some(range_type) = primary_key_range_type(schema, primary_key) else {
+        return (String::new(), String::new());
+    };
+    let pk = bq_ident(primary_key);
+    let declaration = format!(
+        "DECLARE _cdsync_pk_range STRUCT<min_pk {range_type}, max_pk {range_type}> DEFAULT \
+         (SELECT AS STRUCT MIN({pk}) AS min_pk, MAX({pk}) AS max_pk FROM ({range_source_sql})); "
+    );
+    let predicate =
+        format!(" AND T.{pk} BETWEEN _cdsync_pk_range.min_pk AND _cdsync_pk_range.max_pk");
+    (declaration, predicate)
+}
+
+fn table_primary_key_range_source(
+    project: &str,
+    dataset: &str,
+    table: &str,
+    primary_key: &str,
+) -> String {
+    format!(
+        "SELECT {pk} FROM `{project}.{dataset}.{table}`",
+        pk = bq_ident(primary_key)
+    )
+}
+
+fn staging_merge_sql(
+    project: &str,
+    dataset: &str,
+    target: &str,
+    staging: &str,
+    schema: &TableSchema,
+    primary_key: &str,
+) -> String {
+    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let updates: Vec<String> = columns
+        .iter()
+        .map(|col| format!("{} = S.{}", bq_ident(col), bq_ident(col)))
+        .collect();
+    let insert_cols: Vec<String> = columns.iter().map(|col| bq_ident(col)).collect();
+    let insert_vals: Vec<String> = columns
+        .iter()
+        .map(|col| format!("S.{}", bq_ident(col)))
+        .collect();
+    let pk = bq_ident(primary_key);
+    let range_source = table_primary_key_range_source(project, dataset, staging, primary_key);
+    let (range_declaration, target_range_predicate) =
+        primary_key_range_merge_parts(schema, primary_key, &range_source);
+
+    format!(
+        "{range_declaration}MERGE `{project}.{dataset}.{target}` T USING `{project}.{dataset}.{staging}` S \
+         ON T.{pk} = S.{pk}{target_range_predicate} \
+         WHEN MATCHED THEN UPDATE SET {updates} \
+         WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})",
+        updates = updates.join(", "),
+        insert_cols = insert_cols.join(", "),
+        insert_vals = insert_vals.join(", ")
+    )
+}
+
 fn cdc_reducer_merge_sql(
     project: &str,
     dataset: &str,
@@ -1548,11 +1664,22 @@ fn cdc_reducer_merge_sql(
     reducer_columns.push(bq_ident(CDC_STAGING_SEQUENCE_COLUMN));
     reducer_columns.push(bq_ident(CDC_STAGING_TX_ORDINAL_COLUMN));
     let reducer_projection = reducer_columns.join(", ");
+    let pk = bq_ident(primary_key);
     let union_sources = steps
         .iter()
         .map(|step| {
             format!(
                 "SELECT {reducer_projection} FROM `{project}.{dataset}.{staging}`",
+                staging = step.staging_table
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let range_sources = steps
+        .iter()
+        .map(|step| {
+            format!(
+                "SELECT {pk} FROM `{project}.{dataset}.{staging}`",
                 staging = step.staging_table
             )
         })
@@ -1573,17 +1700,18 @@ fn cdc_reducer_merge_sql(
         .map(|col| format!("S.{}", bq_ident(col)))
         .collect::<Vec<_>>()
         .join(", ");
-    let pk = bq_ident(primary_key);
     let sequence = bq_ident(CDC_STAGING_SEQUENCE_COLUMN);
     let tx_ordinal = bq_ident(CDC_STAGING_TX_ORDINAL_COLUMN);
+    let (range_declaration, target_range_predicate) =
+        primary_key_range_merge_parts(&schema, primary_key, &range_sources);
 
     format!(
-        "MERGE `{project}.{dataset}.{target}` T USING (\
+        "{range_declaration}MERGE `{project}.{dataset}.{target}` T USING (\
          SELECT {projection} FROM (\
          SELECT {projection}, ROW_NUMBER() OVER (PARTITION BY {pk} \
          ORDER BY {sequence} DESC, {tx_ordinal} DESC) AS _cdsync_reducer_rank \
          FROM ({union_sources}) _cdsync_reducer_source) \
-         WHERE _cdsync_reducer_rank = 1) S ON T.{pk} = S.{pk} \
+         WHERE _cdsync_reducer_rank = 1) S ON T.{pk} = S.{pk}{target_range_predicate} \
          WHEN MATCHED THEN UPDATE SET {updates} \
          WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
     )
@@ -1628,14 +1756,17 @@ fn dynamodb_change_merge_sql(
     let source_event_at = bq_ident(META_SOURCE_EVENT_AT);
     let source_event_id = bq_ident(META_SOURCE_EVENT_ID);
     let deleted_at = bq_ident(&metadata.deleted_at);
+    let range_source = table_primary_key_range_source(project, dataset, staging, primary_key);
+    let (range_declaration, target_range_predicate) =
+        primary_key_range_merge_parts(&schema, primary_key, &range_source);
 
     format!(
-        "MERGE `{project}.{dataset}.{target}` T USING (\
+        "{range_declaration}MERGE `{project}.{dataset}.{target}` T USING (\
          SELECT {projection} FROM (\
          SELECT {projection}, ROW_NUMBER() OVER (PARTITION BY {pk} \
          ORDER BY {source_event_at} DESC, {source_event_id} DESC, {deleted_at} DESC) AS _cdsync_rank \
          FROM `{project}.{dataset}.{staging}`) \
-         WHERE _cdsync_rank = 1) S ON T.{pk} = S.{pk} \
+         WHERE _cdsync_rank = 1) S ON T.{pk} = S.{pk}{target_range_predicate} \
          WHEN MATCHED AND (\
              T.{source_event_at} IS NULL \
              OR S.{source_event_at} > T.{source_event_at} \
@@ -1798,17 +1929,23 @@ fn get_query_results_to_query_response(result: QueryResponse) -> Result<QueryRes
 #[cfg(test)]
 mod tests {
     use super::{
-        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, cdc_reducer_merge_sql,
-        drain_cleanup_task_handles, fetch_query_results_response_from_http,
-        get_query_results_to_query_response, merge_query_request_id, query_job_completed,
-        reap_finished_cleanup_task_handles, stable_query_request_id, upsert_staging_table_id,
+        BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, CdcBatchLoadJobStep, bq_fields_from_schema,
+        cdc_reducer_merge_sql, drain_cleanup_task_handles, dynamodb_change_merge_sql,
+        fetch_query_results_response_from_http, get_query_results_to_query_response,
+        merge_query_request_id, primary_key_clustering, query_job_completed,
+        reap_finished_cleanup_task_handles, stable_query_request_id, staging_merge_sql,
+        update_table_for_missing_fields_and_clustering, upsert_staging_table_id,
     };
-    use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
+    use crate::types::{
+        ColumnSchema, DataType, META_SOURCE_EVENT_AT, META_SOURCE_EVENT_ID, MetadataColumns,
+        TableSchema,
+    };
     use gcloud_bigquery::http::error::Error as BqError;
     use gcloud_bigquery::http::job::query::QueryResponse;
     use gcloud_bigquery::http::job::{
         Job, JobConfiguration, JobReference, JobState, JobStatus, JobType,
     };
+    use gcloud_bigquery::http::table::{Clustering, Table, TableSchema as BqTableSchema};
     use serde_json::json;
     use std::future::pending;
     use std::sync::Arc;
@@ -1840,6 +1977,158 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("public__accounts_staging_"));
         assert!(second.starts_with("public__accounts_staging_"));
+    }
+
+    #[test]
+    fn primary_key_clustering_uses_supported_primary_key() {
+        let schema = TableSchema {
+            name: "public__accounts".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "name".to_string(),
+                    data_type: DataType::String,
+                    nullable: true,
+                },
+            ],
+            primary_key: Some("id".to_string()),
+        };
+
+        let clustering = primary_key_clustering(&schema).expect("clusterable primary key");
+        assert_eq!(clustering.fields, vec!["id"]);
+    }
+
+    #[test]
+    fn primary_key_clustering_skips_unsupported_primary_key() {
+        let schema = TableSchema {
+            name: "public__measurements".to_string(),
+            columns: vec![ColumnSchema {
+                name: "score".to_string(),
+                data_type: DataType::Float64,
+                nullable: false,
+            }],
+            primary_key: Some("score".to_string()),
+        };
+
+        assert!(primary_key_clustering(&schema).is_none());
+    }
+
+    #[test]
+    fn existing_table_patch_plan_is_noop_when_schema_and_clustering_match() {
+        let desired_fields = bq_fields_from_schema(&[
+            ColumnSchema {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+            },
+        ]);
+        let clustering = Clustering {
+            fields: vec!["id".to_string()],
+        };
+        let mut table = Table {
+            schema: Some(BqTableSchema {
+                fields: desired_fields.clone(),
+            }),
+            clustering: Some(clustering.clone()),
+            ..Default::default()
+        };
+
+        assert!(!update_table_for_missing_fields_and_clustering(
+            &mut table,
+            &desired_fields,
+            Some(&clustering),
+        ));
+    }
+
+    #[test]
+    fn existing_table_patch_plan_adds_missing_clustering() {
+        let desired_fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }]);
+        let clustering = Clustering {
+            fields: vec!["id".to_string()],
+        };
+        let mut table = Table {
+            schema: Some(BqTableSchema {
+                fields: desired_fields.clone(),
+            }),
+            clustering: None,
+            ..Default::default()
+        };
+
+        assert!(update_table_for_missing_fields_and_clustering(
+            &mut table,
+            &desired_fields,
+            Some(&clustering),
+        ));
+        assert_eq!(table.clustering, Some(clustering));
+    }
+
+    #[test]
+    fn existing_table_patch_plan_adds_missing_schema_fields() {
+        let existing_fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }]);
+        let desired_fields = bq_fields_from_schema(&[
+            ColumnSchema {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+            },
+        ]);
+        let mut table = Table {
+            schema: Some(BqTableSchema {
+                fields: existing_fields,
+            }),
+            ..Default::default()
+        };
+
+        assert!(update_table_for_missing_fields_and_clustering(
+            &mut table,
+            &desired_fields,
+            None,
+        ));
+        assert_eq!(table.schema.expect("patched schema").fields.len(), 2);
+    }
+
+    #[test]
+    fn existing_table_patch_plan_skips_clustering_when_not_desired() {
+        let desired_fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "score".to_string(),
+            data_type: DataType::Float64,
+            nullable: false,
+        }]);
+        let mut table = Table {
+            schema: Some(BqTableSchema {
+                fields: desired_fields.clone(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(!update_table_for_missing_fields_and_clustering(
+            &mut table,
+            &desired_fields,
+            None,
+        ));
+        assert!(table.clustering.is_none());
     }
 
     #[tokio::test]
@@ -1944,6 +2233,96 @@ mod tests {
     }
 
     #[test]
+    fn staging_merge_sql_adds_static_primary_key_range_for_orderable_key() {
+        let sql = staging_merge_sql(
+            "project",
+            "dataset",
+            "public__accounts",
+            "stage_accounts",
+            &TableSchema {
+                name: "public__accounts".to_string(),
+                columns: vec![
+                    ColumnSchema {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        name: "name".to_string(),
+                        data_type: DataType::String,
+                        nullable: true,
+                    },
+                ],
+                primary_key: Some("id".to_string()),
+            },
+            "id",
+        );
+
+        assert!(
+            sql.starts_with("DECLARE _cdsync_pk_range STRUCT<min_pk INT64, max_pk INT64> DEFAULT")
+        );
+        assert!(sql.contains("FROM (SELECT `id` FROM `project.dataset.stage_accounts`)"));
+        assert!(
+            sql.contains(
+                "ON T.`id` = S.`id` AND T.`id` BETWEEN _cdsync_pk_range.min_pk AND _cdsync_pk_range.max_pk"
+            )
+        );
+    }
+
+    #[test]
+    fn staging_merge_sql_adds_static_primary_key_range_for_bool_key() {
+        let sql = staging_merge_sql(
+            "project",
+            "dataset",
+            "public__flags",
+            "stage_flags",
+            &TableSchema {
+                name: "public__flags".to_string(),
+                columns: vec![ColumnSchema {
+                    name: "enabled".to_string(),
+                    data_type: DataType::Bool,
+                    nullable: false,
+                }],
+                primary_key: Some("enabled".to_string()),
+            },
+            "enabled",
+        );
+
+        assert!(
+            sql.starts_with("DECLARE _cdsync_pk_range STRUCT<min_pk BOOL, max_pk BOOL> DEFAULT")
+        );
+        assert!(
+            sql.contains(
+                "ON T.`enabled` = S.`enabled` AND T.`enabled` BETWEEN _cdsync_pk_range.min_pk AND _cdsync_pk_range.max_pk"
+            )
+        );
+    }
+
+    #[test]
+    fn staging_merge_sql_skips_primary_key_range_for_unordered_float_key() {
+        let sql = staging_merge_sql(
+            "project",
+            "dataset",
+            "public__measurements",
+            "stage_measurements",
+            &TableSchema {
+                name: "public__measurements".to_string(),
+                columns: vec![ColumnSchema {
+                    name: "score".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: false,
+                }],
+                primary_key: Some("score".to_string()),
+            },
+            "score",
+        );
+
+        assert!(!sql.contains("DECLARE _cdsync_pk_range"));
+        assert!(!sql.contains("BETWEEN _cdsync_pk_range.min_pk"));
+        assert!(sql.contains("ON T.`score` = S.`score`"));
+    }
+
+    #[test]
     fn cdc_reducer_merge_sql_deduplicates_union_by_latest_sequence() {
         let sql = cdc_reducer_merge_sql(
             "project",
@@ -1993,6 +2372,58 @@ mod tests {
         assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY `id`"));
         assert!(sql.contains("ORDER BY `_cdsync_sequence` DESC, `_cdsync_tx_ordinal` DESC"));
         assert!(sql.contains("WHERE _cdsync_reducer_rank = 1"));
+        assert!(sql.contains("DECLARE _cdsync_pk_range STRUCT<min_pk INT64, max_pk INT64>"));
+        assert!(sql.contains("SELECT `id` FROM `project.dataset.stage_1` UNION ALL SELECT `id` FROM `project.dataset.stage_2`"));
+        assert!(
+            sql.contains(
+                "ON T.`id` = S.`id` AND T.`id` BETWEEN _cdsync_pk_range.min_pk AND _cdsync_pk_range.max_pk"
+            )
+        );
+    }
+
+    #[test]
+    fn dynamodb_change_merge_sql_adds_static_primary_key_range() {
+        let sql = dynamodb_change_merge_sql(
+            "project",
+            "dataset",
+            "sites_revision",
+            "stage_revision",
+            &TableSchema {
+                name: "sites_revision".to_string(),
+                columns: vec![
+                    ColumnSchema {
+                        name: "id".to_string(),
+                        data_type: DataType::String,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        name: META_SOURCE_EVENT_AT.to_string(),
+                        data_type: DataType::Timestamp,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        name: META_SOURCE_EVENT_ID.to_string(),
+                        data_type: DataType::String,
+                        nullable: false,
+                    },
+                ],
+                primary_key: Some("id".to_string()),
+            },
+            &MetadataColumns::default(),
+            "id",
+        );
+
+        assert!(
+            sql.starts_with(
+                "DECLARE _cdsync_pk_range STRUCT<min_pk STRING, max_pk STRING> DEFAULT"
+            )
+        );
+        assert!(sql.contains("FROM (SELECT `id` FROM `project.dataset.stage_revision`)"));
+        assert!(
+            sql.contains(
+                "ON T.`id` = S.`id` AND T.`id` BETWEEN _cdsync_pk_range.min_pk AND _cdsync_pk_range.max_pk"
+            )
+        );
     }
 
     #[test]

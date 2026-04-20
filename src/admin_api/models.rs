@@ -62,6 +62,7 @@ pub(super) struct ProgressResponse {
     pub(super) cdc: ConnectionCdcSnapshot,
     pub(super) dynamodb_follow: Option<DynamoDbFollowSnapshot>,
     pub(super) cdc_progress: Option<CdcProgressInsight>,
+    pub(super) cdc_batch_load_runtime: Option<CdcBatchLoadRuntimeConfig>,
     pub(super) batch_load_queue: Option<CdcBatchLoadQueueSummary>,
     pub(super) cdc_coordinator: Option<CdcCoordinatorSummary>,
     pub(super) tables: Vec<TableProgress>,
@@ -94,6 +95,15 @@ pub(super) struct CdcProgressInsight {
     pub(super) running_jobs: Option<i64>,
     pub(super) jobs_per_minute: Option<i64>,
     pub(super) rows_per_minute: Option<i64>,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct CdcBatchLoadRuntimeConfig {
+    pub(super) queue_enabled: bool,
+    pub(super) reducer_enabled: bool,
+    pub(super) reducer_max_jobs: usize,
+    pub(super) staging_worker_count: usize,
+    pub(super) reducer_worker_count: usize,
 }
 
 #[derive(Clone, Serialize)]

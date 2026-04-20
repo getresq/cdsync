@@ -544,11 +544,15 @@ impl PostgresConfig {
     }
 
     pub fn cdc_batch_load_reducer_max_jobs(&self) -> usize {
-        if self.cdc_batch_load_reducer_enabled.unwrap_or(true) {
+        if self.cdc_batch_load_reducer_enabled() {
             self.cdc_batch_load_reducer_max_jobs.unwrap_or(16).max(1)
         } else {
             1
         }
+    }
+
+    pub fn cdc_batch_load_reducer_enabled(&self) -> bool {
+        self.cdc_batch_load_reducer_enabled.unwrap_or(true)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
