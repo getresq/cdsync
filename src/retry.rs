@@ -276,6 +276,10 @@ pub fn classify_sync_retry(error: &Error) -> SyncRetryClass {
         return SyncRetryClass::Backpressure;
     }
 
+    if message.contains("destination deleted/expired during operation") {
+        return SyncRetryClass::Transient;
+    }
+
     if let Some(classification) = classify_bigquery_reason_from_message(&message) {
         return classification;
     }
@@ -405,6 +409,15 @@ mod tests {
             "BigQuery query job merge_abc failed bigquery_reason=rateLimitExceeded: {{\"status\":{{}}}}"
         );
         assert_eq!(classify_sync_retry(&quota), SyncRetryClass::Backpressure);
+    }
+
+    #[test]
+    fn classify_sync_retry_treats_deleted_destination_loads_as_transient() {
+        let err = anyhow::anyhow!(
+            "BigQuery load job cdsync_load_7f5a308c41f5aa7083db5ddb failed bigquery_reason=invalid: {{\"status\":{{\"errorResult\":{{\"message\":\"Destination deleted/expired during operation: project:dataset.stage_table\",\"reason\":\"invalid\"}}}}}}"
+        );
+
+        assert_eq!(classify_sync_retry(&err), SyncRetryClass::Transient);
     }
 
     #[test]

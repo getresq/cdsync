@@ -869,6 +869,32 @@ impl CdcBatchLoadManager {
             first_sequence = job.record.first_sequence,
             step_count = job.payload.steps.len()
         );
+        let (heartbeat_stop_tx, mut heartbeat_stop_rx) = oneshot::channel();
+        let heartbeat_handle = {
+            let state_handle = self.state_handle.clone();
+            let heartbeat_job_id = job_id.clone();
+            let heartbeat_table = table_key.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL) => {
+                            if let Err(err) = state_handle.heartbeat_cdc_batch_load_job(&heartbeat_job_id).await {
+                                warn!(
+                                    component = "consumer",
+                                    event = "cdc_consumer_staging_job_heartbeat_failed",
+                                    connection_id = state_handle.connection_id(),
+                                    job_id = %heartbeat_job_id,
+                                    table = %heartbeat_table,
+                                    error = %err,
+                                    "failed to heartbeat queued CDC batch-load staging job"
+                                );
+                            }
+                        }
+                        _ = &mut heartbeat_stop_rx => break,
+                    }
+                }
+            })
+        };
         let result = self
             .inner
             .stage_cdc_batch_load_job(
@@ -878,6 +904,8 @@ impl CdcBatchLoadManager {
             )
             .instrument(span)
             .await;
+        let _ = heartbeat_stop_tx.send(());
+        let _ = heartbeat_handle.await;
         match result {
             Ok(()) => {
                 info!(

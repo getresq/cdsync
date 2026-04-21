@@ -1248,6 +1248,69 @@ async fn postgres_state_store_loads_retryable_failed_jobs_for_durable_retry() ->
 }
 
 #[tokio::test]
+async fn postgres_state_store_staging_heartbeat_keeps_claimed_job_fresh() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: "job-staging-heartbeat".to_string(),
+                table_key: "public__accounts".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Pending,
+                stage: CdcLedgerStage::Received,
+                payload_json: "{}".to_string(),
+                attempt_count: 0,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            },
+            &[],
+        )
+        .await?;
+
+    let claimed = handle
+        .claim_next_cdc_batch_load_staging_job(now)
+        .await?
+        .expect("expected initial staging claim");
+    assert_eq!(claimed.attempt_count, 1);
+    assert_eq!(claimed.stage, CdcLedgerStage::Staged);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    handle.heartbeat_cdc_batch_load_job(&claimed.job_id).await?;
+
+    let jobs = store
+        .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    let refreshed = &jobs[0];
+    assert!(refreshed.updated_at > claimed.updated_at);
+    assert_eq!(refreshed.stage, CdcLedgerStage::Staged);
+
+    assert!(
+        handle
+            .claim_next_cdc_batch_load_staging_job(refreshed.updated_at - 1)
+            .await?
+            .is_none()
+    );
+
+    let reclaimed = handle
+        .claim_next_cdc_batch_load_staging_job(refreshed.updated_at + 1)
+        .await?
+        .expect("expected stale staging job reclaim");
+    assert_eq!(reclaimed.job_id, claimed.job_id);
+    assert_eq!(reclaimed.attempt_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn postgres_state_store_batch_load_queue_summary_classifies_failed_jobs() -> anyhow::Result<()>
 {
     let Some(config) = test_state_config() else {

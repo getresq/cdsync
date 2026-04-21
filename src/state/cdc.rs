@@ -639,7 +639,10 @@ impl SyncStateStore {
             set updated_at = $3
             where connection_id = $1
               and job_id = any($2)
-              and status = $4
+              and (
+                status = $4
+                or (status = $5 and stage = $6)
+              )
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -647,6 +650,8 @@ impl SyncStateStore {
         .bind(job_ids)
         .bind(now_millis())
         .bind(CdcBatchLoadJobStatus::Running.as_str())
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcLedgerStage::Staged.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
