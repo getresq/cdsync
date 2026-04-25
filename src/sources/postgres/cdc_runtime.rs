@@ -25,6 +25,22 @@ async fn load_next_cdc_commit_sequence(state_handle: Option<&StateHandle>) -> Re
     Ok(next_cdc_commit_sequence_from_watermark(watermark.as_ref()))
 }
 
+async fn cached_cdc_table_schema(
+    store: &MemoryStore,
+    cache: &mut HashMap<TableId, Arc<EtlTableSchema>>,
+    table_id: TableId,
+) -> Result<Option<Arc<EtlTableSchema>>> {
+    if let Some(schema) = cache.get(&table_id) {
+        return Ok(Some(schema.clone()));
+    }
+
+    let schema = store.get_table_schema(&table_id).await?;
+    if let Some(schema) = &schema {
+        cache.insert(table_id, schema.clone());
+    }
+    Ok(schema)
+}
+
 impl PostgresSource {
     pub(super) async fn stream_cdc_changes(
         &self,
@@ -70,6 +86,7 @@ impl PostgresSource {
 
         let mut pending_events: Vec<Event> = Vec::with_capacity(max_pending_events.min(1024));
         let mut pending_stats: HashMap<TableId, usize> = HashMap::new();
+        let mut tx_schema_cache: HashMap<TableId, Arc<EtlTableSchema>> = HashMap::new();
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
         let mut last_feedback_lsn = start_lsn;
@@ -556,6 +573,7 @@ impl PostgresSource {
                             expected_commit_lsn = Some(etl::types::PgLsn::from(begin.final_lsn()));
                             pending_events.clear();
                             pending_stats.clear();
+                            tx_schema_cache.clear();
                         }
                         LogicalReplicationMessage::Commit(commit) => {
                             let commit_lsn = etl::types::PgLsn::from(commit.commit_lsn());
@@ -572,6 +590,7 @@ impl PostgresSource {
                             let table_batches =
                                 split_commit_events_by_table(std::mem::take(&mut pending_events));
                             let stats_by_table = std::mem::take(&mut pending_stats);
+                            tx_schema_cache.clear();
                             let extract_ms = tx_extract_started_at
                                 .take()
                                 .map(|started_at| started_at.elapsed().as_millis() as u64)
@@ -900,10 +919,10 @@ impl PostgresSource {
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let tx_ordinal = next_tx_ordinal;
                             next_tx_ordinal = next_tx_ordinal.saturating_add(1);
-                            let schema = store
-                                .get_table_schema(&table_id)
-                                .await?
-                                .context("missing schema for insert")?;
+                            let schema =
+                                cached_cdc_table_schema(store, &mut tx_schema_cache, table_id)
+                                    .await?
+                                    .context("missing schema for insert")?;
                             let table_row = tuple_to_row(
                                 &schema.column_schemas,
                                 insert.tuple().tuple_data(),
@@ -933,10 +952,10 @@ impl PostgresSource {
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let tx_ordinal = next_tx_ordinal;
                             next_tx_ordinal = next_tx_ordinal.saturating_add(1);
-                            let schema = store
-                                .get_table_schema(&table_id)
-                                .await?
-                                .context("missing schema for update")?;
+                            let schema =
+                                cached_cdc_table_schema(store, &mut tx_schema_cache, table_id)
+                                    .await?
+                                    .context("missing schema for update")?;
                             let is_key = update.old_tuple().is_none();
                             let old_tuple = update.old_tuple().or(update.key_tuple());
                             let old_table_row = old_tuple
@@ -979,10 +998,10 @@ impl PostgresSource {
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
                             let tx_ordinal = next_tx_ordinal;
                             next_tx_ordinal = next_tx_ordinal.saturating_add(1);
-                            let schema = store
-                                .get_table_schema(&table_id)
-                                .await?
-                                .context("missing schema for delete")?;
+                            let schema =
+                                cached_cdc_table_schema(store, &mut tx_schema_cache, table_id)
+                                    .await?
+                                    .context("missing schema for delete")?;
                             let is_key = delete.old_tuple().is_none();
                             let old_tuple = delete.old_tuple().or(delete.key_tuple());
                             let old_table_row = old_tuple
@@ -1039,6 +1058,8 @@ impl PostgresSource {
                 last_received_lsn,
                 last_flushed_lsn,
                 pending_events.len(),
+                &pending_stats,
+                table_configs,
                 queued_batches.len(),
                 pending_table_batches.len(),
                 inflight_dispatch.len() + inflight_apply.len(),

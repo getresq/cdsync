@@ -129,6 +129,36 @@ fn next_cdc_wait_timeout_falls_back_to_idle_when_apply_slots_are_full() {
 }
 
 #[test]
+fn cdc_pending_table_stats_summary_orders_hot_tables() {
+    let mut pending_stats = HashMap::new();
+    pending_stats.insert(TableId::new(10), 5);
+    pending_stats.insert(TableId::new(20), 42);
+    pending_stats.insert(TableId::new(30), 7);
+
+    let mut table_configs = HashMap::new();
+    table_configs.insert(
+        TableId::new(20),
+        ResolvedPostgresTable {
+            name: "public.hot_table".to_string(),
+            primary_key: "id".to_string(),
+            updated_at_column: None,
+            soft_delete: false,
+            soft_delete_column: None,
+            where_clause: None,
+            columns: ColumnSelection {
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+        },
+    );
+
+    assert_eq!(
+        super::cdc_loop::format_cdc_pending_table_stats(&pending_stats, &table_configs),
+        "public.hot_table(20):42,unknown(30):7,unknown(10):5"
+    );
+}
+
+#[test]
 fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
     let mut pending = HashMap::new();
     pending.insert(

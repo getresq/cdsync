@@ -1,6 +1,7 @@
 use super::*;
 
 const CDC_DURABLE_FRONTIER_SCAN_LIMIT: usize = 4096;
+const CDC_PENDING_STATS_TABLE_LIMIT: usize = 8;
 
 pub(super) enum CdcRelationLockWaitProgress<'a> {
     Acquired(tokio::sync::MutexGuard<'a, ()>),
@@ -496,6 +497,8 @@ pub(super) fn maybe_log_cdc_loop_heartbeat(
     last_received_lsn: etl::types::PgLsn,
     last_flushed_lsn: etl::types::PgLsn,
     pending_events: usize,
+    pending_stats: &HashMap<TableId, usize>,
+    table_configs: &HashMap<TableId, ResolvedPostgresTable>,
     queued_batches: usize,
     pending_table_batches: usize,
     inflight_apply: usize,
@@ -508,11 +511,13 @@ pub(super) fn maybe_log_cdc_loop_heartbeat(
     if last_heartbeat_log.elapsed() < Duration::from_secs(30) {
         return;
     }
+    let pending_table_stats = format_cdc_pending_table_stats(pending_stats, table_configs);
     info!(
         slot_name = slot_name,
         last_received_lsn = %last_received_lsn,
         last_flushed_lsn = %last_flushed_lsn,
         pending_events,
+        pending_table_stats = %pending_table_stats,
         queued_batches,
         pending_table_batches,
         inflight_apply,
@@ -525,6 +530,36 @@ pub(super) fn maybe_log_cdc_loop_heartbeat(
         "cdc loop heartbeat"
     );
     *last_heartbeat_log = Instant::now();
+}
+
+pub(super) fn format_cdc_pending_table_stats(
+    pending_stats: &HashMap<TableId, usize>,
+    table_configs: &HashMap<TableId, ResolvedPostgresTable>,
+) -> String {
+    if pending_stats.is_empty() {
+        return "-".to_string();
+    }
+
+    let mut entries = pending_stats.iter().collect::<Vec<_>>();
+    entries.sort_by(
+        |(left_table_id, left_count), (right_table_id, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_table_id.into_inner().cmp(&right_table_id.into_inner()))
+        },
+    );
+
+    entries
+        .into_iter()
+        .take(CDC_PENDING_STATS_TABLE_LIMIT)
+        .map(|(table_id, count)| {
+            let table_name = table_configs
+                .get(table_id)
+                .map_or("unknown", |table| table.name.as_str());
+            format!("{}({}):{}", table_name, table_id.into_inner(), count)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(super) async fn finalize_cdc_runtime(
