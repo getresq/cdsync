@@ -308,6 +308,30 @@ pub(super) fn build_cdc_progress_insight(
             "none",
             "Queued CDC work is completing recently".to_string(),
         )
+    } else if cdc.slot_active == Some(false)
+        && cdc.wal_bytes_behind_confirmed.unwrap_or_default()
+            >= CDC_PROGRESS_IDLE_WAL_GAP_WATCH_BYTES
+        && pending_fragments.unwrap_or_default() == 0
+        && pending_jobs.unwrap_or_default() == 0
+        && running_jobs.unwrap_or_default() == 0
+    {
+        (
+            "blocked",
+            "slot_inactive",
+            "Logical replication slot is inactive while WAL is retained; CDSync is not connected to consume or acknowledge WAL"
+                .to_string(),
+        )
+    } else if sequence_lag.unwrap_or_default() > 0
+        && pending_fragments.unwrap_or_default() == 0
+        && pending_jobs.unwrap_or_default() == 0
+        && running_jobs.unwrap_or_default() == 0
+    {
+        (
+            "blocked",
+            "feedback_gap",
+            "CDC sequence lag remains even though no queued or running CDC work is visible; slot feedback is not advancing"
+                .to_string(),
+        )
     } else if cdc.wal_bytes_behind_confirmed.unwrap_or_default()
         >= CDC_PROGRESS_IDLE_WAL_GAP_WATCH_BYTES
         && pending_fragments.unwrap_or_default() == 0

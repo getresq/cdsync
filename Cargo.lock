@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "cdsync"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-compression",

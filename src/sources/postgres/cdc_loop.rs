@@ -1,6 +1,7 @@
 use super::*;
 
 const CDC_DURABLE_FRONTIER_SCAN_LIMIT: usize = 4096;
+const CDC_DURABLE_FRONTIER_ADVANCE_TIMEOUT: Duration = Duration::from_secs(1);
 const CDC_PENDING_STATS_TABLE_LIMIT: usize = 8;
 
 pub(super) enum CdcRelationLockWaitProgress<'a> {
@@ -189,9 +190,9 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
     coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
     coordinator_state_rx: &watch::Receiver<CdcCoordinatorRuntimeState>,
     state_handle: Option<&StateHandle>,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let Some(state_handle) = state_handle else {
-        return Ok(());
+        return Ok(None);
     };
     let coordinator_sequence = coordinator_state_rx.borrow().next_sequence_to_ack;
     let feedback_state = state_handle.load_cdc_feedback_state().await?;
@@ -201,10 +202,13 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
         .load_cdc_durable_apply_frontier(from_sequence, CDC_DURABLE_FRONTIER_SCAN_LIMIT)
         .await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     if frontier.next_sequence_to_ack <= from_sequence {
-        return Ok(());
+        return Ok(None);
+    }
+    if frontier.next_sequence_to_ack < coordinator_sequence {
+        return Ok(None);
     }
     let sequence_count = frontier.next_sequence_to_ack.saturating_sub(from_sequence);
     let commit_lsn = frontier.commit_lsn.parse().map_err(|_| {
@@ -226,7 +230,7 @@ pub(super) async fn submit_cdc_durable_frontier_acks(
             commit_lsn,
         })
         .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
-    Ok(())
+    Ok(Some(frontier.next_sequence_to_ack))
 }
 
 fn durable_frontier_scan_start_sequence(
@@ -288,8 +292,12 @@ pub(super) async fn drain_ready_cdc_coordinator_advances(
     last_received_lsn: etl::types::PgLsn,
     last_flushed_lsn: &mut etl::types::PgLsn,
 ) -> Result<()> {
-    submit_cdc_durable_frontier_acks(coordinator_tx, coordinator_state_rx, state_handle).await?;
-    while let Ok(advance) = coordinator_advances_rx.try_recv() {
+    let required_frontier =
+        submit_cdc_durable_frontier_acks(coordinator_tx, coordinator_state_rx, state_handle)
+            .await?;
+    let advances =
+        collect_ready_cdc_coordinator_advances(coordinator_advances_rx, required_frontier).await?;
+    for advance in advances {
         apply_cdc_watermark_advance(
             advance,
             &mut CdcWatermarkRuntime {
@@ -305,6 +313,54 @@ pub(super) async fn drain_ready_cdc_coordinator_advances(
         .await?;
     }
     Ok(())
+}
+
+pub(super) async fn collect_ready_cdc_coordinator_advances(
+    coordinator_advances_rx: &mut mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
+    required_frontier: Option<u64>,
+) -> Result<Vec<CdcWatermarkAdvance>> {
+    let mut advances = Vec::new();
+    let mut required_seen = required_frontier.is_none();
+
+    loop {
+        match coordinator_advances_rx.try_recv() {
+            Ok(advance) => {
+                if required_frontier
+                    .is_some_and(|frontier| advance.next_sequence_to_ack >= frontier)
+                {
+                    required_seen = true;
+                }
+                advances.push(advance);
+            }
+            Err(mpsc::error::TryRecvError::Empty) if required_seen => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                let required_frontier = required_frontier
+                    .expect("required frontier should exist until it has been seen");
+                let advance = timeout(
+                    CDC_DURABLE_FRONTIER_ADVANCE_TIMEOUT,
+                    coordinator_advances_rx.recv(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "CDC coordinator did not emit durable frontier advance to {required_frontier} within {}s after durable frontier was seen",
+                        CDC_DURABLE_FRONTIER_ADVANCE_TIMEOUT.as_secs()
+                    )
+                })?
+                .context("CDC coordinator task stopped")?;
+                if advance.next_sequence_to_ack >= required_frontier {
+                    required_seen = true;
+                }
+                advances.push(advance);
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) if required_seen => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                anyhow::bail!("CDC coordinator task stopped");
+            }
+        }
+    }
+
+    Ok(advances)
 }
 
 pub(super) fn dispatch_cdc_batches_and_record(
@@ -985,15 +1041,98 @@ mod tests {
             fragment_count: 1,
         })?;
 
-        submit_cdc_durable_frontier_acks(&coordinator_tx, &state_rx, Some(&state_handle)).await?;
-        let advance = timeout(Duration::from_secs(1), advances_rx.recv())
-            .await?
+        let submitted =
+            submit_cdc_durable_frontier_acks(&coordinator_tx, &state_rx, Some(&state_handle))
+                .await?;
+        assert_eq!(submitted, Some(11));
+
+        let advances = collect_ready_cdc_coordinator_advances(&mut advances_rx, submitted).await?;
+        let advance = advances
+            .last()
             .context("durable frontier should advance replayed commit")?;
         assert_eq!(advance.next_sequence_to_ack, 11);
         assert_eq!(advance.commit_lsn, etl::types::PgLsn::from(0x0A_u64));
 
         drop(coordinator_tx);
         task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_frontier_scan_ignores_frontier_stale_to_memory() -> anyhow::Result<()> {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        crate::state::SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&config, 16).await?;
+        let state_handle = store.handle("app");
+        state_handle
+            .save_cdc_feedback_state(&crate::state::CdcWatermarkState {
+                next_sequence_to_ack: 10,
+                ..Default::default()
+            })
+            .await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let job = crate::state::CdcBatchLoadJobRecord {
+            job_id: "job-stale-to-memory".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: crate::state::CdcBatchLoadJobStatus::Succeeded,
+            stage: crate::state::CdcLedgerStage::Applied,
+            payload_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        let fragment = crate::state::CdcCommitFragmentRecord {
+            fragment_id: "job-stale-to-memory:10".to_string(),
+            job_id: job.job_id.clone(),
+            sequence: 10,
+            commit_lsn: "0/A".to_string(),
+            table_key: job.table_key.clone(),
+            status: crate::state::CdcCommitFragmentStatus::Succeeded,
+            stage: crate::state::CdcLedgerStage::Applied,
+            row_count: 1,
+            upserted_count: 1,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        state_handle
+            .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+            .await?;
+
+        let (coordinator_tx, _advances_rx, state_rx, task) = spawn_cdc_coordinator(12);
+
+        let submitted =
+            submit_cdc_durable_frontier_acks(&coordinator_tx, &state_rx, Some(&state_handle))
+                .await?;
+
+        assert_eq!(submitted, None);
+        drop(coordinator_tx);
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_frontier_drain_waits_for_submitted_coordinator_advance() -> anyhow::Result<()>
+    {
+        let (advance_tx, mut advances_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = advance_tx.send(CdcWatermarkAdvance {
+                commit_lsn: etl::types::PgLsn::from(0x0B_u64),
+                stats: HashMap::new(),
+                extract_ms: 0,
+                next_sequence_to_ack: 12,
+            });
+        });
+
+        let advances = collect_ready_cdc_coordinator_advances(&mut advances_rx, Some(12)).await?;
+
+        assert_eq!(advances.len(), 1);
+        assert_eq!(advances[0].next_sequence_to_ack, 12);
+        assert_eq!(advances[0].commit_lsn, etl::types::PgLsn::from(0x0B_u64));
         Ok(())
     }
 

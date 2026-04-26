@@ -819,6 +819,97 @@ fn cdc_progress_insight_ignores_tiny_idle_wal_gap() {
 }
 
 #[test]
+fn cdc_progress_insight_blocks_sequence_lag_without_visible_work() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(true),
+        current_wal_lsn: Some("0/20".to_string()),
+        restart_lsn: Some("0/10".to_string()),
+        confirmed_flush_lsn: Some("0/10".to_string()),
+        wal_bytes_retained_by_slot: Some(1_000_000),
+        wal_bytes_behind_confirmed: Some(1_000_000),
+    };
+    let coordinator = CdcCoordinatorSummary {
+        sequence_lag: Some(31),
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(
+        &cdc,
+        Some(&CdcBatchLoadQueueSummary::default()),
+        Some(&coordinator),
+    )
+    .expect("progress insight");
+
+    assert_eq!(insight.status, "blocked");
+    assert_eq!(insight.primary_blocker, "feedback_gap");
+    assert_eq!(
+        insight.detail,
+        "CDC sequence lag remains even though no queued or running CDC work is visible; slot feedback is not advancing"
+    );
+}
+
+#[test]
+fn cdc_progress_insight_blocks_inactive_slot_with_retained_wal() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(false),
+        current_wal_lsn: Some("0/20".to_string()),
+        restart_lsn: Some("0/10".to_string()),
+        confirmed_flush_lsn: Some("0/10".to_string()),
+        wal_bytes_retained_by_slot: Some(1_000_000),
+        wal_bytes_behind_confirmed: Some(1_000_000),
+    };
+
+    let insight = build_cdc_progress_insight(
+        &cdc,
+        Some(&CdcBatchLoadQueueSummary::default()),
+        Some(&CdcCoordinatorSummary::default()),
+    )
+    .expect("progress insight");
+
+    assert_eq!(insight.status, "blocked");
+    assert_eq!(insight.primary_blocker, "slot_inactive");
+    assert_eq!(
+        insight.detail,
+        "Logical replication slot is inactive while WAL is retained; CDSync is not connected to consume or acknowledge WAL"
+    );
+}
+
+#[test]
+fn cdc_progress_insight_prioritizes_inactive_slot_over_sequence_lag() {
+    let cdc = ConnectionCdcSnapshot {
+        sampler_status: "ok",
+        sampled_at: None,
+        slot_name: Some("slot".to_string()),
+        slot_active: Some(false),
+        current_wal_lsn: Some("0/20".to_string()),
+        restart_lsn: Some("0/10".to_string()),
+        confirmed_flush_lsn: Some("0/10".to_string()),
+        wal_bytes_retained_by_slot: Some(1_000_000),
+        wal_bytes_behind_confirmed: Some(1_000_000),
+    };
+    let coordinator = CdcCoordinatorSummary {
+        sequence_lag: Some(31),
+        ..Default::default()
+    };
+
+    let insight = build_cdc_progress_insight(
+        &cdc,
+        Some(&CdcBatchLoadQueueSummary::default()),
+        Some(&coordinator),
+    )
+    .expect("progress insight");
+
+    assert_eq!(insight.status, "blocked");
+    assert_eq!(insight.primary_blocker, "slot_inactive");
+}
+
+#[test]
 fn cdc_progress_insight_watches_large_idle_wal_gap_without_blocker() {
     let cdc = ConnectionCdcSnapshot {
         sampler_status: "ok",
