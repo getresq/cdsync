@@ -345,7 +345,9 @@ pub struct PostgresConfig {
     pub cdc_batch_load_reducer_worker_count: Option<usize>,
     pub cdc_max_inflight_commits: Option<usize>,
     pub cdc_batch_load_reducer_max_jobs: Option<usize>,
+    pub cdc_batch_load_reducer_max_fill_ms: Option<u64>,
     pub cdc_batch_load_reducer_enabled: Option<bool>,
+    pub cdc_ack_boundary: Option<CdcAckBoundary>,
     pub cdc_backlog_max_pending_fragments: Option<usize>,
     pub cdc_backlog_max_oldest_pending_seconds: Option<u64>,
     pub cdc_max_fill_ms: Option<u64>,
@@ -488,6 +490,13 @@ pub enum DynamoDbAttributeType {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdcAckBoundary {
+    TargetApply,
+    DurableEnqueue,
+}
+
 impl DynamoDbAttributeType {
     fn to_data_type(&self) -> crate::types::DataType {
         match self {
@@ -551,8 +560,19 @@ impl PostgresConfig {
         }
     }
 
+    pub fn cdc_batch_load_reducer_max_fill_ms(&self) -> u64 {
+        if !self.cdc_batch_load_reducer_enabled() || self.cdc_batch_load_reducer_max_jobs() <= 1 {
+            return 0;
+        }
+        self.cdc_batch_load_reducer_max_fill_ms.unwrap_or(0)
+    }
+
     pub fn cdc_batch_load_reducer_enabled(&self) -> bool {
         self.cdc_batch_load_reducer_enabled.unwrap_or(true)
+    }
+
+    pub fn cdc_ack_boundary(&self) -> CdcAckBoundary {
+        self.cdc_ack_boundary.unwrap_or(CdcAckBoundary::TargetApply)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -750,7 +770,13 @@ connections:
       # This is the current in-memory read-ahead cap, not the future durable backlog budget.
       # cdc_max_inflight_commits: 32
       # cdc_batch_load_reducer_max_jobs: 16
+      # Defaults to 0 for immediate claim. Set above 0 to let same-table
+      # reducer windows coalesce before BigQuery MERGE.
+      # cdc_batch_load_reducer_max_fill_ms: 5000
       # cdc_batch_load_reducer_enabled: true
+      # ACK Postgres after target apply by default. durable_enqueue is experimental:
+      # it ACKs after durable CDC landing and materializes BigQuery asynchronously.
+      # cdc_ack_boundary: target_apply
       # Optional durable backlog backpressure caps.
       # cdc_backlog_max_pending_fragments: 10000
       # cdc_backlog_max_oldest_pending_seconds: 300
@@ -975,7 +1001,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1008,7 +1036,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1041,7 +1071,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1074,7 +1106,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1107,7 +1141,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1141,7 +1177,9 @@ connections:
             cdc_batch_load_reducer_worker_count: Some(4),
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1175,7 +1213,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1208,7 +1248,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: Some(128),
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1241,7 +1283,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1253,7 +1297,9 @@ connections:
         };
         let override_config = PostgresConfig {
             cdc_batch_load_reducer_max_jobs: Some(64),
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             ..default_config.clone()
@@ -1261,6 +1307,56 @@ connections:
 
         assert_eq!(default_config.cdc_batch_load_reducer_max_jobs(), 16);
         assert_eq!(override_config.cdc_batch_load_reducer_max_jobs(), 64);
+    }
+
+    #[test]
+    fn cdc_batch_load_reducer_max_fill_defaults_to_immediate_and_honors_override() {
+        let default_config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: Some(32),
+            cdc_batch_load_reducer_max_fill_ms: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: Some(5_000),
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+        let override_config = PostgresConfig {
+            cdc_batch_load_reducer_max_fill_ms: Some(750),
+            ..default_config.clone()
+        };
+        let disabled_config = PostgresConfig {
+            cdc_batch_load_reducer_enabled: Some(false),
+            ..default_config.clone()
+        };
+        let single_job_config = PostgresConfig {
+            cdc_batch_load_reducer_max_jobs: Some(1),
+            ..default_config.clone()
+        };
+
+        assert_eq!(default_config.cdc_batch_load_reducer_max_fill_ms(), 0);
+        assert_eq!(override_config.cdc_batch_load_reducer_max_fill_ms(), 750);
+        assert_eq!(disabled_config.cdc_batch_load_reducer_max_fill_ms(), 0);
+        assert_eq!(single_job_config.cdc_batch_load_reducer_max_fill_ms(), 0);
     }
 
     #[test]
@@ -1282,7 +1378,9 @@ connections:
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: Some(64),
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: Some(false),
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -1294,6 +1392,52 @@ connections:
         };
 
         assert_eq!(config.cdc_batch_load_reducer_max_jobs(), 1);
+    }
+
+    #[test]
+    fn cdc_ack_boundary_defaults_to_target_apply_and_honors_override() {
+        let default_config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+        let durable_config = PostgresConfig {
+            cdc_ack_boundary: Some(CdcAckBoundary::DurableEnqueue),
+            ..default_config.clone()
+        };
+
+        assert_eq!(
+            default_config.cdc_ack_boundary(),
+            CdcAckBoundary::TargetApply
+        );
+        assert_eq!(
+            durable_config.cdc_ack_boundary(),
+            CdcAckBoundary::DurableEnqueue
+        );
     }
 
     #[test]
@@ -1323,7 +1467,9 @@ connections:
                     cdc_batch_load_reducer_worker_count: None,
                     cdc_max_inflight_commits: None,
                     cdc_batch_load_reducer_max_jobs: None,
+                    cdc_batch_load_reducer_max_fill_ms: None,
                     cdc_batch_load_reducer_enabled: None,
+                    cdc_ack_boundary: None,
                     cdc_backlog_max_pending_fragments: None,
                     cdc_backlog_max_oldest_pending_seconds: None,
                     cdc_max_fill_ms: None,
@@ -1394,7 +1540,9 @@ connections:
                     cdc_batch_load_reducer_worker_count: None,
                     cdc_max_inflight_commits: None,
                     cdc_batch_load_reducer_max_jobs: None,
+                    cdc_batch_load_reducer_max_fill_ms: None,
                     cdc_batch_load_reducer_enabled: None,
+                    cdc_ack_boundary: None,
                     cdc_backlog_max_pending_fragments: None,
                     cdc_backlog_max_oldest_pending_seconds: None,
                     cdc_max_fill_ms: None,

@@ -208,6 +208,7 @@ pub struct CdcCommitFragmentRecord {
     pub table_key: String,
     pub status: CdcCommitFragmentStatus,
     pub stage: CdcLedgerStage,
+    pub expected_fragments: i64,
     pub row_count: i64,
     pub upserted_count: i64,
     pub deleted_count: i64,

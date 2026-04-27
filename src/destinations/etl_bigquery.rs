@@ -1,3 +1,4 @@
+use crate::config::CdcAckBoundary;
 use crate::destinations::bigquery::{
     BigQueryDestination, CdcBatchLoadJobPayload, CdcBatchLoadJobStep,
 };
@@ -35,7 +36,6 @@ mod frame;
 mod queue;
 
 use self::frame::*;
-use self::queue::CdcApplyReadiness;
 
 #[derive(Clone)]
 pub struct EtlBigQueryDestination {
@@ -115,9 +115,14 @@ struct CdcQueuedBatchLoadWindow {
 pub(crate) struct CdcCommitFragmentMeta {
     pub(crate) sequence: u64,
     pub(crate) commit_lsn: String,
+    pub(crate) expected_fragments: usize,
 }
 
 type CdcBatchLoadJobWaiters = HashMap<String, Vec<oneshot::Sender<EtlResult<()>>>>;
+
+fn cdc_batch_load_waits_for_target_apply(ack_boundary: CdcAckBoundary) -> bool {
+    ack_boundary == CdcAckBoundary::TargetApply
+}
 
 #[derive(Clone)]
 struct CdcBatchLoadManager {
@@ -127,7 +132,9 @@ struct CdcBatchLoadManager {
     mixed_mode_gate_enabled: Arc<AtomicBool>,
     waiters: Arc<Mutex<CdcBatchLoadJobWaiters>>,
     notify: Arc<Notify>,
+    ack_boundary: CdcAckBoundary,
     reducer_max_jobs: usize,
+    reducer_max_fill: Duration,
     local_retry_retryable_failures: bool,
 }
 
@@ -227,6 +234,8 @@ impl EtlBigQueryDestination {
         cdc_batch_load_staging_worker_count: usize,
         cdc_batch_load_reducer_worker_count: usize,
         cdc_batch_load_reducer_max_jobs: usize,
+        cdc_batch_load_reducer_max_fill: Duration,
+        cdc_ack_boundary: CdcAckBoundary,
         state_handle: Option<StateHandle>,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
@@ -240,6 +249,8 @@ impl EtlBigQueryDestination {
                         cdc_batch_load_staging_worker_count.max(1),
                         cdc_batch_load_reducer_worker_count.max(1),
                         cdc_batch_load_reducer_max_jobs.max(1),
+                        cdc_batch_load_reducer_max_fill,
+                        cdc_ack_boundary,
                         local_retry_retryable_failures,
                     )
                     .await?,
@@ -502,6 +513,8 @@ impl EtlBigQueryDestination {
         let delete_synced_at = synced_at;
 
         if let Some(manager) = &self.cdc_batch_load_manager {
+            let waits_for_target_apply =
+                cdc_batch_load_waits_for_target_apply(manager.ack_boundary());
             let payload = self
                 .prepare_cdc_batch_load_job(
                     &info,
@@ -513,24 +526,16 @@ impl EtlBigQueryDestination {
                 )
                 .await?;
             let first_sequence = fragments.first().map_or(0, |fragment| fragment.sequence);
-            let rx = manager.enqueue(first_sequence, payload, fragments).await?;
-            if queue::should_check_table_apply_readiness(manager.mixed_mode_gate_enabled()) {
-                let readiness = manager
-                    .table_apply_readiness(&info.source_name)
-                    .await
-                    .map_err(|err| {
-                        etl::etl_error!(
-                            ErrorKind::DestinationError,
-                            "failed to inspect CDC table readiness",
-                            err.to_string()
-                        )
-                    })?;
-                if !matches!(readiness, CdcApplyReadiness::Ready) {
-                    return Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate);
-                }
+            let job_id = payload.job_id.clone();
+            let rx = manager
+                .enqueue(first_sequence, payload, fragments, waits_for_target_apply)
+                .await?;
+            if manager.ack_boundary() == CdcAckBoundary::DurableEnqueue {
+                manager.mark_durable_landed(&job_id).await?;
+                return Ok(crate::sources::postgres::CdcTableApplyExecution::Immediate);
             }
             return Ok(crate::sources::postgres::CdcTableApplyExecution::Deferred(
-                rx,
+                rx.expect("target-apply ACK boundary should register a completion waiter"),
             ));
         }
 
@@ -760,6 +765,16 @@ mod tests {
 
         let row = TableRow::new(vec![Cell::I64(3), Cell::Null]);
         assert!(derive_deleted_at_from_row(&info, &row).is_none());
+    }
+
+    #[test]
+    fn cdc_batch_load_target_apply_always_registers_completion_waiter() {
+        assert!(cdc_batch_load_waits_for_target_apply(
+            CdcAckBoundary::TargetApply
+        ));
+        assert!(!cdc_batch_load_waits_for_target_apply(
+            CdcAckBoundary::DurableEnqueue
+        ));
     }
 
     #[test]

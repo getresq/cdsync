@@ -356,6 +356,7 @@ pub(super) fn dispatch_cdc_batches(
                 .push(crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
                     sequence: batch.sequence,
                     commit_lsn: batch.commit_lsn.to_string(),
+                    expected_fragments: fragment_count,
                 });
             pending.event_count += event_count;
             pending.events.extend(table_batch.events);

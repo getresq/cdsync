@@ -882,6 +882,9 @@ impl PostgresSource {
             .config
             .cdc_batch_load_reducer_worker_count(cdc_apply_concurrency);
         let cdc_batch_load_reducer_max_jobs = self.config.cdc_batch_load_reducer_max_jobs();
+        let cdc_batch_load_reducer_max_fill =
+            Duration::from_millis(self.config.cdc_batch_load_reducer_max_fill_ms());
+        let cdc_ack_boundary = self.config.cdc_ack_boundary();
         let cdc_max_inflight_commits = self.config.cdc_max_inflight_commits(cdc_apply_concurrency);
         let cdc_backlog_max_pending_fragments = self.config.cdc_backlog_max_pending_fragments;
         let cdc_backlog_max_oldest_pending = self
@@ -1057,6 +1060,8 @@ impl PostgresSource {
             cdc_batch_load_staging_worker_count,
             cdc_batch_load_reducer_worker_count,
             cdc_batch_load_reducer_max_jobs,
+            cdc_batch_load_reducer_max_fill,
+            cdc_ack_boundary,
             state_handle.clone(),
             follow,
         )

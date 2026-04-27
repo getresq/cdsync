@@ -89,16 +89,27 @@ impl StateHandle {
             .await
     }
 
+    pub async fn mark_cdc_batch_load_fragments_durable_landed(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<u64> {
+        self.store
+            .mark_cdc_batch_load_fragments_durable_landed(&self.connection_id, job_id)
+            .await
+    }
+
     pub async fn claim_next_loaded_cdc_batch_load_job_window_for_apply(
         &self,
         stale_running_before_ms: i64,
         max_jobs: usize,
+        max_fill_ms: i64,
     ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
         self.store
             .claim_next_loaded_cdc_batch_load_job_window_for_apply(
                 &self.connection_id,
                 stale_running_before_ms,
                 max_jobs,
+                max_fill_ms,
             )
             .await
     }

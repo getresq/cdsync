@@ -6,6 +6,7 @@ use cdsync::state::{
 };
 use cdsync::types::{DataType, SchemaFieldSnapshot, SnapshotChunkCheckpoint, TableCheckpoint};
 use chrono::Utc;
+use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 fn test_state_config() -> Option<StateConfig> {
@@ -36,6 +37,34 @@ fn reducer_payload_json(job_id: &str, table: &str) -> String {
         "steps": []
     })
     .to_string()
+}
+
+#[tokio::test]
+async fn postgres_state_store_open_requires_cdc_sequence_ledger() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&config.url)
+        .await?;
+    sqlx::query(&format!(
+        "drop table {}.cdc_commit_sequences",
+        config.schema_name()
+    ))
+    .execute(&pool)
+    .await?;
+
+    let Err(err) = SyncStateStore::open_with_config(&config, 16).await else {
+        anyhow::bail!("opening without cdc_commit_sequences should fail");
+    };
+    assert!(
+        err.to_string().contains("cdc_commit_sequences"),
+        "error should name the missing table: {err}"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -344,7 +373,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
     }
 
     let first = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
         .await?
         .into_iter()
         .next()
@@ -354,7 +383,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
     assert_eq!(first.stage, CdcLedgerStage::Applying);
 
     let second = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
         .await?
         .into_iter()
         .next()
@@ -364,7 +393,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
     assert_eq!(second.stage, CdcLedgerStage::Applying);
 
     let third = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
         .await?;
     assert!(third.is_empty());
 
@@ -405,7 +434,7 @@ async fn postgres_state_store_claims_loaded_apply_window_for_one_table() -> anyh
     }
 
     let window = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
         .await?;
     assert_eq!(
         window
@@ -426,10 +455,628 @@ async fn postgres_state_store_claims_loaded_apply_window_for_one_table() -> anyh
     );
 
     let next = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
         .await?;
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].job_id, "job-b-20");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_loaded_apply_window_waits_for_fill_before_single_job()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: "job-a-10".to_string(),
+                table_key: "table_a".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Pending,
+                stage: CdcLedgerStage::Loaded,
+                payload_json: reducer_payload_json("job-a-10", "table_a"),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            },
+            &[],
+        )
+        .await?;
+
+    let filling = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 60_000)
+        .await?;
+    assert!(filling.is_empty());
+
+    let aged = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
+        .await?;
+    assert_eq!(aged.len(), 1);
+    assert_eq!(aged[0].job_id, "job-a-10");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_loaded_apply_window_claims_full_window_without_wait()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for sequence in [10_u64, 11] {
+        let job_id = format!("job-a-{sequence}");
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.clone(),
+                    table_key: "table_a".to_string(),
+                    first_sequence: sequence,
+                    status: CdcBatchLoadJobStatus::Pending,
+                    stage: CdcLedgerStage::Loaded,
+                    payload_json: reducer_payload_json(&job_id, "table_a"),
+                    created_at: now + sequence as i64,
+                    updated_at: now + sequence as i64,
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await?;
+    }
+
+    let window = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 2, 60_000)
+        .await?;
+    assert_eq!(
+        window
+            .iter()
+            .map(|job| job.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-a-10", "job-a-11"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_loaded_apply_window_skips_filling_head_for_ready_table()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for (job_id, table_key, sequence, updated_at) in [
+        ("job-a-10", "table_a", 10, now),
+        ("job-b-20", "table_b", 20, now - 120_000),
+    ] {
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.to_string(),
+                    table_key: table_key.to_string(),
+                    first_sequence: sequence,
+                    status: CdcBatchLoadJobStatus::Pending,
+                    stage: CdcLedgerStage::Loaded,
+                    payload_json: reducer_payload_json(job_id, table_key),
+                    created_at: updated_at,
+                    updated_at,
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await?;
+    }
+
+    let window = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 60_000)
+        .await?;
+    assert_eq!(window.len(), 1);
+    assert_eq!(window[0].job_id, "job-b-20");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_durable_landing_advances_frontier_before_materialization()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-durable-landed".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        payload_json: reducer_payload_json("job-durable-landed", "table_a"),
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    let fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-durable-landed:10".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 10,
+        commit_lsn: "0/A".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        row_count: 1,
+        upserted_count: 1,
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    handle
+        .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+        .await?;
+
+    let landed = handle
+        .mark_cdc_batch_load_fragments_durable_landed(&job.job_id)
+        .await?;
+    assert_eq!(landed, 1);
+
+    let fragments = store
+        .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Succeeded])
+        .await?;
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].stage, CdcLedgerStage::ApplyPending);
+
+    let frontier = store
+        .load_cdc_durable_apply_frontier("app", 10, 10)
+        .await?
+        .expect("durable landing should advance source ACK frontier");
+    assert_eq!(frontier.next_sequence_to_ack, 11);
+    assert_eq!(frontier.commit_lsn, "0/A");
+
+    let jobs = store
+        .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].stage, CdcLedgerStage::Received);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_replay_cleanup_preserves_durable_landed_jobs() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-durable-landed-cleanup".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        payload_json: reducer_payload_json("job-durable-landed-cleanup", "table_a"),
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    let fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-durable-landed-cleanup:10".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 10,
+        commit_lsn: "0/A".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Succeeded,
+        stage: CdcLedgerStage::ApplyPending,
+        row_count: 1,
+        upserted_count: 1,
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    handle
+        .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+        .await?;
+
+    let cleanup = handle
+        .discard_inflight_cdc_batch_load_state_for_replay()
+        .await?;
+    assert_eq!(cleanup.discarded_jobs, 0);
+    assert_eq!(cleanup.discarded_fragments, 0);
+
+    let jobs = store
+        .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+        .await?;
+    assert_eq!(jobs.len(), 1);
+    let fragments = store
+        .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Succeeded])
+        .await?;
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].stage, CdcLedgerStage::ApplyPending);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_replay_cleanup_discards_partially_landed_jobs() -> anyhow::Result<()>
+{
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-partially-landed-cleanup".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        payload_json: reducer_payload_json("job-partially-landed-cleanup", "table_a"),
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    let landed_fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-partially-landed-cleanup:10".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 10,
+        commit_lsn: "0/A".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Succeeded,
+        stage: CdcLedgerStage::ApplyPending,
+        expected_fragments: 2,
+        row_count: 1,
+        upserted_count: 1,
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    let pending_fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-partially-landed-cleanup:11".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 11,
+        commit_lsn: "0/B".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        expected_fragments: 2,
+        row_count: 1,
+        upserted_count: 1,
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    handle
+        .enqueue_cdc_batch_load_bundle(&job, &[landed_fragment, pending_fragment])
+        .await?;
+
+    let cleanup = handle
+        .discard_inflight_cdc_batch_load_state_for_replay()
+        .await?;
+    assert_eq!(cleanup.discarded_jobs, 1);
+    assert_eq!(cleanup.discarded_fragments, 2);
+
+    assert!(
+        store
+            .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Pending])
+            .await?
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_cdc_commit_fragments(
+                "app",
+                &[
+                    CdcCommitFragmentStatus::Pending,
+                    CdcCommitFragmentStatus::Succeeded,
+                ],
+            )
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_materialization_failure_preserves_durable_landed_frontier()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+    let job = CdcBatchLoadJobRecord {
+        job_id: "job-durable-landed-failed".to_string(),
+        table_key: "table_a".to_string(),
+        first_sequence: 10,
+        status: CdcBatchLoadJobStatus::Pending,
+        stage: CdcLedgerStage::Received,
+        payload_json: reducer_payload_json("job-durable-landed-failed", "table_a"),
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    let fragment = CdcCommitFragmentRecord {
+        fragment_id: "job-durable-landed-failed:10".to_string(),
+        job_id: job.job_id.clone(),
+        sequence: 10,
+        commit_lsn: "0/A".to_string(),
+        table_key: job.table_key.clone(),
+        status: CdcCommitFragmentStatus::Succeeded,
+        stage: CdcLedgerStage::ApplyPending,
+        row_count: 1,
+        upserted_count: 1,
+        created_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    handle
+        .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+        .await?;
+
+    handle
+        .mark_cdc_batch_load_window_failed(
+            std::slice::from_ref(&job.job_id),
+            "permanent materialization failure",
+            SyncRetryClass::Permanent,
+            true,
+        )
+        .await?;
+
+    let failed_jobs = store
+        .load_cdc_batch_load_jobs("app", &[CdcBatchLoadJobStatus::Failed])
+        .await?;
+    assert_eq!(failed_jobs.len(), 1);
+    let succeeded_fragments = store
+        .load_cdc_commit_fragments("app", &[CdcCommitFragmentStatus::Succeeded])
+        .await?;
+    assert_eq!(succeeded_fragments.len(), 1);
+    assert_eq!(succeeded_fragments[0].stage, CdcLedgerStage::ApplyPending);
+    let frontier = store
+        .load_cdc_durable_apply_frontier("app", 10, 10)
+        .await?
+        .expect("durable landing evidence should survive materialization failure");
+    assert_eq!(frontier.next_sequence_to_ack, 11);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_durable_frontier_waits_for_expected_fragments() -> anyhow::Result<()>
+{
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for (job_id, table_key) in [("job-a-10", "table_a"), ("job-b-10", "table_b")] {
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.to_string(),
+                    table_key: table_key.to_string(),
+                    first_sequence: 10,
+                    status: CdcBatchLoadJobStatus::Pending,
+                    stage: CdcLedgerStage::Received,
+                    payload_json: reducer_payload_json(job_id, table_key),
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                },
+                &[CdcCommitFragmentRecord {
+                    fragment_id: format!("{job_id}:10"),
+                    job_id: job_id.to_string(),
+                    sequence: 10,
+                    commit_lsn: "0/A".to_string(),
+                    table_key: table_key.to_string(),
+                    status: CdcCommitFragmentStatus::Succeeded,
+                    stage: CdcLedgerStage::ApplyPending,
+                    expected_fragments: 2,
+                    row_count: 1,
+                    upserted_count: 1,
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                }],
+            )
+            .await?;
+
+        let frontier = store.load_cdc_durable_apply_frontier("app", 10, 10).await?;
+        if job_id == "job-a-10" {
+            assert!(
+                frontier.is_none(),
+                "one landed row must not ACK a two-fragment commit"
+            );
+        } else {
+            assert_eq!(
+                frontier
+                    .expect("both expected fragments landed")
+                    .next_sequence_to_ack,
+                11
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_durable_frontier_counts_distinct_logical_fragments()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for job_id in ["job-a-10-first", "job-a-10-replay"] {
+        handle
+            .enqueue_cdc_batch_load_bundle(
+                &CdcBatchLoadJobRecord {
+                    job_id: job_id.to_string(),
+                    table_key: "table_a".to_string(),
+                    first_sequence: 10,
+                    status: CdcBatchLoadJobStatus::Pending,
+                    stage: CdcLedgerStage::Received,
+                    payload_json: reducer_payload_json(job_id, "table_a"),
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                },
+                &[CdcCommitFragmentRecord {
+                    fragment_id: format!("{job_id}:10"),
+                    job_id: job_id.to_string(),
+                    sequence: 10,
+                    commit_lsn: "0/A".to_string(),
+                    table_key: "table_a".to_string(),
+                    status: CdcCommitFragmentStatus::Succeeded,
+                    stage: CdcLedgerStage::ApplyPending,
+                    expected_fragments: 2,
+                    row_count: 1,
+                    upserted_count: 1,
+                    created_at: now,
+                    updated_at: now,
+                    ..Default::default()
+                }],
+            )
+            .await?;
+    }
+
+    assert!(
+        store
+            .load_cdc_durable_apply_frontier("app", 10, 10)
+            .await?
+            .is_none(),
+        "duplicate landed rows for one table must not satisfy a two-fragment commit"
+    );
+
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                job_id: "job-b-10".to_string(),
+                table_key: "table_b".to_string(),
+                first_sequence: 10,
+                status: CdcBatchLoadJobStatus::Pending,
+                stage: CdcLedgerStage::Received,
+                payload_json: reducer_payload_json("job-b-10", "table_b"),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            },
+            &[CdcCommitFragmentRecord {
+                fragment_id: "job-b-10:10".to_string(),
+                job_id: "job-b-10".to_string(),
+                sequence: 10,
+                commit_lsn: "0/A".to_string(),
+                table_key: "table_b".to_string(),
+                status: CdcCommitFragmentStatus::Succeeded,
+                stage: CdcLedgerStage::ApplyPending,
+                expected_fragments: 2,
+                row_count: 1,
+                upserted_count: 1,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            }],
+        )
+        .await?;
+
+    assert_eq!(
+        store
+            .load_cdc_durable_apply_frontier("app", 10, 10)
+            .await?
+            .expect("distinct table fragments landed")
+            .next_sequence_to_ack,
+        11
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_durable_frontier_requires_sequence_ledger() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let schema = config
+        .schema
+        .as_deref()
+        .expect("test state config should use an isolated schema");
+    let pool = sqlx::PgPool::connect(&config.url).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    sqlx::query(&format!(
+        r#"
+        insert into {schema}.cdc_commit_fragments (
+            connection_id,
+            fragment_id,
+            job_id,
+            sequence,
+            commit_lsn,
+            table_key,
+            status,
+            stage,
+            row_count,
+            upserted_count,
+            deleted_count,
+            created_at,
+            updated_at
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        "#,
+    ))
+    .bind("app")
+    .bind("legacy-fragment-no-sequence-ledger:10")
+    .bind("legacy-fragment-no-sequence-ledger")
+    .bind(10_i64)
+    .bind("0/A")
+    .bind("table_a")
+    .bind("succeeded")
+    .bind("apply_pending")
+    .bind(1_i64)
+    .bind(1_i64)
+    .bind(0_i64)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    assert!(
+        store
+            .load_cdc_durable_apply_frontier("app", 10, 10)
+            .await?
+            .is_none(),
+        "fragment rows without an explicit commit-sequence ledger must not ACK source WAL"
+    );
 
     Ok(())
 }
@@ -469,7 +1116,7 @@ async fn postgres_state_store_loaded_apply_window_stops_at_barrier() -> anyhow::
     }
 
     let window = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
         .await?;
     assert_eq!(window.len(), 1);
     assert_eq!(window[0].job_id, "job-a-10");
@@ -479,7 +1126,7 @@ async fn postgres_state_store_loaded_apply_window_stops_at_barrier() -> anyhow::
         .await?;
 
     let barrier = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
         .await?;
     assert_eq!(barrier.len(), 1);
     assert_eq!(barrier[0].job_id, "job-a-11");
@@ -532,7 +1179,7 @@ async fn postgres_state_store_loaded_apply_window_reclaims_stale_barrier_alone()
     }
 
     let window = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now + 20, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now + 20, 10, 60_000)
         .await?;
     assert_eq!(window.len(), 1);
     assert_eq!(window[0].job_id, "job-a-10");
@@ -595,7 +1242,7 @@ async fn postgres_state_store_loaded_apply_window_does_not_cross_succeeded_barri
     }
 
     let window = handle
-        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10)
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 10, 0)
         .await?;
     assert_eq!(window.len(), 1);
     assert_eq!(window[0].job_id, "job-a-10");

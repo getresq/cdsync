@@ -100,8 +100,10 @@ pub(super) struct CdcProgressInsight {
 #[derive(Clone, Serialize)]
 pub(super) struct CdcBatchLoadRuntimeConfig {
     pub(super) queue_enabled: bool,
+    pub(super) ack_boundary: crate::config::CdcAckBoundary,
     pub(super) reducer_enabled: bool,
     pub(super) reducer_max_jobs: usize,
+    pub(super) reducer_max_fill_ms: u64,
     pub(super) staging_worker_count: usize,
     pub(super) reducer_worker_count: usize,
 }
@@ -213,7 +215,9 @@ pub(super) struct ScrubbedPostgresConfig {
     pub(super) cdc_batch_load_reducer_worker_count: Option<usize>,
     pub(super) cdc_max_inflight_commits: Option<usize>,
     pub(super) cdc_batch_load_reducer_max_jobs: Option<usize>,
+    pub(super) cdc_batch_load_reducer_max_fill_ms: Option<u64>,
     pub(super) cdc_batch_load_reducer_enabled: Option<bool>,
+    pub(super) cdc_ack_boundary: Option<crate::config::CdcAckBoundary>,
     pub(super) cdc_backlog_max_pending_fragments: Option<usize>,
     pub(super) cdc_backlog_max_oldest_pending_seconds: Option<u64>,
     pub(super) cdc_max_fill_ms: Option<u64>,

@@ -160,6 +160,10 @@ fn cdc_batch_load_retry_is_due(record: &CdcBatchLoadJobRecord, now_ms: i64) -> b
     cdc_batch_load_retry_due_at_ms(record) <= now_ms
 }
 
+fn duration_millis_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn cdc_batch_load_apply_attempt_key<'a>(
     records: impl IntoIterator<Item = &'a CdcBatchLoadJobRecord>,
 ) -> String {
@@ -438,6 +442,8 @@ impl CdcBatchLoadManager {
         staging_worker_count: usize,
         reducer_worker_count: usize,
         reducer_max_jobs: usize,
+        reducer_max_fill: Duration,
+        ack_boundary: CdcAckBoundary,
         local_retry_retryable_failures: bool,
     ) -> Result<Self> {
         let manager = Self {
@@ -447,12 +453,27 @@ impl CdcBatchLoadManager {
             mixed_mode_gate_enabled: Arc::new(AtomicBool::new(false)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            ack_boundary,
             reducer_max_jobs: reducer_max_jobs.max(1),
+            reducer_max_fill,
             local_retry_retryable_failures,
         };
-        manager.discard_inflight_jobs_for_replay().await?;
+        if ack_boundary == CdcAckBoundary::TargetApply {
+            manager.discard_inflight_jobs_for_replay().await?;
+        } else {
+            info!(
+                component = "consumer",
+                event = "cdc_consumer_preserved_durable_enqueue_jobs",
+                connection_id = manager.state_handle.connection_id(),
+                "preserved queued CDC batch-load state because Postgres ACKs are bounded by durable enqueue"
+            );
+        }
         manager.start_workers(staging_worker_count.max(1), reducer_worker_count.max(1));
         Ok(manager)
+    }
+
+    pub(super) fn ack_boundary(&self) -> CdcAckBoundary {
+        self.ack_boundary
     }
 
     fn start_workers(&self, staging_worker_count: usize, reducer_worker_count: usize) {
@@ -601,14 +622,20 @@ impl CdcBatchLoadManager {
         first_sequence: u64,
         payload: CdcBatchLoadJobPayload,
         fragments: Vec<CdcCommitFragmentMeta>,
-    ) -> EtlResult<oneshot::Receiver<EtlResult<()>>> {
+        register_waiter: bool,
+    ) -> EtlResult<Option<oneshot::Receiver<EtlResult<()>>>> {
         let now = Utc::now().timestamp_millis();
+        let initial_stage = if self.ack_boundary == CdcAckBoundary::DurableEnqueue {
+            CdcLedgerStage::ApplyPending
+        } else {
+            CdcLedgerStage::Received
+        };
         let record = CdcBatchLoadJobRecord {
             job_id: payload.job_id.clone(),
             table_key: payload.target_table.clone(),
             first_sequence,
             status: CdcBatchLoadJobStatus::Pending,
-            stage: CdcLedgerStage::Received,
+            stage: initial_stage,
             payload_json: serde_json::to_string(&payload).map_err(|err| {
                 etl::etl_error!(
                     ErrorKind::DestinationError,
@@ -656,6 +683,9 @@ impl CdcBatchLoadManager {
                 table_key: record.table_key.clone(),
                 status: CdcCommitFragmentStatus::Pending,
                 stage: CdcLedgerStage::Received,
+                expected_fragments: i64::try_from(fragment.expected_fragments)
+                    .unwrap_or(i64::MAX)
+                    .max(1),
                 row_count: if fragment_count == 1 || index == 0 {
                     total_rows
                 } else {
@@ -683,13 +713,18 @@ impl CdcBatchLoadManager {
                 updated_at: now,
             })
             .collect();
-        let (tx, rx) = oneshot::channel();
-        self.waiters
-            .lock()
-            .await
-            .entry(record.job_id.clone())
-            .or_default()
-            .push(tx);
+        let rx = if register_waiter {
+            let (tx, rx) = oneshot::channel();
+            self.waiters
+                .lock()
+                .await
+                .entry(record.job_id.clone())
+                .or_default()
+                .push(tx);
+            Some(rx)
+        } else {
+            None
+        };
         let persisted_record = match self
             .state_handle
             .enqueue_cdc_batch_load_bundle(&record, &fragment_records)
@@ -697,7 +732,9 @@ impl CdcBatchLoadManager {
         {
             Ok(record) => record,
             Err(err) => {
-                let _ = self.waiters.lock().await.remove(&record.job_id);
+                if register_waiter {
+                    let _ = self.waiters.lock().await.remove(&record.job_id);
+                }
                 return Err(etl::etl_error!(
                     ErrorKind::DestinationError,
                     "failed to persist CDC batch-load job",
@@ -724,13 +761,39 @@ impl CdcBatchLoadManager {
                     job_id = %persisted_record.job_id,
                     "queued CDC batch-load job scheduled for consumer workers"
                 );
-                self.notify.notify_one();
+                if self.ack_boundary == CdcAckBoundary::TargetApply {
+                    self.notify.notify_one();
+                }
             }
             CdcBatchLoadJobStatus::Failed => {
                 unreachable!("failed jobs should be revived or preserved before returning")
             }
         }
         Ok(rx)
+    }
+
+    pub(super) async fn mark_durable_landed(&self, job_id: &str) -> EtlResult<()> {
+        let landed = self
+            .state_handle
+            .mark_cdc_batch_load_fragments_durable_landed(job_id)
+            .await
+            .map_err(|err| {
+                etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "failed to mark CDC batch-load fragments durable landed",
+                    err.to_string()
+                )
+            })?;
+        info!(
+            component = "producer",
+            event = "cdc_producer_marked_durable_landed",
+            connection_id = self.state_handle.connection_id(),
+            job_id,
+            landed_fragments = landed,
+            "marked CDC batch-load fragments durable landed for source ACK"
+        );
+        self.notify.notify_one();
+        Ok(())
     }
 
     async fn claim_next_staging_job(&self) -> EtlResult<Option<CdcQueuedBatchLoadJob>> {
@@ -770,6 +833,7 @@ impl CdcBatchLoadManager {
             .claim_next_loaded_cdc_batch_load_job_window_for_apply(
                 stale_before_ms,
                 self.reducer_max_jobs,
+                duration_millis_i64(self.reducer_max_fill),
             )
             .await
             .map_err(|err| {
@@ -924,8 +988,27 @@ impl CdcBatchLoadManager {
                 self.notify.notify_one();
             }
             Err(err) => {
-                self.fail_job(job.record, &table_key, started_at, &err)
+                let retry_class = classify_sync_retry(&err);
+                let resolve_waiters = should_resolve_cdc_batch_load_waiters(
+                    retry_class,
+                    self.local_retry_retryable_failures,
+                );
+                let waiter_error = err.to_string();
+                if self
+                    .fail_job(job.record, &table_key, started_at, &err)
+                    .await
+                    && resolve_waiters
+                {
+                    self.resolve_job_waiters(&job_id, || {
+                        Err(etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "queued CDC batch-load job failed",
+                            waiter_error.clone()
+                        ))
+                    })
                     .await;
+                }
+                self.notify.notify_one();
             }
         }
     }
@@ -1212,6 +1295,14 @@ impl CdcBatchLoadManager {
         }
     }
 
+    async fn resolve_job_waiters(&self, job_id: &str, mut result: impl FnMut() -> EtlResult<()>) {
+        if let Some(waiters) = self.waiters.lock().await.remove(job_id) {
+            for waiter in waiters {
+                let _ignored = waiter.send(result());
+            }
+        }
+    }
+
     async fn run_apply_job(&self, job: CdcQueuedBatchLoadJob) {
         let job_id = job.record.job_id.clone();
         let table_key = job.record.table_key.clone();
@@ -1394,18 +1485,16 @@ impl CdcBatchLoadManager {
             }
         };
 
-        if resolve_waiters && let Some(waiters) = self.waiters.lock().await.remove(&job_id) {
-            for waiter in waiters {
-                let waiter_result = match &result {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err(etl::etl_error!(
-                        ErrorKind::DestinationError,
-                        "queued CDC batch-load job failed",
-                        err.to_string()
-                    )),
-                };
-                let _ignored = waiter.send(waiter_result);
-            }
+        if resolve_waiters {
+            self.resolve_job_waiters(&job_id, || match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(etl::etl_error!(
+                    ErrorKind::DestinationError,
+                    "queued CDC batch-load job failed",
+                    err.to_string()
+                )),
+            })
+            .await;
         }
         self.notify.notify_one();
     }
@@ -1810,7 +1899,9 @@ mod tests {
             mixed_mode_gate_enabled: Arc::new(AtomicBool::new(false)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            ack_boundary: CdcAckBoundary::TargetApply,
             reducer_max_jobs: 1,
+            reducer_max_fill: Duration::ZERO,
             local_retry_retryable_failures: true,
         };
 
@@ -1902,7 +1993,9 @@ mod tests {
             mixed_mode_gate_enabled: Arc::new(AtomicBool::new(true)),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            ack_boundary: CdcAckBoundary::TargetApply,
             reducer_max_jobs: 1,
+            reducer_max_fill: Duration::ZERO,
             local_retry_retryable_failures: true,
         };
         let payload = CdcBatchLoadJobPayload {

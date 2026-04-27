@@ -40,8 +40,10 @@ pub(super) fn build_cdc_batch_load_runtime_config(
 
     Some(CdcBatchLoadRuntimeConfig {
         queue_enabled: true,
+        ack_boundary: pg.cdc_ack_boundary(),
         reducer_enabled: pg.cdc_batch_load_reducer_enabled(),
         reducer_max_jobs: pg.cdc_batch_load_reducer_max_jobs(),
+        reducer_max_fill_ms: pg.cdc_batch_load_reducer_max_fill_ms(),
         staging_worker_count: pg.cdc_batch_load_staging_worker_count(apply_concurrency),
         reducer_worker_count: pg.cdc_batch_load_reducer_worker_count(apply_concurrency),
     })

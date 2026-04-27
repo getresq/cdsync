@@ -85,6 +85,7 @@ fn next_cdc_wait_timeout_uses_pending_fill_deadline_when_sooner() {
             fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
                 sequence: 1,
                 commit_lsn: "0/1".to_string(),
+                expected_fragments: 1,
             }],
             events: Vec::new(),
             event_count: 1,
@@ -111,6 +112,7 @@ fn next_cdc_wait_timeout_falls_back_to_idle_when_apply_slots_are_full() {
             fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
                 sequence: 1,
                 commit_lsn: "0/1".to_string(),
+                expected_fragments: 1,
             }],
             events: Vec::new(),
             event_count: 1,
@@ -167,6 +169,7 @@ fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
             fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
                 sequence: 1,
                 commit_lsn: "0/1".to_string(),
+                expected_fragments: 1,
             }],
             events: Vec::new(),
             event_count: 1,

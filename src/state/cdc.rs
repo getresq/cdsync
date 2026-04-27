@@ -128,7 +128,37 @@ impl SyncStateStore {
         .await?;
 
         let fragment_table = self.table("cdc_commit_fragments");
+        let sequence_table = self.table("cdc_commit_sequences");
         for fragment in fragments {
+            sqlx::query(&format!(
+                r#"
+                insert into {sequence_table} (
+                    connection_id,
+                    sequence,
+                    commit_lsn,
+                    expected_fragments,
+                    created_at,
+                    updated_at
+                ) values ($1, $2, $3, $4, $5, $6)
+                on conflict(connection_id, sequence) do update set
+                    commit_lsn = excluded.commit_lsn,
+                    expected_fragments = greatest(
+                        {sequence_table}.expected_fragments,
+                        excluded.expected_fragments
+                    ),
+                    updated_at = greatest({sequence_table}.updated_at, excluded.updated_at)
+                "#,
+                sequence_table = sequence_table,
+            ))
+            .bind(connection_id)
+            .bind(saturating_u64_to_i64(fragment.sequence))
+            .bind(&fragment.commit_lsn)
+            .bind(fragment.expected_fragments.max(1))
+            .bind(fragment.created_at)
+            .bind(fragment.updated_at)
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query(&format!(
                 r#"
                 insert into {fragment_table} (
@@ -140,6 +170,7 @@ impl SyncStateStore {
                     table_key,
                     status,
                     stage,
+                    expected_fragments,
                     row_count,
                     upserted_count,
                     deleted_count,
@@ -153,12 +184,16 @@ impl SyncStateStore {
                     ledger_metadata_json,
                     created_at,
                     updated_at
-                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                 on conflict(fragment_id) do update set
                     job_id = excluded.job_id,
                     sequence = excluded.sequence,
                     commit_lsn = excluded.commit_lsn,
                     table_key = excluded.table_key,
+                    expected_fragments = greatest(
+                        coalesce({fragment_table}.expected_fragments, 1),
+                        excluded.expected_fragments
+                    ),
                     status = case
                         when {fragment_table}.status = 'failed' then excluded.status
                         else {fragment_table}.status
@@ -199,6 +234,7 @@ impl SyncStateStore {
                 CdcLedgerStage::normalize_for_fragment_status(fragment.stage, fragment.status)
                     .as_str(),
             )
+            .bind(fragment.expected_fragments.max(1))
             .bind(fragment.row_count)
             .bind(fragment.upserted_count)
             .bind(fragment.deleted_count)
@@ -360,6 +396,86 @@ impl SyncStateStore {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn mark_cdc_batch_load_fragments_durable_landed(
+        &self,
+        connection_id: &str,
+        job_id: &str,
+    ) -> anyhow::Result<u64> {
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(&format!(
+            r#"
+            update {}
+            set status = $3,
+                stage = $4,
+                last_error = null,
+                updated_at = $5
+            where connection_id = $1
+              and job_id = $2
+              and status = $6
+            "#,
+            self.table("cdc_commit_fragments")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .bind(CdcLedgerStage::ApplyPending.as_str())
+        .bind(now)
+        .bind(CdcCommitFragmentStatus::Pending.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let summary = sqlx::query(&format!(
+            r#"
+            select count(*)::bigint as total_fragments,
+                   count(*) filter (where status = $3)::bigint as durable_fragments,
+                   count(*) filter (where status = $4)::bigint as failed_fragments
+            from {}
+            where connection_id = $1
+              and job_id = $2
+            "#,
+            self.table("cdc_commit_fragments")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .bind(CdcCommitFragmentStatus::Failed.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let total_fragments = summary.try_get::<i64, _>("total_fragments")?;
+        let durable_fragments = summary.try_get::<i64, _>("durable_fragments")?;
+        let failed_fragments = summary.try_get::<i64, _>("failed_fragments")?;
+        if total_fragments <= 0 {
+            anyhow::bail!("CDC batch-load job {job_id} has no fragments to mark durable landed");
+        }
+        if failed_fragments > 0 || durable_fragments != total_fragments {
+            anyhow::bail!(
+                "CDC batch-load job {job_id} is not fully durable landed: total={total_fragments} durable={durable_fragments} failed={failed_fragments}"
+            );
+        }
+        sqlx::query(&format!(
+            r#"
+            update {}
+            set stage = $3,
+                updated_at = $4
+            where connection_id = $1
+              and job_id = $2
+              and status = $5
+              and stage = $6
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(job_id)
+        .bind(CdcLedgerStage::Received.as_str())
+        .bind(now)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcLedgerStage::ApplyPending.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn mark_cdc_batch_load_window_blocked_for_snapshot_handoff(
         &self,
         connection_id: &str,
@@ -504,14 +620,27 @@ impl SyncStateStore {
         connection_id: &str,
         stale_running_before_ms: i64,
         max_jobs: usize,
+        max_fill_ms: i64,
     ) -> anyhow::Result<Vec<CdcBatchLoadJobRecord>> {
         let now = now_millis();
+        let claimable_loaded_before_ms = if max_fill_ms <= 0 {
+            i64::MAX
+        } else {
+            now.saturating_sub(max_fill_ms)
+        };
         self.release_snapshot_handoff_blocked_cdc_batch_load_jobs(connection_id)
             .await?;
         let rows = sqlx::query(&format!(
             r#"
-            with candidate as (
-                select j.job_id, j.table_key, j.first_sequence, j.barrier_kind, j.payload_json
+            with candidate_heads as (
+                select j.job_id,
+                       j.table_key,
+                       j.first_sequence,
+                       j.status,
+                       j.updated_at,
+                       j.barrier_kind,
+                       j.payload_json,
+                       j.created_at
                 from {} j
                 where j.connection_id = $1
                   and (
@@ -531,14 +660,11 @@ impl SyncStateStore {
                         or blockers.status = $4
                       )
                   )
-                order by j.first_sequence asc, j.created_at asc
-                for update skip locked
-                limit 1
             ),
             window_candidates as (
-                select j.job_id
+                select first.job_id as head_job_id, j.job_id, j.first_sequence, j.created_at
                 from {} j
-                join candidate first
+                join candidate_heads first
                   on first.table_key = j.table_key
                 where j.connection_id = $1
                   and (
@@ -571,7 +697,45 @@ impl SyncStateStore {
                       )
                     )
                   )
-                order by j.first_sequence asc, j.created_at asc
+            ),
+            window_counts as (
+                select head_job_id, count(*) as job_count
+                from window_candidates
+                group by head_job_id
+            ),
+            claimable_heads as (
+                select first.job_id, first.first_sequence, first.created_at
+                from candidate_heads first
+                join window_counts counts
+                  on counts.head_job_id = first.job_id
+                where first.status = $4
+                   or first.updated_at <= $10
+                   or counts.job_count >= $9
+                   or first.barrier_kind is not null
+                   or not (
+                    first.payload_json::jsonb ? 'staging_schema'
+                    and first.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                   )
+            ),
+            locked_head as (
+                select j.job_id
+                from {} j
+                join claimable_heads first
+                  on first.job_id = j.job_id
+                where j.connection_id = $1
+                order by first.first_sequence asc, first.created_at asc
+                for update of j skip locked
+                limit 1
+            ),
+            chosen_window as (
+                select j.job_id
+                from {} j
+                join window_candidates candidates
+                  on candidates.job_id = j.job_id
+                join locked_head first
+                  on first.job_id = candidates.head_job_id
+                where j.connection_id = $1
+                order by candidates.first_sequence asc, candidates.created_at asc
                 for update of j skip locked
                 limit $9
             )
@@ -580,9 +744,12 @@ impl SyncStateStore {
                 stage = $7,
                 last_error = null,
                 updated_at = $8
-            from candidate
             where jobs.connection_id = $1
-              and jobs.job_id in (select job_id from window_candidates)
+              and jobs.job_id in (select job_id from chosen_window)
+              and (
+                (jobs.status = $2 and jobs.stage = $3)
+                or (jobs.status = $4 and jobs.updated_at < $5)
+              )
             returning jobs.job_id, jobs.table_key, jobs.first_sequence, jobs.status,
                       jobs.payload_json, jobs.attempt_count, jobs.retry_class, jobs.last_error,
                       jobs.stage, jobs.staging_table, jobs.artifact_uri, jobs.load_job_id,
@@ -590,6 +757,8 @@ impl SyncStateStore {
                       jobs.ledger_metadata_json,
                       jobs.created_at, jobs.updated_at
             "#,
+            self.table("cdc_batch_load_jobs"),
+            self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
@@ -605,6 +774,7 @@ impl SyncStateStore {
         .bind(CdcLedgerStage::Applying.as_str())
         .bind(now)
         .bind(saturating_usize_to_i64(max_jobs.max(1)))
+        .bind(claimable_loaded_before_ms)
         .fetch_all(&self.pool)
         .await?;
 
@@ -691,7 +861,7 @@ impl SyncStateStore {
         .execute(&mut *tx)
         .await?;
 
-        let doomed_jobs = self
+        let inflight_jobs = self
             .load_cdc_batch_load_jobs(
                 connection_id,
                 &[
@@ -700,7 +870,44 @@ impl SyncStateStore {
                 ],
             )
             .await?;
-        let doomed_job_ids: Vec<String> = doomed_jobs.into_iter().map(|job| job.job_id).collect();
+        let inflight_job_ids = inflight_jobs
+            .iter()
+            .map(|job| job.job_id.clone())
+            .collect::<Vec<_>>();
+        if inflight_job_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(CdcReplayCleanupSummary {
+                repaired_terminal_fragments: repair_result.rows_affected(),
+                ..Default::default()
+            });
+        }
+
+        let durable_job_rows = sqlx::query(&format!(
+            r#"
+            select job_id
+            from {fragment_table}
+            where connection_id = $1
+              and job_id = any($2)
+            group by job_id
+            having count(*) > 0
+               and count(*) filter (where status = $3) = count(*)
+            "#,
+            fragment_table = fragment_table,
+        ))
+        .bind(connection_id)
+        .bind(&inflight_job_ids)
+        .bind(CdcCommitFragmentStatus::Succeeded.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let durable_job_ids = durable_job_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("job_id"))
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        let doomed_job_ids = inflight_jobs
+            .into_iter()
+            .filter(|job| !durable_job_ids.contains(&job.job_id))
+            .map(|job| job.job_id)
+            .collect::<Vec<_>>();
 
         if doomed_job_ids.is_empty() {
             tx.commit().await?;
@@ -900,7 +1107,9 @@ impl SyncStateStore {
                     stage = $6,
                     last_error = $4,
                     updated_at = $5
-                where connection_id = $1 and job_id = any($2)
+                where connection_id = $1
+                  and job_id = any($2)
+                  and status <> $7
                 "#,
                 self.table("cdc_commit_fragments")
             ))
@@ -910,6 +1119,7 @@ impl SyncStateStore {
             .bind(error)
             .bind(now)
             .bind(CdcLedgerStage::Failed.as_str())
+            .bind(CdcCommitFragmentStatus::Succeeded.as_str())
             .execute(&mut *tx)
             .await?;
         }
@@ -1173,7 +1383,7 @@ impl SyncStateStore {
             select fragment_id, job_id, sequence, commit_lsn, table_key, status, row_count,
                    upserted_count, deleted_count, last_error, stage, artifact_uri, staging_table,
                    load_job_id, merge_job_id, primary_key_lane, barrier_kind, ledger_metadata_json,
-                   created_at, updated_at
+                   coalesce(expected_fragments, 0) as expected_fragments, created_at, updated_at
             from {}
             where connection_id = $1
               and status = any($2)
@@ -1204,6 +1414,9 @@ impl SyncStateStore {
                     table_key: row.try_get("table_key")?,
                     status,
                     stage,
+                    expected_fragments: row
+                        .try_get::<Option<i64>, _>("expected_fragments")?
+                        .unwrap_or_default(),
                     row_count: row.try_get("row_count")?,
                     upserted_count: row.try_get("upserted_count")?,
                     deleted_count: row.try_get("deleted_count")?,
@@ -1230,16 +1443,22 @@ impl SyncStateStore {
     ) -> anyhow::Result<Option<CdcDurableApplyFrontier>> {
         let rows = sqlx::query(&format!(
             r#"
-            select sequence,
-                   max(commit_lsn) as commit_lsn,
-                   bool_and(status = $3) as all_succeeded
-            from {}
-            where connection_id = $1
-              and sequence >= $2
-            group by sequence
-            order by sequence asc
+            select sequences.sequence,
+                   sequences.commit_lsn,
+                   sequences.expected_fragments,
+                   count(distinct (fragments.table_key, coalesce(fragments.primary_key_lane, '')))
+                       filter (where fragments.status = $3)::bigint as succeeded_fragments
+            from {} sequences
+            left join {} fragments
+              on fragments.connection_id = sequences.connection_id
+             and fragments.sequence = sequences.sequence
+            where sequences.connection_id = $1
+              and sequences.sequence >= $2
+            group by sequences.sequence, sequences.commit_lsn, sequences.expected_fragments
+            order by sequences.sequence asc
             limit $4
             "#,
+            self.table("cdc_commit_sequences"),
             self.table("cdc_commit_fragments")
         ))
         .bind(connection_id)
@@ -1254,8 +1473,9 @@ impl SyncStateStore {
         for row in rows {
             let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
                 .context("cdc commit fragment sequence must be non-negative")?;
-            let all_succeeded = row.try_get::<bool, _>("all_succeeded")?;
-            if sequence != next_sequence || !all_succeeded {
+            let expected_fragments = row.try_get::<i64, _>("expected_fragments")?.max(1);
+            let succeeded_fragments = row.try_get::<i64, _>("succeeded_fragments")?;
+            if sequence != next_sequence || succeeded_fragments < expected_fragments {
                 break;
             }
             commit_lsn = row.try_get::<Option<String>, _>("commit_lsn")?;

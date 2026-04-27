@@ -45,7 +45,9 @@ fn test_hash_config(
                 cdc_batch_load_reducer_worker_count: None,
                 cdc_max_inflight_commits: None,
                 cdc_batch_load_reducer_max_jobs: None,
+                cdc_batch_load_reducer_max_fill_ms: None,
                 cdc_batch_load_reducer_enabled: None,
+                cdc_ack_boundary: None,
                 cdc_backlog_max_pending_fragments: None,
                 cdc_backlog_max_oldest_pending_seconds: None,
                 cdc_max_fill_ms: Some(2000),
@@ -196,7 +198,9 @@ fn max_checkpoint_age_seconds_ignores_removed_config_entities() {
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: None,
@@ -272,7 +276,9 @@ fn test_postgres_cdc_connection() -> ConnectionConfig {
             cdc_batch_load_reducer_worker_count: None,
             cdc_max_inflight_commits: None,
             cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
             cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: None,
             cdc_backlog_max_pending_fragments: None,
             cdc_backlog_max_oldest_pending_seconds: None,
             cdc_max_fill_ms: Some(2000),
@@ -497,14 +503,20 @@ fn cdc_batch_load_runtime_config_exposes_effective_reducer_settings() {
     pg.cdc_batch_load_staging_worker_count = Some(4);
     pg.cdc_batch_load_reducer_worker_count = Some(2);
     pg.cdc_batch_load_reducer_max_jobs = Some(32);
+    pg.cdc_batch_load_reducer_max_fill_ms = Some(5_000);
     pg.cdc_batch_load_reducer_enabled = Some(true);
 
     let runtime = build_cdc_batch_load_runtime_config(&cfg.connections[0], cfg.sync.as_ref())
         .expect("batch-load runtime config");
 
     assert!(runtime.queue_enabled);
+    assert_eq!(
+        runtime.ack_boundary,
+        crate::config::CdcAckBoundary::TargetApply
+    );
     assert!(runtime.reducer_enabled);
     assert_eq!(runtime.reducer_max_jobs, 32);
+    assert_eq!(runtime.reducer_max_fill_ms, 5_000);
     assert_eq!(runtime.staging_worker_count, 4);
     assert_eq!(runtime.reducer_worker_count, 2);
 }
@@ -527,6 +539,7 @@ fn cdc_batch_load_runtime_config_shows_reducer_disabled_as_one_job_windows() {
 
     assert!(!runtime.reducer_enabled);
     assert_eq!(runtime.reducer_max_jobs, 1);
+    assert_eq!(runtime.reducer_max_fill_ms, 0);
 }
 
 #[test]
