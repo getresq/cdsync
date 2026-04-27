@@ -1,9 +1,17 @@
 - Rust safety and reliability:
+  - Avoid speculative features, creative additions, and hidden modes unless the user explicitly asks for them.
+  - Prefer implementing functionality in an existing file unless it is a new logical component.
+  - Do not add new `mod.rs` module files; prefer `src/some_module.rs`. Existing `mod.rs` paths should be removed when touched.
+  - When adding a new Rust library crate, prefer an explicit `[lib] path = "...rs"` with a descriptive root file instead of defaulting to `src/lib.rs`.
   - Avoid `unsafe` in production; if required, isolate and document invariants/assumptions.
   - Validate/sanitize external inputs (headers, query/body); use parameterized queries.
-  - Prefer `Option`/`Result` and `?` for propagation; avoid `unwrap`/`expect` on external data.
+  - Prefer `Option`/`Result` and `?` for propagation; avoid `unwrap`/`expect` and direct collection indexing in normal code. Prefer `ok_or_else`, `get`, or other checked flows.
     - Tests may use `unwrap`/`expect` for setup and assertions.
+  - Never silently discard errors from fallible operations with `let _ =`. Propagate with `?`, log with visibility when best-effort behavior is intentional, or handle the error explicitly.
+  - Async operations that can affect user-visible or admin-visible work should propagate failures to the route/API/admin layer instead of only logging locally.
   - Avoid blocking calls in async contexts; use async I/O or `spawn_blocking` for CPU-bound work.
+  - Comments should explain non-obvious intent, invariants, or tradeoffs. Do not add organizational comments that only summarize the code beneath them.
+  - In async `move` contexts, shadow cloned values just before the spawn/block so borrow lifetimes stay narrow and obvious.
   - Enable overflow checks in release builds in `Cargo.toml`.
 - Mock external deps in tests (Twilio, OpenAI, etc.)
 - #![allow(dead_code)] is not allowed. No compiler warnings, no clippy warnings.
