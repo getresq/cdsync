@@ -308,6 +308,12 @@ pub struct CdcBatchLoadQueueSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CdcBatchLoadBackpressureSummary {
+    pub pending_jobs: i64,
+    pub oldest_pending_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CdcBatchLoadQueueTableSummary {
     pub table_key: String,
     pub queued_jobs: i64,

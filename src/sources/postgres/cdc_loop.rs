@@ -242,7 +242,7 @@ fn durable_frontier_scan_start_sequence(
     })
 }
 
-pub(super) async fn cdc_durable_backlog_backpressure_exceeded(
+pub(super) async fn cdc_backlog_backpressure_exceeded(
     slot_name: &str,
     state_handle: Option<&StateHandle>,
     max_pending_fragments: Option<usize>,
@@ -269,6 +269,33 @@ pub(super) async fn cdc_durable_backlog_backpressure_exceeded(
         (summary.oldest_pending_age_seconds, max_oldest_pending)
         && oldest_pending_age_seconds
             >= i64::try_from(max_oldest_pending.as_secs()).unwrap_or(i64::MAX)
+    {
+        crate::telemetry::record_cdc_backpressure_wait(
+            slot_name,
+            u64::try_from(oldest_pending_age_seconds).unwrap_or_default(),
+            max_oldest_pending.as_secs(),
+        );
+        return Ok(true);
+    }
+    let batch_load_summary = state_handle
+        .load_cdc_batch_load_backpressure_summary()
+        .await?;
+    if let Some(max_pending_fragments) = max_pending_fragments
+        && batch_load_summary.pending_jobs
+            >= i64::try_from(max_pending_fragments).unwrap_or(i64::MAX)
+    {
+        crate::telemetry::record_cdc_backpressure_wait(
+            slot_name,
+            u64::try_from(batch_load_summary.pending_jobs).unwrap_or_default(),
+            max_pending_fragments as u64,
+        );
+        return Ok(true);
+    }
+    if let (Some(oldest_pending_age_seconds), Some(max_oldest_pending)) = (
+        batch_load_summary.oldest_pending_age_seconds,
+        max_oldest_pending,
+    ) && oldest_pending_age_seconds
+        >= i64::try_from(max_oldest_pending.as_secs()).unwrap_or(i64::MAX)
     {
         crate::telemetry::record_cdc_backpressure_wait(
             slot_name,
@@ -1137,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_backlog_backpressure_uses_pending_fragment_count() -> anyhow::Result<()> {
+    async fn cdc_backpressure_uses_pending_fragment_count() -> anyhow::Result<()> {
         let Some(config) = test_state_config() else {
             return Ok(());
         };
@@ -1175,12 +1202,77 @@ mod tests {
             .await?;
 
         assert!(
-            cdc_durable_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(1), None)
-                .await?
+            cdc_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(1), None).await?
         );
         assert!(
-            !cdc_durable_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(2), None)
-                .await?
+            !cdc_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(2), None).await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cdc_backpressure_uses_target_batch_load_pending_jobs() -> anyhow::Result<()> {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        crate::state::SyncStateStore::migrate_with_config(&config, 16).await?;
+        let store = crate::state::SyncStateStore::open_with_config(&config, 16).await?;
+        let state_handle = store.handle("app");
+        let now = chrono::Utc::now().timestamp_millis();
+        let old = now - 120_000;
+        let job = crate::state::CdcBatchLoadJobRecord {
+            job_id: "job-target-backpressure".to_string(),
+            table_key: "table_a".to_string(),
+            first_sequence: 10,
+            status: crate::state::CdcBatchLoadJobStatus::Pending,
+            stage: crate::state::CdcLedgerStage::ApplyPending,
+            payload_json: "{}".to_string(),
+            created_at: old,
+            updated_at: old,
+            ..Default::default()
+        };
+        let fragment = crate::state::CdcCommitFragmentRecord {
+            fragment_id: "job-target-backpressure:10".to_string(),
+            job_id: job.job_id.clone(),
+            sequence: 10,
+            commit_lsn: "0/A".to_string(),
+            table_key: job.table_key.clone(),
+            status: crate::state::CdcCommitFragmentStatus::Succeeded,
+            stage: crate::state::CdcLedgerStage::ApplyPending,
+            row_count: 1,
+            upserted_count: 1,
+            created_at: old,
+            updated_at: old,
+            ..Default::default()
+        };
+        state_handle
+            .enqueue_cdc_batch_load_bundle(&job, std::slice::from_ref(&fragment))
+            .await?;
+
+        assert!(
+            cdc_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(1), None).await?
+        );
+        assert!(
+            !cdc_backlog_backpressure_exceeded("slot", Some(&state_handle), Some(2), None).await?
+        );
+        assert!(
+            cdc_backlog_backpressure_exceeded(
+                "slot",
+                Some(&state_handle),
+                None,
+                Some(Duration::from_secs(60))
+            )
+            .await?
+        );
+        assert!(
+            !cdc_backlog_backpressure_exceeded(
+                "slot",
+                Some(&state_handle),
+                None,
+                Some(Duration::from_secs(180))
+            )
+            .await?
         );
 
         Ok(())

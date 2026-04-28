@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -41,6 +42,28 @@ impl Config {
         }
         for connection in &self.connections {
             connection.validate()?;
+            self.validate_cdc_control_plane_isolated(connection)?;
+        }
+        Ok(())
+    }
+
+    fn validate_cdc_control_plane_isolated(
+        &self,
+        connection: &ConnectionConfig,
+    ) -> anyhow::Result<()> {
+        let SourceConfig::Postgres(pg) = &connection.source else {
+            return Ok(());
+        };
+        if !pg.cdc.unwrap_or(true) || pg.cdc_ack_boundary() != CdcAckBoundary::DurableEnqueue {
+            return Ok(());
+        }
+        if postgres_urls_share_authority(&self.state.url, &pg.url)?
+            && !postgres_url_uses_loopback_host(&pg.url)?
+        {
+            anyhow::bail!(
+                "connection `{}` uses postgres.cdc_ack_boundary=durable_enqueue but state.url shares the source Postgres host/port; use a dedicated state database outside the source writer",
+                connection.id
+            );
         }
         Ok(())
     }
@@ -105,6 +128,27 @@ impl Config {
 
         MIN_STATE_POOL_MAX_CONNECTIONS.max(batch_load_workers.saturating_add(control_headroom))
     }
+}
+
+fn postgres_urls_share_authority(left: &str, right: &str) -> anyhow::Result<bool> {
+    let left = Url::parse(left).context("invalid state.url")?;
+    let right = Url::parse(right).context("invalid postgres source url")?;
+    if left.scheme() != "postgres" && left.scheme() != "postgresql" {
+        return Ok(false);
+    }
+    if right.scheme() != "postgres" && right.scheme() != "postgresql" {
+        return Ok(false);
+    }
+    Ok(left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default())
+}
+
+fn postgres_url_uses_loopback_host(value: &str) -> anyhow::Result<bool> {
+    let url = Url::parse(value).context("invalid postgres source url")?;
+    Ok(matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1")
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,6 +638,14 @@ impl PostgresConfig {
             if self.cdc_pipeline_id.is_none() {
                 anyhow::bail!("postgres.cdc_pipeline_id is required when CDC is enabled");
             }
+            if self.cdc_ack_boundary() == CdcAckBoundary::DurableEnqueue
+                && self.cdc_backlog_max_pending_fragments.is_none()
+                && self.cdc_backlog_max_oldest_pending_seconds.is_none()
+            {
+                anyhow::bail!(
+                    "postgres.cdc_ack_boundary=durable_enqueue requires postgres.cdc_backlog_max_pending_fragments or postgres.cdc_backlog_max_oldest_pending_seconds"
+                );
+            }
             if self.cdc_tls.unwrap_or(false)
                 && self.cdc_tls_ca.is_none()
                 && self.cdc_tls_ca_path.is_none()
@@ -761,11 +813,10 @@ connections:
       cdc_pipeline_id: 1
       cdc_batch_size: 10000
       cdc_apply_concurrency: 8
-      cdc_batch_load_worker_count: 8
-      # If omitted, both default to cdc_batch_load_worker_count. That can run
-      # roughly 2x that many batch-load tasks after the staging/reducer split.
-      # cdc_batch_load_staging_worker_count: 8
-      # cdc_batch_load_reducer_worker_count: 8
+      # Set split worker counts explicitly in production. The legacy
+      # cdc_batch_load_worker_count fallback hides actual downstream concurrency.
+      cdc_batch_load_staging_worker_count: 8
+      cdc_batch_load_reducer_worker_count: 8
       # Defaults to cdc_apply_concurrency * 4.
       # This is the current in-memory read-ahead cap, not the future durable backlog budget.
       # cdc_max_inflight_commits: 32
@@ -777,9 +828,12 @@ connections:
       # ACK Postgres after target apply by default. durable_enqueue is experimental:
       # it ACKs after durable CDC landing and materializes BigQuery asynchronously.
       # cdc_ack_boundary: target_apply
-      # Optional durable backlog backpressure caps.
+      # CDC backlog backpressure caps. durable_enqueue requires at least one of
+      # these so WAL intake stays bounded by durable or target materialization
+      # backlog.
       # cdc_backlog_max_pending_fragments: 10000
       # cdc_backlog_max_oldest_pending_seconds: 300
+      # Queued CDC staging/reducer claim SQL has a hard 5s timeout.
       cdc_max_fill_ms: 2000
       cdc_max_pending_events: 100000
       cdc_idle_timeout_seconds: 10
@@ -1438,6 +1492,142 @@ connections:
             durable_config.cdc_ack_boundary(),
             CdcAckBoundary::DurableEnqueue
         );
+    }
+
+    #[test]
+    fn durable_enqueue_requires_backpressure_budget() {
+        let mut config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: Some(TableSelectionConfig {
+                include: vec!["public.*".to_string()],
+                exclude: Vec::new(),
+                defaults: None,
+            }),
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: Some(1),
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(8),
+            cdc_batch_load_worker_count: None,
+            cdc_batch_load_staging_worker_count: None,
+            cdc_batch_load_reducer_worker_count: None,
+            cdc_max_inflight_commits: None,
+            cdc_batch_load_reducer_max_jobs: None,
+            cdc_batch_load_reducer_max_fill_ms: None,
+            cdc_batch_load_reducer_enabled: None,
+            cdc_ack_boundary: Some(CdcAckBoundary::DurableEnqueue),
+            cdc_backlog_max_pending_fragments: None,
+            cdc_backlog_max_oldest_pending_seconds: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        let err = config.validate().expect_err("durable enqueue needs caps");
+        assert!(
+            err.to_string()
+                .contains("durable_enqueue requires postgres.cdc_backlog")
+        );
+
+        config.cdc_backlog_max_pending_fragments = Some(10_000);
+        config
+            .validate()
+            .expect("backpressure cap should be enough");
+    }
+
+    #[test]
+    fn durable_enqueue_requires_state_outside_source_writer() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@source-host:5432/cdsync"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@source-host:5432/app"
+      cdc: true
+      publication: "cdsync_pub"
+      cdc_pipeline_id: 1
+      cdc_ack_boundary: durable_enqueue
+      cdc_backlog_max_pending_fragments: 10000
+      table_selection:
+        include: ["public.*"]
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+"#;
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
+        let err = cfg
+            .validate()
+            .expect_err("colocated durable queue is unsafe");
+        assert!(
+            err.to_string()
+                .contains("state.url shares the source Postgres host/port")
+        );
+    }
+
+    #[test]
+    fn durable_enqueue_allows_dedicated_state_host() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@state-host:5432/cdsync"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@source-host:5432/app"
+      cdc: true
+      publication: "cdsync_pub"
+      cdc_pipeline_id: 1
+      cdc_ack_boundary: durable_enqueue
+      cdc_backlog_max_pending_fragments: 10000
+      table_selection:
+        include: ["public.*"]
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+"#;
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
+        cfg.validate().expect("dedicated state host is allowed");
+    }
+
+    #[test]
+    fn durable_enqueue_allows_loopback_state_in_tests() {
+        let raw = r#"
+state:
+  url: "postgres://user:pass@localhost:5432/cdsync"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@localhost:5432/app"
+      cdc: true
+      publication: "cdsync_pub"
+      cdc_pipeline_id: 1
+      cdc_ack_boundary: durable_enqueue
+      cdc_backlog_max_pending_fragments: 10000
+      table_selection:
+        include: ["public.*"]
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+      emulator_http: "http://localhost:9050"
+"#;
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
+        cfg.validate()
+            .expect("local integration tests can share loopback Postgres");
     }
 
     #[test]

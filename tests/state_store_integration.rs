@@ -39,6 +39,26 @@ fn reducer_payload_json(job_id: &str, table: &str) -> String {
     .to_string()
 }
 
+fn reducer_job(
+    job_id: &str,
+    table_key: &str,
+    first_sequence: u64,
+    stage: CdcLedgerStage,
+    now: i64,
+) -> CdcBatchLoadJobRecord {
+    CdcBatchLoadJobRecord {
+        job_id: job_id.to_string(),
+        table_key: table_key.to_string(),
+        first_sequence,
+        status: CdcBatchLoadJobStatus::Pending,
+        stage,
+        payload_json: reducer_payload_json(job_id, table_key),
+        created_at: now + first_sequence as i64,
+        updated_at: now + first_sequence as i64,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn postgres_state_store_open_requires_cdc_sequence_ledger() -> anyhow::Result<()> {
     let Some(config) = test_state_config() else {
@@ -332,7 +352,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
             first_sequence: 10,
             status: CdcBatchLoadJobStatus::Pending,
             stage: CdcLedgerStage::Loaded,
-            payload_json: "{}".to_string(),
+            payload_json: reducer_payload_json("job-a-10", "table_a"),
             attempt_count: 0,
             retry_class: None,
             last_error: None,
@@ -346,7 +366,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
             first_sequence: 11,
             status: CdcBatchLoadJobStatus::Pending,
             stage: CdcLedgerStage::Loaded,
-            payload_json: "{}".to_string(),
+            payload_json: reducer_payload_json("job-a-11", "table_a"),
             attempt_count: 0,
             retry_class: None,
             last_error: None,
@@ -360,7 +380,7 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
             first_sequence: 20,
             status: CdcBatchLoadJobStatus::Pending,
             stage: CdcLedgerStage::Loaded,
-            payload_json: "{}".to_string(),
+            payload_json: reducer_payload_json("job-b-20", "table_b"),
             attempt_count: 0,
             retry_class: None,
             last_error: None,
@@ -396,6 +416,119 @@ async fn postgres_state_store_claims_oldest_loaded_apply_job_per_table() -> anyh
         .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
         .await?;
     assert!(third.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_ready_heads_advance_after_table_head_clears() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for job in [
+        reducer_job("job-a-10", "table_a", 10, CdcLedgerStage::Received, now),
+        reducer_job("job-a-11", "table_a", 11, CdcLedgerStage::Loaded, now),
+        reducer_job("job-b-20", "table_b", 20, CdcLedgerStage::Loaded, now),
+    ] {
+        handle.enqueue_cdc_batch_load_bundle(&job, &[]).await?;
+    }
+
+    let first = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
+        .await?;
+    assert_eq!(
+        first
+            .iter()
+            .map(|job| job.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-b-20"]
+    );
+    handle
+        .mark_cdc_batch_load_window_succeeded(&[first[0].job_id.clone()])
+        .await?;
+
+    assert!(
+        handle
+            .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
+            .await?
+            .is_empty(),
+        "loaded tail job must not bypass a non-loaded table head"
+    );
+
+    assert!(handle.mark_cdc_batch_load_job_loaded("job-a-10").await?);
+    let table_head = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
+        .await?;
+    assert_eq!(
+        table_head
+            .iter()
+            .map(|job| job.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-a-10"]
+    );
+
+    handle
+        .mark_cdc_batch_load_window_succeeded(&[table_head[0].job_id.clone()])
+        .await?;
+    let next_head = handle
+        .claim_next_loaded_cdc_batch_load_job_window_for_apply(now - 1, 1, 0)
+        .await?;
+    assert_eq!(
+        next_head
+            .iter()
+            .map(|job| job.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-a-11"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_state_store_backpressure_summary_counts_pending_batch_load_jobs()
+-> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config, 16).await?;
+    let store = SyncStateStore::open_with_config(&config, 16).await?;
+    let handle = store.handle("app");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for job in [
+        reducer_job(
+            "job-a-10",
+            "table_a",
+            10,
+            CdcLedgerStage::Loaded,
+            now - 10_000,
+        ),
+        reducer_job("job-b-20", "table_b", 20, CdcLedgerStage::Loaded, now),
+    ] {
+        handle.enqueue_cdc_batch_load_bundle(&job, &[]).await?;
+    }
+    handle
+        .enqueue_cdc_batch_load_bundle(
+            &CdcBatchLoadJobRecord {
+                status: CdcBatchLoadJobStatus::Succeeded,
+                stage: CdcLedgerStage::Applied,
+                ..reducer_job("job-c-30", "table_c", 30, CdcLedgerStage::Applied, now)
+            },
+            &[],
+        )
+        .await?;
+
+    let summary = handle.load_cdc_batch_load_backpressure_summary().await?;
+    assert_eq!(summary.pending_jobs, 2);
+    assert!(
+        summary.oldest_pending_age_seconds.unwrap_or_default() >= 5,
+        "oldest pending age should reflect the queued target jobs"
+    );
 
     Ok(())
 }

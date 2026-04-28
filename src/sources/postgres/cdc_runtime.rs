@@ -674,7 +674,7 @@ impl PostgresSource {
                                 )
                                 .await?;
                             }
-                            while cdc_durable_backlog_backpressure_exceeded(
+                            while cdc_backlog_backpressure_exceeded(
                                 slot_name,
                                 state_handle.as_ref(),
                                 backlog_max_pending_fragments,
