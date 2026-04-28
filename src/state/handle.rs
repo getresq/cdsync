@@ -114,6 +114,14 @@ impl StateHandle {
             .await
     }
 
+    pub async fn load_cdc_batch_load_backpressure_summary(
+        &self,
+    ) -> anyhow::Result<CdcBatchLoadBackpressureSummary> {
+        self.store
+            .load_cdc_batch_load_backpressure_summary(&self.connection_id)
+            .await
+    }
+
     pub async fn heartbeat_cdc_batch_load_job(&self, job_id: &str) -> anyhow::Result<()> {
         self.store
             .heartbeat_cdc_batch_load_job(&self.connection_id, job_id)

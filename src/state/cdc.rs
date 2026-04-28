@@ -1,7 +1,98 @@
 use super::*;
 use crate::retry::SyncRetryClass;
 
+const CDC_BATCH_LOAD_CLAIM_HEAD_SCAN_LIMIT: i64 = 128;
+
+fn cdc_batch_load_reducer_eligible(job: &CdcBatchLoadJobRecord) -> bool {
+    if job.barrier_kind.is_some() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&job.payload_json)
+        .ok()
+        .and_then(|value| value.get("staging_schema").cloned())
+        .is_some_and(|staging_schema| !staging_schema.is_null())
+}
+
+fn distinct_table_keys(rows: &[PgRow]) -> anyhow::Result<Vec<String>> {
+    let mut table_keys = std::collections::BTreeSet::new();
+    for row in rows {
+        table_keys.insert(row.try_get::<String, _>("table_key")?);
+    }
+    Ok(table_keys.into_iter().collect())
+}
+
 impl SyncStateStore {
+    async fn refresh_cdc_batch_load_ready_heads_for_tables(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        connection_id: &str,
+        table_keys: &[String],
+    ) -> anyhow::Result<()> {
+        if table_keys.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(&format!(
+            r#"
+            delete from {}
+            where connection_id = $1
+              and table_key = any($2)
+            "#,
+            self.table("cdc_batch_load_ready_heads")
+        ))
+        .bind(connection_id)
+        .bind(table_keys)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(&format!(
+            r#"
+            insert into {} (
+                connection_id,
+                table_key,
+                head_job_id,
+                first_sequence,
+                created_at,
+                updated_at
+            )
+            select connection_id,
+                   table_key,
+                   job_id as head_job_id,
+                   first_sequence,
+                   created_at,
+                   $5 as updated_at
+            from (
+                select distinct on (connection_id, table_key)
+                       connection_id,
+                       table_key,
+                       job_id,
+                       first_sequence,
+                       created_at
+                from {}
+                where connection_id = $1
+                  and table_key = any($2)
+                  and status in ($3, $4, $6)
+                order by connection_id, table_key, first_sequence, created_at
+            ) heads
+            on conflict (connection_id, table_key) do update set
+                head_job_id = excluded.head_job_id,
+                first_sequence = excluded.first_sequence,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            "#,
+            self.table("cdc_batch_load_ready_heads"),
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(table_keys)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .bind(CdcBatchLoadJobStatus::Running.as_str())
+        .bind(now_millis())
+        .bind(CdcBatchLoadJobStatus::Failed.as_str())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     pub async fn enqueue_cdc_batch_load_bundle(
         &self,
         connection_id: &str,
@@ -30,9 +121,10 @@ impl SyncStateStore {
                 primary_key_lane,
                 barrier_kind,
                 ledger_metadata_json,
+                reducer_eligible,
                 created_at,
                 updated_at
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             on conflict(job_id) do update set
                 table_key = case
                     when {table}.status = 'failed' then excluded.table_key
@@ -91,6 +183,10 @@ impl SyncStateStore {
                     when {table}.status = 'failed' then excluded.ledger_metadata_json
                     else {table}.ledger_metadata_json
                 end,
+                reducer_eligible = case
+                    when {table}.status = 'failed' then excluded.reducer_eligible
+                    else {table}.reducer_eligible
+                end,
                 updated_at = case
                     when {table}.status = 'failed' then excluded.updated_at
                     else {table}.updated_at
@@ -122,6 +218,7 @@ impl SyncStateStore {
         .bind(job.primary_key_lane.clone())
         .bind(job.barrier_kind.clone())
         .bind(job.ledger_metadata_json.clone())
+        .bind(cdc_batch_load_reducer_eligible(job))
         .bind(job.created_at)
         .bind(job.updated_at)
         .fetch_one(&mut *tx)
@@ -252,6 +349,12 @@ impl SyncStateStore {
             .await?;
         }
 
+        self.refresh_cdc_batch_load_ready_heads_for_tables(
+            &mut tx,
+            connection_id,
+            std::slice::from_ref(&job.table_key),
+        )
+        .await?;
         tx.commit().await?;
         cdc_batch_load_job_record_from_row(&row)
     }
@@ -323,6 +426,7 @@ impl SyncStateStore {
         stale_staged_before_ms: i64,
     ) -> anyhow::Result<Option<CdcBatchLoadJobRecord>> {
         let now = now_millis();
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(&format!(
             r#"
             with candidate as (
@@ -362,8 +466,18 @@ impl SyncStateStore {
         .bind(CdcLedgerStage::Staged.as_str())
         .bind(stale_staged_before_ms)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        if let Some(row) = &row {
+            self.refresh_cdc_batch_load_ready_heads_for_tables(
+                &mut tx,
+                connection_id,
+                &[row.try_get("table_key")?],
+            )
+            .await?;
+        }
+        tx.commit().await?;
 
         row.as_ref()
             .map(cdc_batch_load_job_record_from_row)
@@ -375,7 +489,8 @@ impl SyncStateStore {
         connection_id: &str,
         job_id: &str,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query(&format!(
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(&format!(
             r#"
             update {}
             set stage = $3,
@@ -383,6 +498,7 @@ impl SyncStateStore {
             where connection_id = $1
               and job_id = $2
               and status = $5
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -391,9 +507,13 @@ impl SyncStateStore {
         .bind(CdcLedgerStage::Loaded.as_str())
         .bind(now_millis())
         .bind(CdcBatchLoadJobStatus::Pending.as_str())
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let table_keys = distinct_table_keys(&rows)?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
+        tx.commit().await?;
+        Ok(!table_keys.is_empty())
     }
 
     pub async fn mark_cdc_batch_load_fragments_durable_landed(
@@ -452,7 +572,7 @@ impl SyncStateStore {
                 "CDC batch-load job {job_id} is not fully durable landed: total={total_fragments} durable={durable_fragments} failed={failed_fragments}"
             );
         }
-        sqlx::query(&format!(
+        let job_rows = sqlx::query(&format!(
             r#"
             update {}
             set stage = $3,
@@ -461,6 +581,7 @@ impl SyncStateStore {
               and job_id = $2
               and status = $5
               and stage = $6
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -470,8 +591,11 @@ impl SyncStateStore {
         .bind(now)
         .bind(CdcBatchLoadJobStatus::Pending.as_str())
         .bind(CdcLedgerStage::ApplyPending.as_str())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let table_keys = distinct_table_keys(&job_rows)?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
         tx.commit().await?;
         Ok(result.rows_affected())
     }
@@ -487,7 +611,7 @@ impl SyncStateStore {
         }
         let now = now_millis();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(&format!(
+        let job_rows = sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
@@ -498,6 +622,7 @@ impl SyncStateStore {
             where connection_id = $1
               and job_id = any($2)
               and status = $7
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -508,8 +633,9 @@ impl SyncStateStore {
         .bind(CdcLedgerStage::Blocked.as_str())
         .bind(now)
         .bind(CdcBatchLoadJobStatus::Running.as_str())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let table_keys = distinct_table_keys(&job_rows)?;
         sqlx::query(&format!(
             r#"
             update {}
@@ -530,6 +656,8 @@ impl SyncStateStore {
         .bind(CdcCommitFragmentStatus::Pending.as_str())
         .execute(&mut *tx)
         .await?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -573,7 +701,7 @@ impl SyncStateStore {
             from ready_jobs
             where jobs.connection_id = $1
               and jobs.job_id = ready_jobs.job_id
-            returning jobs.job_id
+            returning jobs.job_id, jobs.table_key
             "#,
             jobs_table = jobs_table,
             checkpoints_table = checkpoints_table,
@@ -590,6 +718,7 @@ impl SyncStateStore {
             .iter()
             .map(|row| row.try_get::<String, _>("job_id"))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let table_keys = distinct_table_keys(&rows)?;
         if !job_ids.is_empty() {
             sqlx::query(&format!(
                 r#"
@@ -611,6 +740,8 @@ impl SyncStateStore {
             .execute(&mut *tx)
             .await?;
         }
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
         tx.commit().await?;
         Ok(job_ids.len() as u64)
     }
@@ -630,6 +761,7 @@ impl SyncStateStore {
         };
         self.release_snapshot_handoff_blocked_cdc_batch_load_jobs(connection_id)
             .await?;
+        let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(&format!(
             r#"
             with candidate_heads as (
@@ -639,27 +771,19 @@ impl SyncStateStore {
                        j.status,
                        j.updated_at,
                        j.barrier_kind,
-                       j.payload_json,
+                       j.reducer_eligible,
                        j.created_at
-                from {} j
+                from {} heads
+                join {} j
+                  on j.connection_id = heads.connection_id
+                 and j.job_id = heads.head_job_id
                 where j.connection_id = $1
                   and (
                     (j.status = $2 and j.stage = $3)
                     or (j.status = $4 and j.updated_at < $5)
                   )
-                  and not exists (
-                    select 1
-                    from {} blockers
-                    where blockers.connection_id = j.connection_id
-                      and blockers.table_key = j.table_key
-                      and blockers.job_id <> j.job_id
-                      and blockers.first_sequence < j.first_sequence
-                      and (
-                        blockers.status = $2
-                        or blockers.status = $6
-                        or blockers.status = $4
-                      )
-                  )
+                order by j.first_sequence asc, j.created_at asc
+                limit $11
             ),
             window_candidates as (
                 select first.job_id as head_job_id, j.job_id, j.first_sequence, j.created_at
@@ -671,14 +795,12 @@ impl SyncStateStore {
                     j.job_id = first.job_id
                     or (
                       first.barrier_kind is null
-                      and first.payload_json::jsonb ? 'staging_schema'
-                      and first.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                      and first.reducer_eligible
                       and j.status = $2
                       and j.stage = $3
                       and j.barrier_kind is null
                       and j.first_sequence > first.first_sequence
-                      and j.payload_json::jsonb ? 'staging_schema'
-                      and j.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                      and j.reducer_eligible
                       and not exists (
                         select 1
                         from {} blockers
@@ -691,8 +813,7 @@ impl SyncStateStore {
                             blockers.status = $2
                             and blockers.stage = $3
                             and blockers.barrier_kind is null
-                            and blockers.payload_json::jsonb ? 'staging_schema'
-                            and blockers.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
+                            and blockers.reducer_eligible
                           )
                       )
                     )
@@ -712,10 +833,7 @@ impl SyncStateStore {
                    or first.updated_at <= $10
                    or counts.job_count >= $9
                    or first.barrier_kind is not null
-                   or not (
-                    first.payload_json::jsonb ? 'staging_schema'
-                    and first.payload_json::jsonb -> 'staging_schema' <> 'null'::jsonb
-                   )
+                   or not first.reducer_eligible
             ),
             locked_head as (
                 select j.job_id
@@ -757,7 +875,7 @@ impl SyncStateStore {
                       jobs.ledger_metadata_json,
                       jobs.created_at, jobs.updated_at
             "#,
-            self.table("cdc_batch_load_jobs"),
+            self.table("cdc_batch_load_ready_heads"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
             self.table("cdc_batch_load_jobs"),
@@ -775,8 +893,13 @@ impl SyncStateStore {
         .bind(now)
         .bind(saturating_usize_to_i64(max_jobs.max(1)))
         .bind(claimable_loaded_before_ms)
-        .fetch_all(&self.pool)
+        .bind(CDC_BATCH_LOAD_CLAIM_HEAD_SCAN_LIMIT)
+        .fetch_all(&mut *tx)
         .await?;
+        let table_keys = distinct_table_keys(&rows)?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
+        tx.commit().await?;
 
         let mut records = rows
             .iter()
@@ -874,6 +997,10 @@ impl SyncStateStore {
             .iter()
             .map(|job| job.job_id.clone())
             .collect::<Vec<_>>();
+        let inflight_table_by_job = inflight_jobs
+            .iter()
+            .map(|job| (job.job_id.clone(), job.table_key.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
         if inflight_job_ids.is_empty() {
             tx.commit().await?;
             return Ok(CdcReplayCleanupSummary {
@@ -907,6 +1034,12 @@ impl SyncStateStore {
             .into_iter()
             .filter(|job| !durable_job_ids.contains(&job.job_id))
             .map(|job| job.job_id)
+            .collect::<Vec<_>>();
+        let doomed_table_keys = doomed_job_ids
+            .iter()
+            .filter_map(|job_id| inflight_table_by_job.get(job_id).cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
 
         if doomed_job_ids.is_empty() {
@@ -943,6 +1076,12 @@ impl SyncStateStore {
         .execute(&mut *tx)
         .await?;
 
+        self.refresh_cdc_batch_load_ready_heads_for_tables(
+            &mut tx,
+            connection_id,
+            &doomed_table_keys,
+        )
+        .await?;
         tx.commit().await?;
         Ok(CdcReplayCleanupSummary {
             discarded_jobs: job_result.rows_affected(),
@@ -956,7 +1095,8 @@ impl SyncStateStore {
         connection_id: &str,
         job_id: &str,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query(&format!(
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
@@ -968,6 +1108,7 @@ impl SyncStateStore {
               and job_id = $2
               and status = $5
               and retry_class = any($6)
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -981,9 +1122,13 @@ impl SyncStateStore {
             SyncRetryClass::Transient.as_str(),
         ])
         .bind(CdcLedgerStage::Received.as_str())
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let table_keys = distinct_table_keys(&rows)?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
+        tx.commit().await?;
+        Ok(!table_keys.is_empty())
     }
 
     pub async fn mark_cdc_batch_load_bundle_succeeded(
@@ -1005,7 +1150,7 @@ impl SyncStateStore {
         }
         let now = now_millis();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(&format!(
+        let job_rows = sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
@@ -1014,6 +1159,7 @@ impl SyncStateStore {
                 last_error = null,
                 updated_at = $4
             where connection_id = $1 and job_id = any($2)
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -1022,8 +1168,9 @@ impl SyncStateStore {
         .bind(CdcBatchLoadJobStatus::Succeeded.as_str())
         .bind(now)
         .bind(CdcLedgerStage::Applied.as_str())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let table_keys = distinct_table_keys(&job_rows)?;
         sqlx::query(&format!(
             r#"
             update {}
@@ -1042,6 +1189,8 @@ impl SyncStateStore {
         .bind(CdcLedgerStage::Applied.as_str())
         .execute(&mut *tx)
         .await?;
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1077,7 +1226,7 @@ impl SyncStateStore {
         }
         let now = now_millis();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(&format!(
+        let job_rows = sqlx::query(&format!(
             r#"
             update {}
             set status = $3,
@@ -1086,6 +1235,7 @@ impl SyncStateStore {
                 last_error = $5,
                 updated_at = $6
             where connection_id = $1 and job_id = any($2)
+            returning table_key
             "#,
             self.table("cdc_batch_load_jobs")
         ))
@@ -1096,8 +1246,9 @@ impl SyncStateStore {
         .bind(error)
         .bind(now)
         .bind(CdcLedgerStage::Failed.as_str())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let table_keys = distinct_table_keys(&job_rows)?;
 
         if mark_fragments_failed {
             sqlx::query(&format!(
@@ -1124,8 +1275,37 @@ impl SyncStateStore {
             .await?;
         }
 
+        self.refresh_cdc_batch_load_ready_heads_for_tables(&mut tx, connection_id, &table_keys)
+            .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn load_cdc_batch_load_backpressure_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadBackpressureSummary> {
+        let now = now_millis();
+        let row = sqlx::query(&format!(
+            r#"
+            select count(*)::bigint as pending_jobs,
+                   min(created_at) as oldest_pending_ms
+            from {}
+            where connection_id = $1
+              and status = $2
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .bind(CdcBatchLoadJobStatus::Pending.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        let oldest_pending_ms: Option<i64> = row.try_get("oldest_pending_ms")?;
+        Ok(CdcBatchLoadBackpressureSummary {
+            pending_jobs: row.try_get::<i64, _>("pending_jobs")?,
+            oldest_pending_age_seconds: oldest_pending_ms.map(|ts| ((now - ts).max(0)) / 1000),
+        })
     }
 
     pub async fn load_cdc_batch_load_queue_summary(

@@ -25,6 +25,24 @@ where
     }
 }
 
+async fn cdc_batch_load_claim_with_timeout<F, T>(
+    duration: Duration,
+    claim_kind: &str,
+    future: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match timeout(duration, future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "CDC batch-load {} claim exceeded hard timeout of {}ms",
+            claim_kind,
+            duration.as_millis()
+        )),
+    }
+}
+
 fn stable_cdc_batch_load_job_id(
     connection_id: &str,
     target_table: &str,
@@ -800,17 +818,20 @@ impl CdcBatchLoadManager {
         self.requeue_due_retryable_failed_jobs().await?;
         let stale_before_ms =
             Utc::now().timestamp_millis() - CDC_BATCH_LOAD_JOB_STALE_TIMEOUT.as_millis() as i64;
-        let Some(record) = self
-            .state_handle
-            .claim_next_cdc_batch_load_staging_job(stale_before_ms)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to claim CDC batch-load staging job",
-                    err.to_string()
-                )
-            })?
+        let Some(record) = cdc_batch_load_claim_with_timeout(
+            CDC_BATCH_LOAD_CLAIM_HARD_TIMEOUT,
+            "staging",
+            self.state_handle
+                .claim_next_cdc_batch_load_staging_job(stale_before_ms),
+        )
+        .await
+        .map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to claim CDC batch-load staging job",
+                err.to_string()
+            )
+        })?
         else {
             return Ok(None);
         };
@@ -828,21 +849,24 @@ impl CdcBatchLoadManager {
     async fn claim_next_apply_window(&self) -> EtlResult<Option<CdcQueuedBatchLoadWindow>> {
         let stale_before_ms =
             Utc::now().timestamp_millis() - CDC_BATCH_LOAD_JOB_STALE_TIMEOUT.as_millis() as i64;
-        let records = self
-            .state_handle
-            .claim_next_loaded_cdc_batch_load_job_window_for_apply(
-                stale_before_ms,
-                self.reducer_max_jobs,
-                duration_millis_i64(self.reducer_max_fill),
+        let records = cdc_batch_load_claim_with_timeout(
+            CDC_BATCH_LOAD_CLAIM_HARD_TIMEOUT,
+            "apply",
+            self.state_handle
+                .claim_next_loaded_cdc_batch_load_job_window_for_apply(
+                    stale_before_ms,
+                    self.reducer_max_jobs,
+                    duration_millis_i64(self.reducer_max_fill),
+                ),
+        )
+        .await
+        .map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to claim loaded CDC batch-load apply job",
+                err.to_string()
             )
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to claim loaded CDC batch-load apply job",
-                    err.to_string()
-                )
-            })?;
+        })?;
         if records.is_empty() {
             return Ok(None);
         }
@@ -2156,5 +2180,21 @@ mod tests {
         assert!(err.to_string().contains(
             "CDC batch-load job cdc_job_stuck for public__accounts exceeded hard timeout"
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_load_claim_timeout_surfaces_stuck_claim() {
+        let result = cdc_batch_load_claim_with_timeout(
+            Duration::from_millis(1),
+            "apply",
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+
+        let err = result.expect_err("pending claim should time out");
+        assert!(
+            err.to_string()
+                .contains("CDC batch-load apply claim exceeded hard timeout")
+        );
     }
 }

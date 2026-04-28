@@ -50,3 +50,4 @@ Notes:
 - [How CDSync Works](docs/how-cdsync-works.md)
 - [Operations](docs/operations.md)
 - [End-to-End Tests](docs/e2e.md)
+- [CDSync Sunset: Datastream First, Airbyte Second](docs/datastream-airbyte-migration.md)

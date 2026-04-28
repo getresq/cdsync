@@ -441,6 +441,7 @@ impl SyncStateStore {
         ensure_table_exists(&mut conn, &self.schema, "table_checkpoints").await?;
         ensure_table_exists(&mut conn, &self.schema, "connection_locks").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_batch_load_jobs").await?;
+        ensure_table_exists(&mut conn, &self.schema, "cdc_batch_load_ready_heads").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_commit_sequences").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_commit_fragments").await?;
         ensure_table_exists(&mut conn, &self.schema, "cdc_watermark_state").await?;

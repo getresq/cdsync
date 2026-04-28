@@ -453,8 +453,8 @@ async fn e2e_postgres_bigquery_real_cdc_durable_enqueue_materializes_from_queue(
         cdc_batch_load_reducer_max_fill_ms: Some(30_000),
         cdc_batch_load_reducer_enabled: None,
         cdc_ack_boundary: Some(CdcAckBoundary::DurableEnqueue),
-        cdc_backlog_max_pending_fragments: None,
-        cdc_backlog_max_oldest_pending_seconds: None,
+        cdc_backlog_max_pending_fragments: Some(10_000),
+        cdc_backlog_max_oldest_pending_seconds: Some(300),
         cdc_max_fill_ms: Some(1000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(1),
@@ -706,8 +706,8 @@ async fn e2e_postgres_bigquery_real_cdc_durable_enqueue_replays_after_restart() 
         cdc_batch_load_reducer_max_fill_ms: Some(30_000),
         cdc_batch_load_reducer_enabled: None,
         cdc_ack_boundary: Some(CdcAckBoundary::DurableEnqueue),
-        cdc_backlog_max_pending_fragments: None,
-        cdc_backlog_max_oldest_pending_seconds: None,
+        cdc_backlog_max_pending_fragments: Some(10_000),
+        cdc_backlog_max_oldest_pending_seconds: Some(300),
         cdc_max_fill_ms: Some(1000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(60),
@@ -1253,6 +1253,10 @@ fn build_follow_runner_config(input: FollowRunnerConfigInput<'_>) -> String {
             CdcAckBoundary::DurableEnqueue => "durable_enqueue",
         };
         cdc_extra_yaml.push_str(&format!("      cdc_ack_boundary: {value}\n"));
+        if ack_boundary == CdcAckBoundary::DurableEnqueue {
+            cdc_extra_yaml.push_str("      cdc_backlog_max_pending_fragments: 10000\n");
+            cdc_extra_yaml.push_str("      cdc_backlog_max_oldest_pending_seconds: 300\n");
+        }
     }
     format!(
         r#"

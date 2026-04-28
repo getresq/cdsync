@@ -145,6 +145,7 @@ enum PendingTableRowAction {
 
 const CDC_FRAME_BUILD_BLOCKING_ROWS: usize = 512;
 const CDC_BATCH_LOAD_CLAIM_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CDC_BATCH_LOAD_CLAIM_HARD_TIMEOUT: Duration = Duration::from_secs(5);
 const CDC_BATCH_LOAD_JOB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CDC_BATCH_LOAD_JOB_STALE_TIMEOUT: Duration = Duration::from_secs(90);
 const CDC_BATCH_LOAD_JOB_HARD_TIMEOUT: Duration =
